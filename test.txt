@@ -1,0 +1,1475 @@
+so if template message can change, we will create a new template
+
+and based on old templateID reference, old notificaiton can be checked.
+
+To avoid duplicate notifications. we are creating unique index, but what if after DB entry, notification delivery or something else is failed, in that case, how retry will happen?
+because inserting in db will fail at initial step itself
+Thought for a few seconds
+
+Exactly — you’re thinking correctly.
+
+For templates, yes: instead of modifying old template blindly, usually we use template versioning.
+
+template_id = ORDER_CONFIRMED
+version = 1
+
+template_id = ORDER_CONFIRMED
+version = 2
+
+Old notification stores:
+
+template_id = ORDER_CONFIRMED
+template_version = 1
+
+So later you can still know exactly which template was used.
+
+Now your main question:
+
+“If unique index prevents duplicate notification insert, what if DB entry succeeded but delivery failed? How will retry happen?”
+
+Very important point.
+
+The unique index is only to prevent duplicate notification records, not to prevent delivery retry.
+
+1. Notification creation and notification delivery are separate
+
+Think of it as two stages:
+
+Stage 1: Create notification record
+Stage 2: Deliver notification
+
+The unique index protects Stage 1.
+
+It says:
+
+Do not create same notification twice.
+
+But retry happens in Stage 2.
+
+2. Example schema
+
+notifications table
+notifications (
+    notification_id BIGINT PRIMARY KEY,
+    notification_key VARCHAR(255) UNIQUE,
+    user_id BIGINT,
+    event_type VARCHAR(100),
+    template_id VARCHAR(100),
+    template_version INT,
+    title TEXT,
+    body TEXT,
+    status VARCHAR(50),
+    created_at TIMESTAMP,
+    sent_at TIMESTAMP
+)
+
+Example row:
+
+notification_key = 123:ORDER_CONFIRMED:order_789
+status = PENDING
+notification_attempts table
+notification_attempts (
+    attempt_id BIGINT PRIMARY KEY,
+    notification_id BIGINT,
+    channel VARCHAR(50),
+    attempt_number INT,
+    status VARCHAR(50),
+    error_message TEXT,
+    provider_response TEXT,
+    created_at TIMESTAMP
+)
+
+This tracks every delivery attempt.
+
+3. First time event comes
+
+Order service sends:
+
+ORDER_CONFIRMED for order_789
+
+Notification service creates key:
+
+123:ORDER_CONFIRMED:order_789
+
+Insert succeeds:
+
+INSERT INTO notifications (
+    notification_key,
+    user_id,
+    event_type,
+    status
+)
+VALUES (
+    '123:ORDER_CONFIRMED:order_789',
+    123,
+    'ORDER_CONFIRMED',
+    'PENDING'
+);
+
+Now notification exists.
+
+Then worker tries to send push/email/SMS.
+
+4. Delivery fails
+
+Example: FCM is down.
+
+Worker updates DB:
+
+notifications.status = RETRY_PENDING
+
+And inserts attempt:
+
+attempt 1 → FAILED → FCM timeout
+
+So DB now has:
+
+notifications:
+notification_id = 1
+notification_key = 123:ORDER_CONFIRMED:order_789
+status = RETRY_PENDING
+notification_attempts:
+attempt_1 | notification_id=1 | PUSH | FAILED | timeout
+5. How retry happens
+
+A retry worker/scheduler picks notifications where:
+
+SELECT *
+FROM notifications
+WHERE status = 'RETRY_PENDING'
+AND next_retry_at <= now();
+
+Then it sends again.
+
+If success:
+
+UPDATE notifications
+SET status = 'SENT',
+    sent_at = now()
+WHERE notification_id = 1;
+
+If failure again:
+
+attempt 2 → FAILED
+attempt 3 → FAILED
+
+After max retries:
+
+status = FAILED
+
+or move to DLQ.
+6. What if same event comes again?
+
+Same event arrives again due to Kafka retry:
+
+ORDER_CONFIRMED order_789
+
+You try insert again.
+
+It fails due to unique index:
+
+duplicate key error
+
+But this is not a problem.
+
+You handle it like this:
+
+If duplicate key:
+    fetch existing notification
+    check status
+
+Then:
+
+Existing status	What to do
+SENT	Do nothing
+PENDING	Do nothing or ensure queued
+RETRY_PENDING	Let retry worker handle it
+FAILED	Maybe retry manually or ignore
+PROCESSING	Do nothing
+
+So duplicate event does not create duplicate notification.
+
+But failed delivery can still be retried using the existing notification record.
+
+7. Better flow with queue
+
+Typical production flow:
+
+1. Event received
+2. Insert notification row with status = PENDING
+3. Push notification_id to Kafka/queue
+4. Worker consumes notification_id
+5. Worker fetches notification from DB
+6. Worker sends notification
+7. Worker updates status
+
+Queue message should contain mainly:
+
+{
+  "notificationId": 1,
+  "channel": "PUSH"
+}
+
+Not necessarily full message body.
+
+8. Why this design is good
+
+Because retries are based on:
+
+notification_id
+
+not on creating a new notification row.
+
+So the unique index prevents duplicate creation, while status/attempts allow retry.
+
+9. Important mental model
+Unique index = create once
+Retry logic = send many times if needed
+
+Or:
+
+notifications table = intent to notify
+notification_attempts table = delivery attempts
+10. Interview-ready answer
+
+You can say:
+
+“The unique index prevents duplicate notification records for the same business event. Delivery retries do not require reinserting the notification. Instead, we keep the notification row with statuses like PENDING, RETRY_PENDING, SENT, or FAILED, and maintain a notification_attempts table to track each delivery attempt. If delivery fails, a worker retries the same notification_id based on retry policy.”
+
+That is the correct production design.
+
+Thought for a couple of seconds
+
+They can be either, but in a production system workers are usually run as separate processes/instances, not inside the same API instance.
+
+Think of it like this:
+
+Notification API Service
+→ receives request
+→ creates notification record
+→ pushes job to Kafka/Queue
+
+Notification Worker
+→ reads from Kafka/Queue
+→ sends email/push/SMS
+→ updates DB
+Option 1: Same service, same instance
+
+Small/simple system:
+
+EC2-1
+ ├── Notification API
+ └── Background Worker
+
+This works, but has problems:
+
+API traffic high → worker slows down
+Worker stuck → API affected
+Deployment issue → both affected
+Hard to scale separately
+
+So this is okay for small projects, but not ideal for serious production systems.
+
+Option 2: Same codebase, separate process
+
+Better:
+
+EC2-1 → Notification API process
+EC2-2 → Notification Worker process
+
+Both may use the same code repository, but they run different commands.
+
+Example:
+
+node api-server.js
+
+and worker:
+
+node notification-worker.js
+
+This is very common.
+
+Option 3: Separate service / deployment
+
+Best production approach:
+
+Notification API Service
+  ├── instance 1
+  ├── instance 2
+  └── instance 3
+
+Push Worker Service
+  ├── worker 1
+  ├── worker 2
+  └── worker 3
+
+Email Worker Service
+  ├── worker 1
+  └── worker 2
+
+SMS Worker Service
+  └── worker 1
+
+Each can scale independently.
+
+For example:
+
+Push notifications high volume → scale Push Workers to 100
+Email low volume → keep Email Workers at 5
+SMS costly → keep SMS Workers at 2
+In EC2 terms
+
+Yes, workers can run on different EC2 machines.
+
+Example:
+
+EC2-A, EC2-B → API servers
+EC2-C, EC2-D → Push workers
+EC2-E → Email worker
+EC2-F → SMS worker
+In Kubernetes terms
+
+They are usually separate deployments:
+
+notification-api-deployment
+push-worker-deployment
+email-worker-deployment
+sms-worker-deployment
+
+Each deployment has its own number of pods.
+
+Why separate workers from API?
+
+Because API should be fast.
+
+Bad design:
+
+Client waits while API sends SMS/email/push
+
+Good design:
+
+API quickly stores job → returns response
+Worker sends notification later
+
+This gives:
+
+fast API response
+better scalability
+retry support
+fault isolation
+Final mental model
+API service = accepts work
+Worker service = performs async work
+Queue/Kafka = buffer between them
+
+So for production:
+
+Workers are usually separate processes, often running on separate EC2 instances or separate Kubernetes pods. They may share the same codebase, but they are deployed and scaled independently.
+
+and what if there is a kafka lag?
+
+
+Kafka lag means:
+
+Messages are being produced faster than consumers/workers are processing them.
+
+In notification system terms:
+
+Notification API → Kafka topic → Workers
+
+If lag increases:
+
+Kafka has many pending notification messages
+Workers are behind
+Users receive notifications late
+1. What exactly is Kafka lag?
+
+Kafka stores messages in partitions. Each consumer group tracks how far it has consumed using an offset.
+
+Latest Kafka offset = 100000
+Consumer offset     = 95000
+
+Lag = 5000 messages
+
+Meaning:
+
+5000 messages are waiting to be processed
+2. Why does lag happen?
+
+Common reasons:
+
+1. Too few workers
+2. Workers are slow
+3. Provider is slow, like SMS/email provider
+4. DB updates are slow
+5. Kafka topic has too few partitions
+6. One partition is too hot
+7. Worker errors causing retries
+8. Large campaign/fan-out spike
+
+Example:
+
+Flash sale notification → 10 million users
+Kafka receives huge traffic
+Workers cannot process fast enough
+Lag increases
+3. Is Kafka lag always bad?
+
+Not always.
+
+Small temporary lag is normal.
+
+Example:
+
+Lag spikes for 2 minutes during traffic burst
+Then workers catch up
+
+That is okay.
+
+Bad lag is:
+
+Lag continuously increasing
+Lag not reducing
+Critical notifications delayed
+4. What happens to users?
+
+For notifications:
+
+OTP / payment alert → dangerous if delayed
+Marketing notification → okay if delayed
+Order confirmation → should be reasonably fast
+
+So you should not treat all notifications equally.
+
+How to handle Kafka lag
+1. Scale consumers/workers
+
+If workers are slow because there are too few of them:
+
+Increase worker instances
+
+Example:
+
+Email workers: 5 → 20
+Push workers: 10 → 100
+
+But there is a limit:
+
+In one consumer group, maximum parallelism is limited by number of Kafka partitions.
+
+If topic has 10 partitions, only 10 consumers can actively consume in parallel in the same group.
+
+2. Increase partitions
+
+If you need more parallelism:
+
+Increase topic partitions
+
+Example:
+
+notification-push topic:
+10 partitions → 100 partitions
+
+Then more workers can consume in parallel.
+
+But be careful: partition count affects ordering and operational cost.
+
+3. Separate topics by priority
+
+Very important for notification systems.
+
+Do not put OTP and marketing messages in the same queue.
+
+Better:
+
+notification-critical
+notification-high
+notification-normal
+notification-low
+
+Examples:
+
+critical → OTP, security alert
+high → payment failed, booking confirmed
+normal → order updates
+low → marketing campaigns
+
+If marketing causes lag, OTP should not be delayed.
+
+4. Separate worker pools
+
+Each topic should have its own workers:
+
+OTP workers
+Push workers
+Email workers
+SMS workers
+Marketing workers
+
+So low-priority load does not block high-priority messages.
+
+5. Rate-limit producers
+
+Sometimes the problem is too much production.
+
+Example:
+
+Campaign service sends 10 million messages instantly
+
+Instead, throttle:
+
+send 50k/min
+send 100k/min
+
+This protects Kafka, workers, providers, and DB.
+
+6. Batch processing
+
+Workers should process efficiently.
+
+Instead of:
+
+Consume 1 message
+Send 1 DB update
+Commit
+
+Use batching where possible:
+
+Consume 100 messages
+Send batch update
+Commit batch
+
+For email/push providers, some support batch APIs too.
+
+7. Optimize slow parts
+
+Lag often happens because worker processing is slow.
+
+Check:
+
+Provider latency
+DB update latency
+Template rendering latency
+Network timeout
+Retry behavior
+
+Example issue:
+
+SMS provider takes 2 seconds per message
+1 worker can only send ~30/min
+
+Solution:
+
+More workers
+Async HTTP calls
+Provider batching
+Fallback provider
+
+8. Use DLQ for poison messages
+
+A poison message is a message that always fails.
+
+Example:
+
+Invalid payload
+Missing user_id
+Bad template_id
+
+If worker keeps retrying it forever, it blocks progress.
+
+Use:
+
+Retry 3 times
+Then move to DLQ
+
+DLQ = Dead Letter Queue.
+
+9. Monitor lag and alert
+
+You should monitor:
+
+consumer lag
+processing latency
+success/failure count
+retry count
+DLQ count
+provider latency
+queue age
+
+Important metric:
+
+oldest message age
+
+Because 10k lag may be fine if messages are tiny and catch up fast, but bad if the oldest message is 30 minutes old.
+
+Example: Notification system with lag protection
+Order Service
+   ↓
+Kafka: notification-high
+   ↓
+High-priority workers
+   ↓
+FCM / Email / SMS
+
+Campaign Service
+   ↓
+Kafka: notification-low
+   ↓
+Marketing workers
+   ↓
+FCM / Email
+
+If campaign creates huge lag:
+
+notification-low lag increases
+notification-high unaffected
+
+That is the correct design.
+
+Interview-ready answer
+
+You can say:
+
+“Kafka lag means consumers are behind producers. I would handle it by monitoring lag, scaling consumers, increasing partitions if needed, separating high-priority and low-priority topics, batching processing, optimizing slow downstream dependencies, and using retries with DLQ for poison messages.”
+
+Final mental model:
+
+Kafka lag = backlog
+Workers = processing capacity
+Partitions = parallelism limit
+Priority queues = protection for critical events
+
+The key idea is:
+
+Different EC2 does not mean different service boundary.
+
+A worker can run on a different EC2 but still belong to the Notification Service.
+
+1. Normal design: workers are part of Notification Service
+
+Even if deployed separately:
+
+EC2-1 → Notification API
+EC2-2 → Push Worker
+EC2-3 → Email Worker
+EC2-4 → SMS Worker
+
+They can all belong to the same logical service:
+
+Notification Service
+
+So they are allowed to access:
+
+notification_db
+
+Architecture:
+
+Notification API  ─┐
+Push Worker       ├──→ notification_db
+Email Worker      ┤
+SMS Worker        ┘
+
+So when Push Worker fails to send notification, it can do:
+
+UPDATE notifications
+SET status = 'RETRY_PENDING',
+    next_retry_at = now() + interval '5 minutes'
+WHERE notification_id = 123;
+
+That is fine because:
+
+Notification DB is owned by Notification Service.
+Workers are part of Notification Service.
+2. EC2 separation is deployment-level, not ownership-level
+
+This is important.
+
+Same service can run on multiple EC2 machines.
+
+Example:
+
+Notification Service
+  ├── API process on EC2-A
+  ├── Worker process on EC2-B
+  ├── Worker process on EC2-C
+  └── DB = notification_db
+
+They are different machines, but same service ownership.
+
+So yes, worker can update retry status.
+
+3. What if DB is owned by another service?
+
+Then the worker should not directly update that DB.
+
+Example bad design:
+
+Email Worker → directly updates Order DB ❌
+
+This violates microservice ownership.
+
+Instead, do one of these:
+
+Option A: Call the owning service API
+
+If Order Service owns order DB:
+
+Notification Worker
+   ↓
+Order Service API
+   ↓
+Order DB
+
+Example:
+
+POST /orders/{orderId}/notification-status
+
+But for notification status, usually Order Service should not care about delivery details.
+
+Option B: Publish an event
+
+Worker publishes:
+
+NotificationDeliveryFailed
+
+Then the owning service consumes it if needed.
+
+Example:
+
+{
+  "event": "NOTIFICATION_DELIVERY_FAILED",
+  "notificationId": 123,
+  "userId": 456,
+  "channel": "PUSH",
+  "reason": "FCM_TIMEOUT"
+}
+
+Then another service can react.
+
+Option C: Keep notification status only in Notification DB
+
+This is usually best.
+
+Order Service says:
+
+Please notify user.
+
+Notification Service owns:
+
+PENDING / SENT / FAILED / RETRY_PENDING
+
+Order Service should not store every delivery attempt unless business needs it.
+
+4. Correct ownership model
+
+For notification system:
+
+Order Service owns order_db
+Payment Service owns payment_db
+Notification Service owns notification_db
+
+So:
+
+Order Service → emits OrderConfirmed
+Notification Service → creates notification row
+Notification Worker → updates notification_db
+
+That is clean.
+
+5. Full flow with retry
+1. Order Service emits ORDER_CONFIRMED
+2. Notification Service creates notification row:
+   status = PENDING
+
+3. Notification Service pushes notification_id to Kafka
+
+4. Push Worker consumes notification_id
+
+5. Push Worker sends to FCM
+
+6. If success:
+   update notification_db → SENT
+
+7. If failure:
+   update notification_db → RETRY_PENDING
+   set next_retry_at
+
+8. Retry worker later picks it again
+
+All DB updates happen inside:
+
+notification_db
+
+So no ownership violation.
+
+6. Alternative: retry using Kafka instead of DB status
+
+Some systems do not rely only on DB polling for retry.
+
+They use retry topics:
+
+notification-push
+notification-push-retry-1m
+notification-push-retry-5m
+notification-push-dlq
+
+Flow:
+
+Worker fails
+→ update attempt in DB
+→ publish message to retry topic
+
+After max retries:
+
+status = FAILED
+message → DLQ
+
+Even in this design, the worker still updates notification_db because it belongs to Notification Service.
+
+7. Final answer
+
+If consumers/workers are on different EC2 instances, they can still update RETRY_PENDING as long as they are part of the same Notification Service and the DB is owned by that service.
+
+But:
+
+If the DB belongs to another service, workers should not update it directly. They should call that service’s API or publish an event.
+
+Mental model
+EC2 boundary ≠ service boundary
+Service ownership decides DB access
+
+So:
+
+Notification Worker → notification_db ✅
+Notification Worker → order_db ❌
+
+1. Where DB bottleneck can happen
+
+In our flow:
+
+Notification API
+  → insert notification row
+
+Workers
+  → update status SENT / RETRY_PENDING / FAILED
+  → insert attempt rows
+  → read retry_pending rows
+
+So DB is used for:
+
+1. INSERT into notifications
+2. INSERT into notification_attempts
+3. UPDATE notification status
+4. SELECT pending/retry records
+5. Query notification history
+
+If traffic is high, all of these hit the same DB.
+
+2. Main DB bottlenecks
+Bottleneck 1: Too many writes
+
+Example:
+
+1 million notifications/minute
+
+For each notification, you may do:
+
+1 insert into notifications
+1 insert into notification_attempts
+1 update notification status
+
+That becomes:
+
+3 million DB writes/minute
+
+This can overload DB CPU, disk I/O, WAL/binlog, locks, and indexes.
+
+Bottleneck 2: Index maintenance
+
+You created:
+
+CREATE UNIQUE INDEX uniq_notification_key
+ON notifications(notification_key);
+
+This is useful, but every insert must also update the index.
+
+So insert is not only:
+
+write row
+
+It is also:
+
+write row + update unique index + maybe other indexes
+
+Too many indexes slow down writes.
+
+Bottleneck 3: Hot rows
+
+Suppose multiple workers update same notification row:
+
+UPDATE notifications
+SET status = 'RETRY_PENDING'
+WHERE notification_id = 123;
+
+If retries/duplicates happen, many processes may touch same row.
+
+This causes row-level lock contention.
+
+Bottleneck 4: Retry polling query
+
+If retry worker keeps running:
+
+SELECT *
+FROM notifications
+WHERE status = 'RETRY_PENDING'
+AND next_retry_at <= now();
+
+This can become slow if not indexed properly.
+
+You need an index like:
+
+CREATE INDEX idx_notifications_retry
+ON notifications(status, next_retry_at);
+
+Otherwise DB may scan many rows.
+
+Bottleneck 5: Large notification history table
+
+Notifications table grows very fast.
+
+Example:
+
+10 million notifications/day
+
+After 30 days:
+
+300 million rows
+
+Queries, indexes, backups, and maintenance become heavier.
+
+Solution:
+
+partition by created_at
+archive old data
+move old history to cold storage
+Bottleneck 6: Connection overload
+
+If many workers run:
+
+100 workers × 10 DB connections = 1000 connections
+
+DB may hit connection limit.
+
+So even before query load, DB can suffer from too many open connections.
+
+Use proper connection pool limits.
+
+Bottleneck 7: Slow queries from dashboards/history APIs
+
+Example:
+
+SELECT *
+FROM notifications
+WHERE user_id = 123
+ORDER BY created_at DESC;
+
+Without proper index:
+
+CREATE INDEX idx_notifications_user_created
+ON notifications(user_id, created_at DESC);
+
+This can become slow and affect worker updates.
+
+3. How to reduce DB bottleneck
+1. Keep queue message small
+
+Queue should carry:
+
+{
+  "notificationId": 123,
+  "channel": "PUSH"
+}
+
+Worker fetches only what it needs.
+
+2. Batch DB writes
+
+Instead of updating one by one:
+
+update notification 1
+update notification 2
+update notification 3
+
+Use batch updates where possible.
+
+3. Use proper indexes
+
+Important indexes:
+
+-- deduplication
+CREATE UNIQUE INDEX uniq_notification_key
+ON notifications(notification_key);
+
+-- retry worker
+CREATE INDEX idx_notifications_retry
+ON notifications(status, next_retry_at);
+
+-- user notification history
+CREATE INDEX idx_notifications_user_created
+ON notifications(user_id, created_at DESC);
+
+-- attempts lookup
+CREATE INDEX idx_attempts_notification
+ON notification_attempts(notification_id);
+4. Partition old data
+
+For high volume:
+
+notifications_2026_07
+notifications_2026_08
+notifications_2026_09
+
+Usually partition by:
+
+created_at
+
+because notification history is time-based.
+
+5. Separate operational DB from analytics
+
+Do not run heavy analytics queries on the main notification DB.
+
+Bad:
+
+Production DB → delivery + reports + analytics
+
+Better:
+
+Production DB → delivery/status
+Data warehouse → analytics/reporting
+6. Use Kafka retry topics instead of heavy DB polling
+
+Instead of constantly scanning DB for retries:
+
+status = RETRY_PENDING
+
+You can publish failed messages to delayed retry queues/topics:
+
+notification-retry-1m
+notification-retry-5m
+notification-retry-30m
+notification-dlq
+
+DB still stores status, but Kafka drives retry timing.
+
+7. Scale workers carefully
+
+Scaling workers helps Kafka lag, but can hurt DB.
+
+Example:
+
+10 workers → DB okay
+100 workers → Kafka lag fixed, DB overloaded
+
+So you need balance:
+
+worker count <= DB capacity
+4. In interview terms
+
+You can say:
+
+“The DB bottleneck in a notification system usually comes from high write volume: inserts into notifications, inserts into attempts, and status updates from workers. Index maintenance, retry polling, hot rows, and connection count can also overload the DB. I would reduce it using batching, proper indexes, partitioning, retry queues, connection pool limits, and separating analytics from operational traffic.”
+
+Final mental model
+Kafka bottleneck = workers cannot consume fast enough
+
+DB bottleneck = workers/API are writing or querying DB faster than DB can handle
+
+And the dangerous part:
+
+Solving Kafka lag by adding more workers can create DB bottleneck.
+
+To handle the DB bottleneck in a notification system, you should not solve it with only one thing. You usually reduce DB pressure from multiple sides:
+
+1. Reduce unnecessary DB writes
+2. Batch writes
+3. Add correct indexes
+4. Partition/archive old data
+5. Move retry scheduling away from DB polling
+6. Control worker concurrency
+7. Split read/write traffic
+8. Shard only when needed
+
+Let’s go step by step.
+
+1. Reduce DB writes
+
+A bad design may do too many writes per notification:
+
+1. Insert notification row
+2. Insert attempt row
+3. Update status to PROCESSING
+4. Update status to SENT
+5. Update provider response
+
+For 1 million notifications, this becomes millions of DB writes.
+
+A better design is to avoid unnecessary intermediate status updates.
+
+Instead of:
+
+PENDING → PROCESSING → SENT
+
+You can often do:
+
+PENDING → SENT
+
+Only write PROCESSING if you really need it.
+
+2. Batch DB writes
+
+Instead of each worker updating DB one row at a time:
+
+UPDATE notifications SET status = 'SENT' WHERE notification_id = 1;
+UPDATE notifications SET status = 'SENT' WHERE notification_id = 2;
+UPDATE notifications SET status = 'SENT' WHERE notification_id = 3;
+
+Batch it:
+
+UPDATE notifications
+SET status = 'SENT', sent_at = now()
+WHERE notification_id IN (1, 2, 3, 4, 5);
+
+Same for inserting attempts:
+
+Insert 100 attempts together
+instead of 100 separate inserts
+
+This reduces DB round trips.
+
+3. Add the right indexes
+
+For retry processing:
+
+CREATE INDEX idx_notifications_retry
+ON notifications(status, next_retry_at);
+
+For user notification history:
+
+CREATE INDEX idx_notifications_user_created
+ON notifications(user_id, created_at DESC);
+
+For deduplication:
+
+CREATE UNIQUE INDEX uniq_notification_key
+ON notifications(notification_key);
+
+But don’t add too many indexes, because every index slows down inserts and updates.
+
+4. Partition the notifications table
+
+Notification tables grow very fast.
+
+Example:
+
+10 million notifications/day
+300 million/month
+
+So partition by time:
+
+notifications_2026_07
+notifications_2026_08
+notifications_2026_09
+
+Why this helps:
+
+Recent notifications → hot partition
+Old notifications → archived or cold partition
+
+User history queries and cleanup become easier.
+
+5. Archive old data
+
+Do not keep all notification history in the main operational DB forever.
+
+Example policy:
+
+Last 30 days → main DB
+Older than 30 days → S3 / data warehouse / archive DB
+
+This keeps your main DB small and fast.
+
+6. Use Kafka retry topics instead of DB polling
+
+Bad retry design:
+
+SELECT *
+FROM notifications
+WHERE status = 'RETRY_PENDING'
+AND next_retry_at <= now();
+
+If this runs constantly on huge table, DB load increases.
+
+Better:
+
+notification-main
+notification-retry-1m
+notification-retry-5m
+notification-retry-30m
+notification-dlq
+
+Flow:
+
+Worker fails sending
+→ update attempt/status
+→ publish message to retry topic
+→ retry later
+
+Now Kafka controls retry timing, not constant DB scanning.
+
+7. Control worker concurrency
+
+If Kafka lag happens, people often add more workers.
+
+But too many workers can overload DB.
+
+Example:
+
+10 workers → DB okay
+100 workers → DB overloaded
+
+So limit worker concurrency:
+
+max 50 workers for push
+max 10 workers for email
+max 5 workers for SMS
+
+Also use connection pool limits:
+
+Each worker should not open too many DB connections
+8. Separate high-priority and low-priority notifications
+
+Don’t let marketing traffic overload the same DB path as OTP/security alerts.
+
+Use separate queues/topics:
+
+notification-critical
+notification-normal
+notification-marketing
+
+And separate workers.
+
+For example:
+
+OTP/security → strict tracking in DB
+Marketing → lighter tracking / batch tracking
+
+For marketing, you may not need to store every single attempt in detail.
+
+9. Use caching where possible
+
+Some data is repeatedly read by workers:
+
+user preferences
+templates
+provider config
+rate limits
+device tokens
+
+Cache these in Redis or in-memory cache.
+
+Example:
+
+template_id → template body
+user_id → notification preferences
+
+This reduces DB reads.
+
+10. Split read and write workload
+
+Operational writes:
+
+insert notification
+update status
+insert attempts
+
+User-facing reads:
+
+show notification history
+
+Analytics reads:
+
+delivery report
+campaign metrics
+
+Don’t run all on same DB.
+
+Better:
+
+Primary DB → writes
+Read replica → user history reads
+Data warehouse → analytics/reporting
+11. Use a summary table for analytics
+
+Instead of scanning attempts table every time:
+
+SELECT COUNT(*)
+FROM notification_attempts
+WHERE status = 'FAILED';
+
+Maintain summary counters:
+
+notification_metrics_daily
+
+Example:
+
+date | channel | sent_count | failed_count
+
+Workers update metrics asynchronously.
+
+12. Shard the notification DB if needed
+
+If one DB cannot handle writes even after optimization, then shard.
+
+Possible shard key:
+
+user_id
+
+Example:
+
+notification_db_shard_1 → users 1–1M
+notification_db_shard_2 → users 1M–2M
+notification_db_shard_3 → users 2M–3M
+
+Then user notification history is easy:
+
+user_id → correct shard
+
+But global analytics becomes harder, so send analytics events to data warehouse separately.
+
+Recommended production design
+
+For a scalable notification system:
+
+Notification API
+   ↓
+Kafka
+   ↓
+Workers
+   ↓
+Notification DB
+
+Use:
+
+1. Kafka for buffering
+2. Workers for async delivery
+3. Batch DB writes
+4. Retry topics instead of heavy polling
+5. Partition notification table by time
+6. Cache templates/preferences
+7. Read replicas for history
+8. Data warehouse for analytics
+9. Sharding only when DB still cannot handle load
+Interview-ready answer
+
+You can say:
+
+“To handle DB bottlenecks in a notification system, I would reduce write amplification, batch worker updates, add only necessary indexes, partition the notification table by time, archive old data, use Kafka retry topics instead of DB polling, control worker concurrency, cache templates and user preferences, and separate analytics from the operational DB. If one DB is still insufficient, I would shard by user_id.”
+
+Final mental model:
+
+Kafka absorbs traffic spikes.
+Workers control processing rate.
+DB stores state/history.
+If workers write faster than DB can handle, throttle workers and batch writes.
+
+check these and add if any improvements required
+
+Yes, template_id as UUID is a good clean design.
+
+Instead of:
+
+ORDER_CONFIRMED_PUSH_001
+ORDER_CONFIRMED_PUSH_002
+
+you use:
+
+template_id = 7f3b9c2e-1a55-4e31-9b7e-5c1234567890
+
+And keep readable fields separately:
+
+CREATE TABLE notification_templates (
+    template_id UUID PRIMARY KEY,
+    event_type VARCHAR(100) NOT NULL,
+    channel VARCHAR(50) NOT NULL,
+    language VARCHAR(20) DEFAULT 'en',
+    title_template TEXT,
+    body_template TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP
+);
+
+Example rows:
+
+template_id                            event_type        channel   is_active
+uuid-1                                 ORDER_CONFIRMED   PUSH      false
+uuid-2                                 ORDER_CONFIRMED   PUSH      true
+
+Your notification row stores:
+
+CREATE TABLE notifications (
+    notification_id BIGINT PRIMARY KEY,
+    notification_key VARCHAR(255) UNIQUE,
+    user_id BIGINT NOT NULL,
+    event_type VARCHAR(100),
+    template_id UUID,
+    title TEXT,
+    body TEXT,
+    status VARCHAR(50),
+    created_at TIMESTAMP,
+    sent_at TIMESTAMP
+);
+
+And add FK if same DB:
+
+ALTER TABLE notifications
+ADD CONSTRAINT fk_notifications_template
+FOREIGN KEY (template_id)
+REFERENCES notification_templates(template_id);
+
+Important: event_type remains same, template_id changes.
+
+event_type = ORDER_CONFIRMED
+
+Old template:
+template_id = uuid-1
+is_active = false
+
+New template:
+template_id = uuid-2
+is_active = true
+
+For selecting current template:
+
+SELECT *
+FROM notification_templates
+WHERE event_type = 'ORDER_CONFIRMED'
+  AND channel = 'PUSH'
+  AND language = 'en'
+  AND is_active = true;
+
+You should also enforce only one active template per event/channel/language.
+
+In PostgreSQL:
+
+CREATE UNIQUE INDEX uniq_active_template
+ON notification_templates(event_type, channel, language)
+WHERE is_active = true;
+
+Final model:
+
+event_type = why notification is sent
+template_id UUID = exact template row used
+is_active = use this template for new notifications or not
+
+So yes — UUID as primary key is perfectly fine.
