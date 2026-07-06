@@ -32,6 +32,8 @@ End-to-end designs that apply the concepts above.
 | [BookMyShow — System Design](system-design/bookmyshow-system-design.md) | Seat locking, atomic conditional updates, Redis+DB hybrid lock, payments, outbox+saga, scaling, CAP trade-offs |
 | [BookMyShow — HLD & LLD](system-design/bookmyshow-hld-lld.md) | High- & low-level design: architecture, DDL schema, API contracts, state machines, class design & interfaces |
 | [URL Shortener — System Design](system-design/url-shortener-system-design.md) | base62 encoding, distributed ID generation (KGS/Snowflake), redirects (301 vs 302), scaling & reliability |
+| [Notification System — System Design](system-design/notification-system-design.md) | Async queue-based delivery, multi-channel workers, fan-out, idempotency, retries/DLQ, templates, scheduling, push/in-app/WebSocket |
+| [Notification System — HLD & LLD](system-design/notification-system-hld-lld.md) | HLD/LLD companion: architecture, full DDL, API contracts, orchestrator/worker class design, state machines, sequences |
 
 ---
 
