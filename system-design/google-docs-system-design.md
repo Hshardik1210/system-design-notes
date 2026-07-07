@@ -2,6 +2,8 @@
 
 > **Core challenge:** let **many users edit the same document simultaneously** and see each other's changes in **real time**, with **no lost edits** and **guaranteed convergence** (everyone ends with identical content) — despite concurrent, conflicting edits and network delays. The heart is **conflict resolution**: **Operational Transformation (OT)** or **CRDTs**.
 
+> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+
 ---
 
 ## Contents
@@ -38,6 +40,41 @@ Each editor sends small OPERATIONS ("insert 'x' at pos 5", "delete pos 8")
 
 You do **not** send the whole document on every keystroke — you send **operations**, resolve conflicts, and broadcast. The two invariants: **causality** (see edits in a sensible order) and **convergence** (everyone ends identical).
 
+### Plain-English: what problem are we even solving?
+
+Picture a single Google Doc open on **five laptops at once** — you, three teammates, and your manager — all typing into the **same paragraph** at the **same moment**. Everyone should see everyone else's letters appear almost instantly, nobody's typing should get erased, and when the dust settles **all five screens must show the exact same text**. That's the whole job.
+
+The naive idea — "whenever someone types, upload the whole document and overwrite the server copy" — fails badly:
+
+- If you and I both save at nearly the same time, **the last save wins and wipes out the other person's edits.** That's a lost edit, and it's unacceptable.
+- Sending the entire document on every keystroke is **huge and slow** for a big doc.
+
+So instead of shipping the *whole document*, each editor ships **tiny descriptions of what changed** — "insert the letter `x` at position 5", "delete the character at position 8". These are called **operations** (ops). A central brain then figures out how to fit everyone's ops together without anyone stepping on anyone else.
+
+Analogy: it's like a group editing a **shared shopping list on a whiteboard**. Instead of everyone rewriting the whole list, each person just calls out small instructions ("add milk at the top", "cross off eggs"), and a coordinator applies them one at a time so the final list is consistent for everyone.
+
+```java
+// We never send "here is the whole document". We send small operations like these:
+class Operation {
+    String type;   // "INSERT" or "DELETE"
+    int    pos;    // where in the text
+    String ch;     // the character(s) for an insert
+}
+
+// You type "x" at the start of "HELLO":
+Operation op = new Operation("INSERT", 0, "x");   // <-- this tiny thing is what travels over the network
+```
+
+#### Q: Why is sending operations better than sending the whole document?
+
+- **Small + fast.** An op is a few bytes; a document can be megabytes. Real-time typing needs tiny messages.
+- **Mergeable.** Two ops ("insert at 0" and "delete at 4") can both be applied so *both people's intent survives*. Two whole-document saves can't merge — one just clobbers the other.
+
+#### Q: What do "causality" and "convergence" actually mean?
+
+- **Causality** = edits are seen in a sensible order (if I reply to your sentence, everyone should see your sentence before my reply).
+- **Convergence** = no matter what order the ops arrive in on each laptop, **everyone ends up with identical text**. This is the promise the whole system exists to keep.
+
 ---
 
 ## 2. Requirements
@@ -52,6 +89,23 @@ You do **not** send the whole document on every keystroke — you send **operati
 **Non-functional**
 - Real-time, **eventually convergent**, **durable** (no lost edits), available, scales to many concurrent editors per doc.
 
+### Plain-English: what the requirements really ask for
+
+Think of the features as promises you make to the people in the doc:
+
+| Requirement | What it means in plain words |
+| --- | --- |
+| **Real-time** | When your teammate types, you see it within a blink (~100ms) — it feels like you're in the same room. |
+| **Convergence** | Everyone's screen ends up identical, always. No "my copy says X, yours says Y." |
+| **No lost edits** | If two people type at once, *both* survive. Nobody's work silently disappears. |
+| **Cursors & presence** | You can see the little colored cursors of other people and who's currently in the doc. |
+| **Comments/suggestions** | Notes attached to specific words that stay attached even as text moves around. |
+| **Version history** | You can scroll back in time and restore an older version. |
+| **Undo/redo** | Ctrl+Z removes *your* last change, even while others keep typing. |
+| **Offline edits** | You can keep typing on a plane with no wifi; it all syncs when you reconnect. |
+
+The two words that make this hard are **"simultaneously"** (everyone at once) and **"convergence"** (yet everyone identical). Almost every design decision later exists to keep those two promises at the same time.
+
 ---
 
 ## 3. Capacity Estimation
@@ -65,6 +119,22 @@ Fan-out: an op → all N editors of that doc (N small) → cheap real-time broad
 ```
 
 > Unlike feeds, fan-out is tiny (editors per doc), but **latency + convergence** are strict. The scaling unit is the **per-document session**, not global.
+
+### Plain-English: how big is this, really?
+
+Compare it to something like Twitter. On Twitter, one celebrity tweet fans out to **millions** of followers — that's a "wide" broadcast problem. Google Docs is the opposite: a single doc usually has **a handful of editors** (1–100), so sending an edit to "everyone in the doc" is **cheap**.
+
+The hard part isn't *volume*, it's **speed and correctness on one doc**:
+
+- An active typist produces **several ops per second**; a busy meeting-notes doc might see hundreds of ops/sec — but only across a few people.
+- Each op is **tiny** (a few bytes), *but they never stop*, so the list of ops for a hot doc grows fast. If we replayed millions of ops every time someone opened the doc, loading would crawl → that's why we take periodic **snapshots** (a saved full copy) so we only replay ops *since* the snapshot (see §9).
+
+```
+One doc's history:  [snapshot @ rev 10000]  +  op 10001, op 10002, ... op 10250
+Open the doc = load the snapshot, then apply just the ~250 recent ops. Fast.
+```
+
+Key mental shift: we scale **per document**, not globally. Each doc is its own little live session. A billion docs is fine because they're independent; the challenge is making *one* doc's session fast and always-convergent.
 
 ---
 
@@ -83,6 +153,35 @@ Both edits were based on "HELLO" (concurrent). We must reconcile so both converg
 
 - **Last-write-wins on the whole doc = lost edits** (one user's change clobbers the other's). Unacceptable.
 - Need **fine-grained op merging** that preserves both intents and converges.
+
+### Plain-English: why edits "drift apart"
+
+The root problem: both people made their edit while looking at the **same starting text** ("HELLO"). Neither knew about the other's edit yet — the edits are **concurrent**. Now each laptop has to apply *both* edits, but the edits reference **positions** ("position 4"), and one edit can **shift** the positions the other one assumed.
+
+Analogy: two editors mark up the **same printed page**. Editor A writes "insert a word at the very start of line 1." Editor B writes "delete the 4th word of line 1." If you blindly do both without thinking, you might delete the *wrong* word — because A's insert pushed everything to the right, so "the 4th word" isn't the 4th word anymore.
+
+Here's the divergence in code — same two ops, applied in different orders, giving **different results**:
+
+```java
+// Start: "HELLO"
+// A = insert 'X' at pos 0     B = delete char at pos 4 (the 'O')
+
+// Laptop 1 applies A then B:
+"HELLO" --A--> "XHELLO"        // now pos 4 is the second 'L', not 'O'!
+        --B--> "XHELO"         // WRONG: deleted an 'L', kept the 'O'
+
+// Laptop 2 applies B then A:
+"HELLO" --B--> "HELL"
+        --A--> "XHELL"         // this is what we actually want
+
+// Laptop1 = "XHELO",  Laptop2 = "XHELL"  ->  DIVERGED. Two people, two different docs. 
+```
+
+The fix can't be "pick one and throw the other away" (that loses an edit). We need to **adjust the positions** so both ops land where the humans *intended*, no matter what order they're applied. That adjustment is the job of **Operational Transformation (§5)** or, alternatively, **CRDTs (§6)**.
+
+#### Q: Why not just lock the document while someone types?
+
+Because then only one person could edit at a time — that's not collaboration, that's taking turns. The whole point is *simultaneous* editing, so we need to merge concurrent edits, not prevent them.
 
 ---
 
@@ -124,6 +223,80 @@ Incoming remote op → client transforms it against its own pending un-acked ops
 | Pros | Compact ops; proven at scale (Google Docs) |
 | Cons | **Transform functions are hard to get right** (many op-pair cases); needs a central server |
 
+### Plain-English: "transform" = shift the position so intent survives
+
+The one idea in OT: when two edits happened at the same time, the server **rewrites the positions** in one op to account for the other, so applying them in the server's chosen order still does what each person meant.
+
+Analogy: you tell a friend "delete the 10th book on the shelf." But *before* they get there, someone **inserts 3 new books at the front**. The "10th book" is now the 13th book. A smart assistant would **transform** your instruction to "delete the 13th book" so you still remove the book you actually meant. OT is that smart assistant for text positions.
+
+```java
+// transform(myOp, otherOp) returns myOp adjusted for the fact that otherOp already happened.
+// Example: someone INSERTED text before my position -> my position must shift right.
+
+Operation transform(Operation mine, Operation other) {
+    if (other.type.equals("INSERT") && other.pos <= mine.pos) {
+        // an insert happened at or before me -> everything after it slid right by 1
+        return new Operation(mine.type, mine.pos + 1, mine.ch);
+    }
+    if (other.type.equals("DELETE") && other.pos < mine.pos) {
+        // a delete happened before me -> everything after it slid left by 1
+        return new Operation(mine.type, mine.pos - 1, mine.ch);
+    }
+    return mine;   // the other edit was after me -> my position is unaffected
+}
+```
+
+Walk through the "HELLO" example that diverged in §4, now with transform:
+
+```java
+// Start "HELLO".  A = insert('X', 0).  B = delete(4).  Server picks order: B then A.
+"HELLO" --B--> "HELL"
+
+// Now transform A against B. B deleted pos 4, which is AFTER A's pos 0,
+// so A's position is NOT affected -> A stays insert('X', 0).
+"HELL"  --A'--> "XHELL"   // correct, and every client that runs this converges to "XHELL"
+```
+
+### Plain-English: the un-acked buffer (why your typing feels instant)
+
+Google Docs feels instant because your client **does not wait** for the server. It applies your keystroke **locally right away**, and *also* remembers it in a **pending buffer** until the server confirms (acks) it. When a remote op arrives from someone else, the client first **transforms it against your still-pending ops** before showing it — so your local edits and their edits stay consistent.
+
+```java
+class ClientDoc {
+    List<Operation> pending = new ArrayList<>();   // my ops the server hasn't acked yet
+    long lastAckedRevision = 0;
+
+    // I type: show it immediately (optimistic), and remember it as pending.
+    void onLocalEdit(Operation op) {
+        applyLocally(op);
+        pending.add(op);
+        server.send(op, lastAckedRevision);   // tell the server, but DON'T block on it
+    }
+
+    // A remote op arrives: transform it past my pending ops, THEN apply.
+    void onRemoteOp(Operation remote) {
+        for (Operation mine : pending) {
+            remote = transform(remote, mine);   // account for edits I made that the server hasn't merged yet
+        }
+        applyLocally(remote);
+    }
+
+    // Server confirms one of my ops: drop it from pending.
+    void onAck(long revision) {
+        pending.remove(0);
+        lastAckedRevision = revision;
+    }
+}
+```
+
+#### Q: Why does OT need a central server?
+
+Because *someone* has to pick the **one official order** of edits and be the referee that assigns revision numbers. Every client transforms against that single authority's order, which is what guarantees everyone converges. (This is why one doc is pinned to one "owning" server — see §7.)
+
+#### Q: Why are transform functions considered "hard"?
+
+There are many op-pair cases: insert-vs-insert, insert-vs-delete, delete-vs-delete, formatting-vs-delete, ties at the *same* position, etc. Each must be provably correct so that *both* orders reach the same result. Getting a single case subtly wrong causes rare divergence bugs — which is exactly the pain CRDTs (§6) try to avoid.
+
 ---
 
 ## 6. CRDTs (the alternative)
@@ -149,6 +322,52 @@ Any replica applying both in any order → "XHELL"  ✓ (ids are absolute)
 
 > **Interview:** know both. OT = central server + transform (compact, but hard transforms). CRDT = commutative ops with unique ids that merge anywhere (great offline/P2P, more metadata). Modern editors trend to **CRDTs**.
 
+### Plain-English: give every character a permanent name tag
+
+OT fights over *positions* (which shift constantly). CRDTs sidestep the fight entirely: **every character gets its own globally-unique, permanent id** — like a name tag it keeps forever. Once a character has a stable id, you never say "position 4" again; you say "the character with id `X`", which can never be confused.
+
+Analogy: **fractional page numbers in a binder.** The pages are numbered 1, 2, 3. To slip a page *between* page 1 and page 2, you don't renumber everything — you just call the new page **1.5**. Need another between 1 and 1.5? Call it **1.25**. Everyone, anywhere, agrees where page 1.25 sits, in any order they file the pages. Deleting a page? Don't rip it out — stamp it "VOID" (a **tombstone**) so nobody re-inserts around a hole that used to exist.
+
+```java
+// Each character carries an id that sorts it into place. No positions, ever.
+class CrdtChar {
+    double id;        // fractional index: 1, 2, 3 ... insert between -> 1.5, 1.25, etc.
+    char   value;
+    boolean deleted;  // "tombstone" — kept, but hidden, so merges stay consistent
+}
+
+// "HELLO" -> H(1) E(2) L(3) L(4) O(5)
+
+// A inserts 'X' before H: pick an id smaller than 1, e.g. 0.5
+CrdtChar x = new CrdtChar(0.5, 'X', false);
+
+// B deletes O: don't remove it, tombstone it
+o.deleted = true;
+
+// To render, sort by id and skip tombstones:  X(0.5) H(1) E(2) L(3) L(4)  ->  "XHELL"
+// ANY replica applying these two ops in ANY order gets "XHELL". No transform needed.
+```
+
+Because each op refers to an **absolute id** (not a position that shifts), two replicas can apply the same set of ops in **any order** and still land on identical text. That property is called **commutativity**, and it's the whole magic of CRDTs.
+
+#### Q: OT vs CRDT — what's the actual difference?
+
+| | **OT** | **CRDT** |
+| --- | --- | --- |
+| The trick | Rewrite (transform) shifting **positions** | Give each char a permanent **id** so order doesn't matter |
+| Needs a central server? | **Yes** (one authority orders + transforms) | **No** (ops merge anywhere, even peer-to-peer) |
+| Main cost | Transform functions are hard to write correctly | Extra metadata: every char carries an id + deleted chars linger as tombstones |
+| Great for offline / P2P? | Harder | **Natural fit** |
+| Famous users | Google Docs | Figma, Yjs/Automerge, Apple Notes |
+
+#### Q: What is a "tombstone" and why keep deleted characters around?
+
+A **tombstone** is a character you mark as deleted instead of actually removing. Why keep it? Imagine you delete char `L(4)` while, at the same time, a teammate inserts a character "right after `L(4)`". If you truly erased `L(4)`, their insert would point at a **hole** and merges could disagree. Keeping the tombstone gives every replica a stable anchor so merges stay consistent. The downside: tombstones pile up (memory), so they're **garbage-collected** once every replica has definitely seen the delete (see §14).
+
+#### Q: If CRDTs are simpler to merge, why did Google Docs use OT?
+
+OT came first and is very **compact** (ops are tiny, no per-char id overhead), and Google Docs already has a reliable central server, so OT's biggest weakness (needing a central authority) wasn't a problem for them. CRDTs shine when you *don't* want a central authority — offline-first apps, peer-to-peer, or local-first tools — which is why **newer** editors lean CRDT.
+
 ---
 
 ## 7. Real-Time Sync Architecture
@@ -167,12 +386,109 @@ Clients ⇄ WebSocket ⇄ Collaboration Server (per-document session)
 - **WebSocket** for low-latency bidirectional sync; ack + revision numbers.
 - Multi-node fan-out (if a doc's editors span nodes) via a pub-sub bus — but usually one doc = one owning node.
 
+### Plain-English: one doc, one "referee" server, over a phone line that stays open
+
+Two ideas make real-time sync work: an always-open connection (**WebSocket**) and a single referee per doc (**sticky routing**).
+
+**WebSocket = a phone call, not letters.** A normal web request is like mailing a letter: you send one, wait for a reply, done. That's too slow and one-directional for live typing. A **WebSocket** is like keeping a **phone line open** — either side can talk at any moment, instantly, without redialing. The server can *push* a teammate's edit to you the millisecond it happens.
+
+**Sticky routing = every editor of one doc talks to the SAME server.** Remember from §5 that OT needs one authority to pick the official order of edits. So all editors of doc #42 are routed to the **one node that owns doc #42**. That node keeps the current document in memory and stamps each incoming op with the next revision number — it's the referee.
+
+```
+   You ─┐
+Teammate├──WebSocket──►  Node 3  (owns doc #42, holds it in memory) ──► append op to log
+Manager ─┘                  │                                         (durable source of truth)
+                            └──WebSocket──► pushes each merged op back to all 3 of you
+```
+
+Here's the referee loop in code:
+
+```java
+class CollabSession {          // one instance PER document, living on its owning node
+    String docText;            // authoritative in-memory copy
+    long   revision = 0;       // the official global order counter for this doc
+
+    // called when ANY editor of this doc sends an op over their WebSocket
+    synchronized void onOp(Operation incoming, long baseRevision, Client sender) {
+        // 1. transform the op against everything that happened since the client's base
+        Operation merged = transformAgainstOpsSince(incoming, baseRevision);
+
+        // 2. apply it and assign the next official revision number
+        docText = apply(docText, merged);
+        long newRev = ++revision;
+
+        // 3. persist it (durability) ...
+        opLog.append(docId, newRev, merged);
+
+        // 4. ... ack the sender and broadcast to everyone else on this doc
+        sender.send(new Ack(newRev));
+        for (Client other : editorsExcept(sender)) {
+            other.send(new RemoteOp(newRev, merged, sender.userId));
+        }
+    }
+}
+```
+
+#### Q: Why must all editors of a doc hit the same node? Isn't that a bottleneck?
+
+For **OT you need one authority** to order edits, so yes — one doc lives on one node at a time. It's not a real bottleneck because a single doc has few editors and ops are tiny; one node handles it easily. Different docs live on different nodes, so the *system* scales by spreading millions of docs across many nodes (this is **sharding by doc**, see §16).
+
+#### Q: What if editors are connected to different nodes?
+
+Usually they aren't (sticky routing sends them all to the owner). If a doc's editors truly span nodes, the nodes relay ops to each other over a **pub-sub bus** (Kafka/Redis). But the common, simplest case is "one doc = one owning node."
+
+#### Q: What happens if that owning node crashes?
+
+The op log is durable, so clients just reconnect, the doc gets re-homed on another node, and it **rebuilds its in-memory state from the last snapshot + the ops after it** (see §9 and §16). Clients resync from their last acked revision — no edits lost.
+
 ---
 
 ## 8. Presence, Cursors & Comments
 
 - **Cursors/selections + presence** are **ephemeral** → broadcast on the same channel, kept in Redis (not durably persisted).
 - **Comments/suggestions** must **anchor to a position that survives edits** — anchor to a **stable op id / character id / range**, not an absolute offset (which shifts as text changes). When the anchored text is edited/deleted, reposition or orphan the comment.
+
+### Plain-English: the colored cursors are "throwaway" info
+
+Those little colored cursors and name flags showing where teammates are? That data is **ephemeral** — throwaway. If it's lost for a second, nobody cares; it'll be resent on the next keystroke. So we **don't** write it to the durable op log. We just broadcast it and cache the latest value in **Redis** (fast, in-memory).
+
+Analogy: the *document text* is like the ink on the page (permanent, saved forever). A cursor is like a **laser pointer dot** someone is waving at the page — useful to see live, but pointless to save; when they leave, the dot just disappears.
+
+```java
+// Cursor / presence: broadcast, cache in Redis, never persisted to the op log.
+void onCursorMove(String docId, String userId, int cursorPos) {
+    redis.setEx("cursors:doc:" + docId + ":" + userId, cursorPos, 30 /* sec TTL */);
+    broadcastToDoc(docId, new CursorUpdate(userId, cursorPos));   // fire and forget
+}
+// TTL means: if a user goes silent for 30s, their cursor auto-vanishes ("left the doc").
+```
+
+### Plain-English: comments must "stick" to words, not positions
+
+A comment says "this sentence is unclear." If you anchor that comment to **"position 120"** and someone adds a paragraph above, position 120 now points at a *totally different* sentence — the comment slides onto the wrong text. So we anchor comments to a **stable id** (the same kind of permanent character id from CRDTs, §6), not a number that shifts.
+
+Analogy: it's the difference between a bookmark that says **"page 120"** (breaks if pages are inserted) versus a **sticky note physically attached to a specific paragraph** (moves with the paragraph, stays correct).
+
+```java
+class Comment {
+    String body;
+    String anchorStartId;   // stable char id where the comment begins (NOT an offset like 120)
+    String anchorEndId;     // stable char id where it ends
+}
+
+// Text shifts around freely; the comment still points at the right words
+// because it's tied to the characters' ids, not their current positions.
+// If the anchored characters are ALL deleted -> the comment is "orphaned"
+// (shown as "comment on deleted text") instead of silently jumping elsewhere.
+```
+
+#### Q: Why not just save cursors in the database like the text?
+
+Because cursors change many times per second and are worthless a moment later. Persisting them would be a huge write load for data nobody ever needs to recover. Redis + broadcast is cheap and perfectly good for "live, throwaway" state.
+
+#### Q: What happens to a comment when its anchored text is deleted?
+
+You either **reposition** it (snap it to the nearest surviving text) or mark it **orphaned** ("original text was deleted"). The one thing you must *not* do is let it silently latch onto unrelated text — that's why offsets are a trap and stable ids are the fix.
 
 ---
 
@@ -187,6 +503,42 @@ Version history = named snapshots / revision checkpoints
 - Append-only **op log = source of truth** (Event Sourcing); **snapshots** bound replay cost + speed up load.
 - **Autosave** continuously (it's just the op log); history lets you restore any checkpoint / see who changed what.
 
+### Plain-English: the doc is a bank ledger, not a saved file
+
+Most apps save "the current file." A collaborative editor instead keeps the **complete list of every edit ever made** — the **op log** — and treats *that* as the truth. The current document is just what you get by **replaying** all those edits from the start. This is called **Event Sourcing**.
+
+Analogy: a **bank account.** The bank doesn't just store "balance = ₹5,000." It stores every transaction (+₹1000, −₹200, +₹4200 …). Your balance is *derived* by replaying the transactions. Benefits: perfect history ("who changed what, when"), and you can reconstruct the balance at any past moment.
+
+But replaying **millions** of edits every time someone opens the doc would be painfully slow. So periodically we save a **snapshot** — a full copy of the document at a certain revision — like the bank printing a **monthly statement**. To open the doc, load the latest snapshot and replay only the *few* edits since it.
+
+```java
+// The doc = latest snapshot + the ops that came after it.
+Document loadDoc(String docId) {
+    Snapshot snap = db.latestSnapshot(docId);        // e.g. full text at revision 10000
+    List<Operation> recent = db.opsAfter(docId, snap.revision);  // ops 10001..10250 only
+    Document doc = snap.toDocument();
+    for (Operation op : recent) {
+        doc = apply(doc, op);                         // replay just the recent handful
+    }
+    return doc;
+}
+
+// Every few hundred/thousand ops, save a fresh snapshot so replay stays short.
+void maybeSnapshot(String docId, long revision) {
+    if (revision % 1000 == 0) {
+        db.saveSnapshot(docId, revision, currentText(docId));
+    }
+}
+```
+
+#### Q: What's the difference between a snapshot and version history?
+
+A **snapshot** is a performance trick (so loading is fast) — automatic and internal. **Version history** is a user feature: **named checkpoints** ("v2 — before the rewrite") that a person can browse and restore. Both are "a saved state of the doc," but snapshots exist to bound replay cost, while versions exist for humans to time-travel.
+
+#### Q: Where does "autosave" come from — is there a Save button?
+
+There's no Save button because **every keystroke is already an op appended to the durable log.** "Autosave" is just the natural side effect of logging every op. Nothing is ever unsaved.
+
 ---
 
 ## 10. Undo/Redo in Collaboration
@@ -200,6 +552,49 @@ Undo = apply the INVERSE of your operation, TRANSFORMED against everything that 
 
 - Each client keeps an **undo stack of its own ops**; undo generates an inverse op that is transformed against intervening remote ops (OT), or removes the specific char id (CRDT).
 - Redo re-applies (also transformed). This is why edits are modeled as reversible **Commands**.
+
+### Plain-English: Ctrl+Z undoes YOUR edit, not the last thing that happened
+
+Solo apps make undo easy: reverse whatever happened last. In a shared doc that's wrong. If your teammate typed after you, and you hit Ctrl+Z, you expect to undo **your own** last edit — not delete *their* sentence!
+
+Analogy: three people drawing on one shared whiteboard. When *you* say "undo," you mean **erase the line I just drew**, even if two other people scribbled after you. You reach back to *your* last stroke, not the most recent stroke on the board.
+
+So each client keeps a **personal undo stack of its own ops**. Undo = create the **inverse** of your op (insert → delete, delete → re-insert), but first **transform** it against everything that happened since, so it lands in the right place.
+
+```java
+class UndoManager {
+    Deque<Operation> myUndoStack = new ArrayDeque<>();   // only MY ops
+
+    void onMyEdit(Operation op) {
+        myUndoStack.push(op);
+    }
+
+    void undo() {
+        Operation original = myUndoStack.pop();
+        Operation inverse  = invert(original);   // inserted 'X' -> now delete that 'X'
+
+        // others edited since I did -> shift my inverse so it hits the RIGHT spot
+        for (Operation since : opsSince(original)) {
+            inverse = transform(inverse, since);
+        }
+        applyAndBroadcast(inverse);
+    }
+
+    Operation invert(Operation op) {
+        return op.type.equals("INSERT")
+            ? new Operation("DELETE", op.pos, op.ch)   // undo an insert = delete it
+            : new Operation("INSERT", op.pos, op.ch);  // undo a delete = put it back
+    }
+}
+```
+
+#### Q: Why is each edit modeled as a "Command"?
+
+Because a Command bundles **do** *and* **undo** together (an op plus its inverse). That uniform shape is what makes undo, redo, logging, and replay all work the same way — it's the **Command pattern** (see §15).
+
+#### Q: Does undo work the same in CRDT?
+
+Same idea, cleaner mechanics: instead of transforming a position, you just **re-tombstone / un-tombstone the specific character id** you touched. Because ids are stable (§6), there's no position to shift.
 
 ---
 
@@ -245,6 +640,36 @@ CREATE TABLE doc_versions ( version_id BIGINT PRIMARY KEY, doc_id BIGINT, revisi
 
 > **Tables to consider:** documents, **doc_operations** (op log — key), doc_snapshots, doc_permissions, doc_shares, comments, doc_versions, users. Presence/cursors + routing = Redis; images → blob.
 
+### Plain-English: what each table is for
+
+Don't let the SQL intimidate you — here's the plain purpose of each table:
+
+| Table | In one sentence |
+| --- | --- |
+| **documents** | The doc's "cover page": title, owner, and what revision it's currently on. |
+| **doc_operations** | The **star of the show** — every single edit ever made, in order. This *is* the document (Event Sourcing, §9). |
+| **doc_snapshots** | Occasional full copies of the doc so we don't replay millions of ops on open. |
+| **doc_permissions** | Who can do what (owner / editor / commenter / viewer). |
+| **doc_shares** | The "anyone with the link" tokens and their access level. |
+| **comments** | Notes anchored to stable char ids (so they survive edits, §8). |
+| **doc_versions** | Human-named checkpoints for the version-history feature. |
+| Redis (not a table) | Throwaway live state: cursors, presence, and which node currently owns each doc. |
+
+The key insight is the **primary key on the op log**: `(doc_id, revision)`. That `revision` is the **official global order** for a doc — the referee server (§7) hands out revision numbers one at a time, and they're what everyone converges against.
+
+```sql
+-- Reconstruct a doc: grab the latest snapshot, then the ops after it, in revision order.
+SELECT content FROM doc_snapshots
+ WHERE doc_id = 42 ORDER BY revision DESC LIMIT 1;         -- newest snapshot
+
+SELECT op_type, position, payload FROM doc_operations
+ WHERE doc_id = 42 AND revision > 10000 ORDER BY revision; -- replay just these
+```
+
+#### Q: Why store operations instead of just the final text in one row?
+
+Because a single "current text" column gives you **no history, no undo, no way to merge concurrent edits, and no audit trail.** The op log gives all of those for free — the current text is just the log replayed (§9). The `position` column even does double duty: an index for OT, or a char id / fractional index for CRDT.
+
 ---
 
 ## 12. API / Protocol
@@ -259,6 +684,35 @@ REST: GET /v1/docs/{id}         (snapshot + current revision)
       GET /v1/docs/{id}/history
       POST /v1/docs/{id}/comments · PUT /v1/docs/{id}/permissions
 ```
+
+### Plain-English: the actual messages flying over the WebSocket
+
+The protocol mixes two channels for two reasons: **WebSocket** for the fast, live stuff (edits, cursors) and plain **REST** for the occasional stuff (load the doc, fetch history, change permissions). Here's what a real editing session looks like as messages:
+
+```jsonc
+// 1. You open the doc (REST, one time):
+GET /v1/docs/42  ->  { "revision": 10000, "content": "HELLO ..." }   // snapshot to start from
+
+// 2. You type 'X' at the start. Client sends over the open WebSocket:
+--> { "type": "op", "baseRevision": 10000,
+      "ops": [ { "insert": "X", "pos": 0 } ] }
+
+// 3. Server orders + transforms it, assigns the next revision, and acks YOU:
+<-- { "type": "ack", "revision": 10001 }
+
+// 4. Meanwhile a teammate deleted a char. Server pushes their edit to YOU:
+<-- { "type": "remote", "revision": 10002,
+      "ops": [ { "delete": true, "pos": 4 } ], "authorId": "teammate-7" }
+
+// 5. Cursors flow on the same socket (throwaway, not persisted — see §8):
+<-- { "type": "cursor", "userId": "teammate-7", "cursorPos": 3 }
+```
+
+Notice **`baseRevision`** on your outgoing op: it tells the server "I made this edit while looking at revision 10000." That's exactly the info the server needs to **transform** your op against anything that happened after 10000 (§5). The **`ack`** with a revision number is your confirmation that your edit is now part of the official order — the client can drop it from its pending buffer.
+
+#### Q: Why WebSocket for edits but REST for loading the doc?
+
+Loading the doc is a **one-time, request/response** action — REST is perfect. Editing is **continuous, two-way, low-latency** — you need the server to push others' edits to you the instant they happen, which is exactly what a long-lived WebSocket gives you.
 
 ---
 
@@ -284,6 +738,36 @@ Client receives all missed remote ops → transforms against its pending → con
 (CRDTs make this cleanest — ops just merge)
 ```
 
+### Plain-English: reading the round-trip diagram
+
+Follow the edit round-trip like a story:
+
+1. **ClientA types** and sends `op@rev10` — "here's my edit, based on revision 10."
+2. **The server (referee)** sees ops 11 and 12 already happened since rev 10, so it **transforms** A's op past them, applies it, and stamps it **rev13**.
+3. It **appends** rev13 to the durable op log (so a crash can't lose it).
+4. It **acks ClientA** ("you're rev13 now") and **broadcasts** the transformed op to **ClientB**.
+5. **ClientB** transforms that incoming op against its *own* un-acked edits, then applies it — and now A and B match.
+
+The **offline → reconnect** flow is the same machinery, just batched: while offline you pile up ops (each tagged with the base revision it was made against); on reconnect you flush them all, the server transforms each against everything that happened while you were gone, and you pull down all the edits you missed. Everyone re-converges.
+
+```java
+// Offline queue: keep editing locally, sync the backlog when the network returns.
+class OfflineQueue {
+    List<Operation> queued = new ArrayList<>();     // ops made while disconnected
+    long baseRevision;                              // last revision I saw before going offline
+
+    void onReconnect() {
+        for (Operation op : queued) {
+            server.send(op, baseRevision);          // server transforms each against ops since baseRevision
+        }
+        queued.clear();
+        pullMissedRemoteOps(baseRevision);          // catch up on what others did while I was away
+    }
+}
+```
+
+> Why the note says "CRDTs make this cleanest": with CRDTs there's no base-revision transforming to do — the queued ops carry stable ids and simply **merge** on reconnect, in any order. That's why offline-first apps love CRDTs (§6).
+
 ---
 
 ## 14. Consistency & Edge Cases
@@ -298,6 +782,19 @@ Client receives all missed remote ops → transforms against its pending → con
 | Server crash | Op log durable → clients resync from last acked rev; rebuild from snapshot + ops |
 | Huge op log | Periodic snapshots bound replay; archive old ops |
 | CRDT tombstone growth | Garbage-collect tombstones once all replicas have seen the delete |
+
+### Plain-English: the edge cases in one breath
+
+Each row above is really the same promise ("no lost edits, everyone converges") tested by a different nasty situation:
+
+- **Two people type at once** → OT transforms / CRDT merges so **both** survive (§4–6).
+- **You go offline and keep typing** → your ops queue up and merge back in on reconnect (§13).
+- **You hit undo while others edit** → you undo *your* op, shifted to the right spot — not the global "last thing" (§10).
+- **A comment's text gets deleted** → the comment orphans or repositions, it never silently jumps to unrelated words (§8).
+- **The server crashes** → the op log is durable, so clients resync from their last acked revision and the doc rebuilds from snapshot + ops (§9, §16). No edits lost.
+- **The op log gets huge / tombstones pile up** → snapshots bound replay, and tombstones are garbage-collected once every replica has seen the delete (§6, §9).
+
+The unifying trick: because **edits are stored as an ordered, durable log** and merged by a **provably convergent** rule (OT or CRDT), almost every failure becomes "reconnect and replay from the last known point."
 
 ---
 
@@ -326,6 +823,33 @@ Client receives all missed remote ops → transforms against its pending → con
 - **Server crash** → clients reconnect, resync from last acked revision (op log durable); rebuild in-memory state from snapshot + ops.
 - **Offline edits** → queue + transform/merge on reconnect (CRDTs cleanest).
 - Fan-out is small (editors per doc) → cheap real-time broadcast; pub-sub only if a doc spans nodes.
+
+### Plain-English: scale by spreading docs, recover by replaying the log
+
+Scaling here is refreshingly different from feed systems. There's no giant fan-out; the trick is just **spreading independent docs across many servers**.
+
+Analogy: a huge **open-plan office of meeting rooms.** Each meeting (doc) happens in **one room** (server node) with everyone for that meeting inside it (sticky routing). Add more meetings? Open more rooms. The building scales to thousands of meetings not by making one giant room, but by having many rooms, each self-contained.
+
+```
+Doc #42  -> Node 3   (all of #42's editors routed here — the "room" for this doc)
+Doc #77  -> Node 8
+Doc #91  -> Node 3   (a node can host many docs)
+   ...spread millions of docs across the fleet by hashing doc_id -> node
+```
+
+Recovery reuses the persistence design (§9): because the **op log is durable**, a crashed node loses only *in-memory* state, never edits. The doc simply re-homes on a healthy node and **rebuilds from snapshot + ops**, and clients reconnect and resync from their last acked revision.
+
+```java
+// Node crashed -> doc #42 gets re-homed on Node 5, which rebuilds it from durable storage:
+CollabSession recover(String docId) {
+    Document doc = loadDoc(docId);          // latest snapshot + ops after it (from §9)
+    return new CollabSession(docId, doc);   // back in memory, ready; clients reconnect
+}
+```
+
+#### Q: If one doc = one node, what stops that node from being a bottleneck?
+
+A single doc has few editors and tiny ops, so one node handles it comfortably. The **system** scales because different docs sit on different nodes — you're limited by total docs across the fleet, not by any single doc. Only an unusually "hot" doc (rare) needs the pub-sub relay across nodes.
 
 ---
 

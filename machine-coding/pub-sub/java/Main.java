@@ -15,6 +15,9 @@ import java.util.function.Consumer;
  */
 public class Main {
 
+    // A single named channel. Holds two things: the append-only "log" of every
+    // message ever published (used by PULL consumers) and the list of push
+    // callbacks (the Observer subscribers notified immediately on publish).
     static class Topic {
         final String name;
         final List<String> log = new ArrayList<>();        // append-only message log
@@ -22,39 +25,51 @@ public class Main {
         Topic(String name) { this.name = name; }
     }
 
+    // The central message hub. It owns all topics and remembers, for each
+    // consumer group, how far that group has read (its offset). This is what
+    // lets different groups read the same log at their own pace.
     static class Broker {
         private final Map<String, Topic> topics = new HashMap<>();
         // topicName -> (groupName -> next offset to read)
         private final Map<String, Map<String, Integer>> groupOffsets = new HashMap<>();
 
+        // Register a new topic (idempotent: calling twice is harmless).
         void createTopic(String name) {
             topics.putIfAbsent(name, new Topic(name));
             groupOffsets.putIfAbsent(name, new HashMap<>());
         }
 
-        // PUSH subscription (Observer).
+        // PUSH subscription (Observer pattern): attach a callback that will be
+        // invoked for every future message published to this topic.
         void subscribe(String topic, Consumer<String> handler) {
             topics.get(topic).subscribers.add(handler);
         }
 
-        // Publish: append to log AND push to live subscribers.
+        // Publish: append to log (for PULL consumers) AND push to live
+        // subscribers right away (for PUSH consumers).
         void publish(String topic, String message) {
             Topic t = topics.get(topic);
             t.log.add(message);
+            // Fan-out: deliver the same message to every registered subscriber.
             for (Consumer<String> s : t.subscribers) s.accept(message); // fan-out
         }
 
-        // PULL: a consumer group reads messages it hasn't seen yet.
+        // PULL: a consumer group reads only the messages it hasn't seen yet.
+        // Each group has its own offset, so groups don't affect each other.
         List<String> poll(String topic, String group) {
             Topic t = topics.get(topic);
             Map<String, Integer> offsets = groupOffsets.get(topic);
+            // Where this group left off last time (0 = never read before).
             int from = offsets.getOrDefault(group, 0);
+            // Slice out the unread tail of the log as this poll's batch.
             List<String> batch = new ArrayList<>(t.log.subList(from, t.log.size()));
             offsets.put(group, t.log.size()); // commit new offset
             return batch;
         }
     }
 
+    // Demo/driver: wires up a broker, shows PUSH fan-out on publish, then shows
+    // two independent consumer groups PULLing the same log via offsets.
     public static void main(String[] args) {
         Broker broker = new Broker();
         broker.createTopic("orders");

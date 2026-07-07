@@ -17,16 +17,23 @@ import java.util.*;
  */
 public class Main {
 
+    // Observer interface: a participant implements this to be told when they've
+    // been outbid. Decouples the auction from how each bidder reacts.
     interface BidObserver { void onOutbid(String item, long newHighest); }
 
+    // State pattern: the auction's lifecycle is either OPEN (accepting bids) or
+    // CLOSED (no more bids allowed).
     enum AuctionState { OPEN, CLOSED }
 
+    // Core domain object: holds the item, the current highest bid, the list of
+    // participants, and the rules for accepting bids and closing the auction.
     static class Auction {
         final String itemId; final long startPrice; final long increment;
         AuctionState state = AuctionState.OPEN;
         String highestBidder; long highestBid;
         // Track each participant so we can notify the previous leader on outbid.
         final Map<String, BidObserver> participants = new HashMap<>();
+        // Guards the read-then-write of highestBid so concurrent bids stay correct.
         private final Object lock = new Object();
 
         Auction(String itemId, long startPrice, long increment) {
@@ -34,21 +41,31 @@ public class Main {
             this.highestBid = startPrice - increment; // so first valid bid can equal startPrice
         }
 
+        // Add a bidder and the callback used to notify them when they're outbid.
         void register(String bidder, BidObserver obs) { participants.put(bidder, obs); }
 
+        // Try to place a bid. Returns true if accepted. Validates the auction is
+        // open and the amount is high enough, then records the new highest bidder
+        // and notifies whoever was leading before.
         boolean bid(String bidder, long amount) {
+            // One critical section: check-then-update runs atomically so two
+            // simultaneous bids can't both beat the same stale highest value.
             synchronized (lock) {
                 if (state != AuctionState.OPEN) { System.out.println("  ! auction closed"); return false; }
+                // Minimum acceptable bid: at least the start price, and at least
+                // one increment above the current highest.
                 long minRequired = Math.max(startPrice, highestBid + increment);
                 if (amount < minRequired) {
                     System.out.printf("  ! bid %d too low (need >= %d)%n", amount, minRequired);
                     return false;
                 }
+                // Remember who was leading before overwriting the highest bid.
                 String previousLeader = highestBidder;
                 highestBidder = bidder;
                 highestBid = amount;
                 System.out.printf("  %s bids %d (new highest)%n", bidder, amount);
-                // Notify the outbid previous leader (Observer).
+                // Notify the outbid previous leader (Observer). Skip if there was
+                // no prior leader or the same person re-bid.
                 if (previousLeader != null && !previousLeader.equals(bidder)) {
                     BidObserver obs = participants.get(previousLeader);
                     if (obs != null) obs.onOutbid(itemId, amount);
@@ -57,10 +74,11 @@ public class Main {
             }
         }
 
-        // Close and declare the winner.
+        // Close and declare the winner. After this, no more bids are accepted.
         String close() {
             synchronized (lock) {
                 state = AuctionState.CLOSED;
+                // No bidder means nobody placed a valid bid: no sale.
                 if (highestBidder == null) { System.out.println("  no sale (no bids)"); return null; }
                 System.out.printf("  SOLD %s to %s for %d%n", itemId, highestBidder, highestBid);
                 return highestBidder;
@@ -68,6 +86,8 @@ public class Main {
         }
     }
 
+    // Demo run: set up an auction, register bidders, place a mix of valid and
+    // invalid bids, then close and confirm bids are rejected afterward.
     public static void main(String[] args) {
         Auction auction = new Auction("painting", 1000, 100);
 

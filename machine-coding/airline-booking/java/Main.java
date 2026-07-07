@@ -12,33 +12,42 @@ import java.util.*;
  */
 public class Main {
 
+    // The three fare classes a seat can belong to. Each class is priced separately per flight.
     enum FareClass { ECONOMY, BUSINESS, FIRST }
 
+    // A single seat: its display number (e.g. "F1"), which fare class it is, and whether it is already booked.
     static class Seat {
         final String number; final FareClass fareClass; boolean booked = false;
         Seat(String number, FareClass fareClass) { this.number = number; this.fareClass = fareClass; }
     }
 
+    // A flight: its route (from/to/day), the full list of seats, and the price for each fare class.
     static class Flight {
         final String no, from, to; final int day; // day number
         final List<Seat> seats = new ArrayList<>();
+        // Price per fare class; EnumMap is a compact map keyed by the FareClass enum.
         final Map<FareClass, Double> price = new EnumMap<>(FareClass.class);
+        // Lock used to guard seat booking so two threads can't grab the same seat.
         private final Object lock = new Object();
 
         Flight(String no, String from, String to, int day) { this.no = no; this.from = from; this.to = to; this.day = day; }
 
+        // Add `count` seats of one fare class and record that class's price.
         void addSeats(FareClass fc, int count, double fare) {
             price.put(fc, fare);
-            char prefix = fc.name().charAt(0);
-            int start = seats.size() + 1;
+            char prefix = fc.name().charAt(0); // first letter of class name -> seat prefix (F/B/E)
+            int start = seats.size() + 1;      // continue numbering after any existing seats
             for (int i = 0; i < count; i++) seats.add(new Seat(prefix + String.valueOf(start + i), fc));
         }
+        // True if at least one unbooked seat exists in the requested class.
         boolean hasFree(FareClass fc) {
             for (Seat s : seats) if (s.fareClass == fc && !s.booked) return true;
             return false;
         }
         // Book the first free seat in a class; returns seat or null.
         Seat book(FareClass fc) {
+            // synchronized block: only one thread at a time can search-and-mark a seat,
+            // which prevents two passengers from being assigned the same seat (double-booking).
             synchronized (lock) {
                 for (Seat s : seats) if (s.fareClass == fc && !s.booked) { s.booked = true; return s; }
                 return null;
@@ -46,6 +55,7 @@ public class Main {
         }
     }
 
+    // In-memory inventory of flights plus the search and booking operations over them.
     static class AirlineService {
         private final List<Flight> flights = new ArrayList<>();
         void addFlight(Flight f) { flights.add(f); }
@@ -58,6 +68,7 @@ public class Main {
             return res;
         }
 
+        // Attempt to book a seat on a flight for a passenger; prints the result and returns the seat number (or null if full).
         String book(Flight f, FareClass fc, String passenger) {
             Seat s = f.book(fc);
             if (s == null) { System.out.println("  ! no free " + fc + " seat on " + f.no); return null; }
@@ -67,6 +78,7 @@ public class Main {
         }
     }
 
+    // Demo: set up flights with priced seats, then run a few searches and bookings.
     public static void main(String[] args) {
         Flight ai101 = new Flight("AI101", "DEL", "BLR", 5);
         ai101.addSeats(FareClass.FIRST, 1, 30000);

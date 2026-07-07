@@ -2,6 +2,8 @@
 
 > **Core challenge:** run **jobs at the right time** — one-off (`run at T`) and **recurring** (cron: "every day 2am") — **reliably**, **exactly-once-ish**, and **at scale**, across a fleet of workers, surviving node failures without dropping or double-running jobs. Think: cron-as-a-service (AWS EventBridge Scheduler, Airflow triggers, Quartz cluster, Sidekiq/Celery beat).
 
+> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+
 ---
 
 ## Contents
@@ -33,6 +35,46 @@ Submit job (run at T / cron) → scheduler finds jobs whose time has come
 ```
 
 Two hard parts: **efficiently finding due jobs at scale** and **making sure each due job runs once** even when scheduler/worker nodes fail.
+
+### Plain-English: what problem are we even solving?
+
+**Analogy used throughout: a giant alarm clock for computers.** You know how you set an alarm on your phone for 7:00 AM and it goes off then? Now imagine a service where **millions of people** set alarms — except each "alarm" isn't a ringtone, it's a **job** to run: "send this email at 9am", "generate this invoice on the 1st of every month", "back up this database every night at 2am."
+
+Our job is to be that alarm clock, but:
+
+- **Millions of alarms** set at once.
+- Many go off at the **same instant** (everyone loves "midnight" and "on the hour").
+- The alarm must fire **even if the machine holding it crashes** (your phone dying shouldn't lose your alarm).
+- Each alarm must ring **exactly once** — not zero times (you miss your flight), not twice (you get charged twice).
+
+So the whole system is a giant, reliable **"do this thing at this time"** machine. Everything else is just "how do we do that correctly when there are millions of them and machines keep dying."
+
+### Plain-English: why not just use one `while(true)` loop with `sleep`?
+
+First instinct: one program that loops forever, checks the clock, and runs whatever's due:
+
+```java
+// The naive single-machine scheduler — fine for a hobby project, breaks in the real world
+while (true) {
+    for (Job job : allJobs) {
+        if (job.runAt <= now()) {
+            run(job);            // do the work right here
+        }
+    }
+    Thread.sleep(1000);          // check again in 1 second
+}
+```
+
+Why this melts at scale:
+
+| Wall | Problem |
+| --- | --- |
+| **1. One machine dies = everything stops** | If this one process crashes, **every** alarm stops firing. No redundancy. |
+| **2. Can't scan millions of jobs every second** | Looping over 100M jobs each tick to ask "are you due?" is hopelessly slow. We need to look up *only* the due ones (see §5). |
+| **3. Running the job blocks the loop** | If `run(job)` takes 30s, the loop is frozen for 30s and misses other alarms. Scheduling and doing must be **separated** (see §4). |
+| **4. Add a second machine → double-firing** | The obvious fix (run two copies for safety) means **both** see the same due job and run it twice. Now we need locking/claiming (see §6). |
+
+**So instead:** (1) store jobs **durably in a database** so a crash loses nothing; (2) have a **scheduler** that only *finds* due jobs and drops them on a **queue** — it never runs them; (3) a **pool of workers** picks jobs off the queue and does the actual work, scaling out independently. That "find due → enqueue → workers run" split is the backbone of the whole design (see §4).
 
 ---
 
@@ -81,6 +123,53 @@ API → Job Store (DB)                 ← submit/cancel/update jobs
 
 - **Separate scheduling from execution:** the scheduler only decides *what's due* and enqueues; **workers** do the actual work + scale independently (like the Notification system).
 
+### Plain-English: the three jobs of the three parts
+
+**Analogy: a restaurant.** The alarm-clock system has three roles, just like a kitchen has a host, a ticket rail, and cooks.
+
+| Part | Restaurant role | What it does | What it does NOT do |
+| --- | --- | --- | --- |
+| **Job Store (DB)** | The reservation book | Remembers every alarm forever, survives crashes ("durable truth") | Doesn't run anything |
+| **Scheduler / Poller** | The host who reads the book | Wakes up, asks "who's due right now?", claims them, drops a ticket on the rail | Doesn't cook (never runs the job itself) |
+| **Queue** | The ticket rail | Holds the tickets so cooks can grab them | Doesn't decide timing |
+| **Workers** | The cooks | Grab a ticket, actually do the work, write down the result | Don't watch the clock |
+
+Why split it up? **The scheduler must stay light and fast.** If it also *ran* the jobs, one slow job would freeze it and it would miss other alarms. By only *finding + enqueueing*, the scheduler stays a quick "who's due?" loop, while a separate army of workers absorbs the actual work.
+
+```java
+// The scheduler NEVER runs the job. It only finds due jobs and hands them off.
+void schedulerTick() {
+    List<Job> due = jobStore.findDue(now());   // "who's due?" — fast lookup (§5)
+    for (Job job : due) {
+        if (jobStore.claim(job)) {              // win the race so no one else takes it (§6)
+            queue.enqueue(job);                 // drop the ticket on the rail — done, move on
+        }
+    }
+}
+
+// A worker, running on a totally separate machine, does the actual work.
+void workerLoop() {
+    while (true) {
+        Job job = queue.take();                 // grab a ticket
+        JobResult result = execute(job);        // THIS is where the real work happens
+        jobStore.recordRun(job, result);        // write down what happened
+        if (job.isRecurring()) scheduleNext(job); // set the next alarm (§7)
+    }
+}
+```
+
+#### Q: Why put a queue in the middle? Can't the scheduler just call the worker directly?
+
+A queue **decouples timing from doing** and gives three things for free:
+
+- **Bursts get absorbed.** 10M jobs fire at midnight → the scheduler dumps 10M tickets on the queue and the workers drain them at their own pace. Without a queue, that spike would hammer the workers all at once.
+- **Workers scale independently.** Too much work? Add more workers reading the same queue. The scheduler doesn't change.
+- **Retries survive.** If a worker crashes mid-job, the ticket can go back on the queue (or the lease expires — see §6) and another worker retries it.
+
+#### Q: Isn't the scheduler a single point of failure?
+
+It would be if there were only one — so in production you run several, but you make sure they don't **both fire the same job**. Two ways (both in §6): **leader election** (only one scheduler is "active" at a time; others stand by) or **sharding** (each scheduler owns a slice of jobs, e.g. by hash of `job_id`, so their work never overlaps).
+
 ---
 
 ## 5. Storing & Finding Due Jobs
@@ -108,6 +197,119 @@ every tick:
   for each due job: claim atomically + enqueue
 ```
 
+### Plain-English: the "don't check every alarm" problem
+
+You have **100 million** alarms set. Every second you must answer: *"which ones go off right now?"* The dumb way is to look at all 100M and check each one's time — 100M comparisons **every second**. Hopeless.
+
+The trick is the same one you'd use with a physical stack of index cards: **keep them sorted by time**, so the ones about to fire are all at the front and you only ever look at the front.
+
+#### The core insight: an index sorted by fire time
+
+If the database keeps an **index on `next_run`** (sorted by fire time), then "who's due?" becomes "give me the cards at the very front whose time has passed" — the DB jumps straight to them instead of scanning everything.
+
+```sql
+-- With an index on next_run, this touches only the handful of rows that are due,
+-- NOT all 100M. The DB uses the sorted index to jump to the front.
+SELECT * FROM jobs
+WHERE status = 'SCHEDULED' AND next_run <= now()
+ORDER BY next_run
+LIMIT 1000;              -- grab a batch, not the whole world
+```
+
+Analogy: a to-do list sorted by due date. You never re-read the whole list; you just look at the top and stop as soon as you hit something not due yet.
+
+### Plain-English: the four ways to find due jobs, from simplest to fanciest
+
+Think of these as increasingly clever versions of the same index-card stack.
+
+#### 1. DB poll + index (the default, start here)
+
+The scheduler wakes up every second (a "tick") and runs the `SELECT` above. **Simple, durable, good enough for most systems.**
+
+```java
+@Scheduled(fixedRate = 1000)   // wake up once per second
+public void tick() {
+    List<Job> due = jobRepo.findDue(Instant.now(), 1000);   // the indexed query
+    for (Job job : due) {
+        if (claim(job)) queue.enqueue(job);                 // claim + hand off (§6)
+    }
+}
+```
+
+- **Poll interval = your minimum precision.** Poll every 1s → an alarm can fire up to ~1s late. That's usually fine.
+- **Downside:** at huge scale, hammering the DB every second is load. That's what the next options relieve.
+
+#### 2. Time-bucketing (group alarms by the minute they fire)
+
+Instead of one giant sorted pile, put each alarm into a **bucket labeled with its minute**. To find what's due, you only open **the current minute's bucket** — never the whole dataset.
+
+```
+bucket "2026-07-08 09:00" → [job A, job B, job C]
+bucket "2026-07-08 09:01" → [job D]
+bucket "2026-07-08 09:02" → [job E, job F]
+                                 ▲
+                     scheduler only reads THIS minute's bucket
+```
+
+Analogy: a wall of mail slots, one per minute. The mail carrier only checks the slot for the current minute. **Downside — hot buckets:** everybody schedules "09:00:00", so that one bucket is enormous while others are empty (the *thundering herd*, see §3). Fix: spread with **jitter**.
+
+#### 3. Redis sorted set / ZSET (a fast in-memory due-index)
+
+A Redis **ZSET** is a set where every member has a **score**, and Redis keeps it sorted by score automatically. Use the alarm's fire time (epoch seconds) as the score:
+
+```java
+// When a job is scheduled: add it to the ZSET, scored by WHEN it should fire.
+redis.zadd("due_jobs", job.runAtEpoch(), job.jobId());
+
+// Every tick: pop everything whose score (fire time) is now or in the past.
+Set<String> due = redis.zrangeByScore("due_jobs", 0, Instant.now().getEpochSecond());
+for (String jobId : due) {
+    redis.zrem("due_jobs", jobId);   // remove so we don't re-fire it
+    enqueue(jobId);
+}
+```
+
+- **Blazing fast** because it's in memory and already sorted — `ZRANGEBYSCORE 0 now` gives you exactly the due ones.
+- **Catch: Redis can lose data on crash**, so it's a fast *cache/index*, not the source of truth. Keep the **DB as durable truth** and use the ZSET as a speed layer you can rebuild from the DB.
+
+#### 4. Timing wheel (how Kafka/Netty do near-term timers)
+
+A **timing wheel** is a circular array of buckets — literally like a **clock face**. A pointer (the "cursor") ticks from slot to slot. When you add a timer, you drop it in the slot the cursor will reach when it's due. Each tick, the cursor fires whatever is in the slot it lands on. Insert and fire are both **O(1)** — no scanning, no sorting.
+
+```java
+class TimingWheel {
+    List<Job>[] buckets = new List[60];   // e.g. 60 slots = one slot per second, 1-minute wheel
+    int cursor = 0;                        // advances one slot per tick
+
+    // Add a job: figure out which slot it lands in.
+    void add(Job job, int secondsFromNow) {
+        int slot = (cursor + secondsFromNow) % buckets.length;
+        buckets[slot].add(job);
+    }
+
+    // Every second: fire this slot, then move the cursor forward.
+    void tick() {
+        for (Job job : buckets[cursor]) enqueue(job);
+        buckets[cursor].clear();
+        cursor = (cursor + 1) % buckets.length;
+    }
+}
+```
+
+- **The problem: a wheel only covers a short horizon** (a 60-slot, 1-per-second wheel only reaches 60s ahead). For an alarm 3 days out, use **hierarchical wheels** — a coarse "days" wheel, then "hours", then "minutes", then "seconds" (exactly like the hour/minute/second hands of a real clock). A far-future job sits in the coarse wheel and gets **promoted down** to a finer wheel as its time approaches.
+- Great for **in-process, near-term** timers (retries, timeouts). The durable long-horizon store is still the DB.
+
+### Plain-English: which one should I actually use?
+
+| If you have... | Use |
+| --- | --- |
+| A normal service, millions of jobs | **DB poll + index on `(status, next_run)`** — simple, durable, done |
+| Very high fire rate, need sub-second speed | **DB (truth) + Redis ZSET (fast due-index)** |
+| In-process short-lived timers (retries/timeouts) | **Timing wheel** |
+| Herd at round times | Any of the above **+ jitter** to flatten the spike |
+
+> **Bottom line:** the DB is always the durable truth; the fancier structures (ZSET, timing wheel) are just faster *ways to find the front of the line* layered on top.
+
 ---
 
 ## 6. Execution — Exactly-Once-ish & No Double-Run
@@ -125,6 +327,104 @@ Multiple scheduler nodes must not fire the same job twice.
 
 > **Reality:** distributed exactly-once is hard → aim **at-least-once + idempotent jobs**, with **atomic claim + lease expiry** so a crashed worker's job is safely retried without a duplicate within the lease.
 
+### Plain-English: the "two alarm clocks, one alarm" problem
+
+We run **several** schedulers for safety (so one crash doesn't stop all alarms). But now if the alarm "send Nike's 9am email" comes due, **all** of them see it. If they each fire it, Nike gets the email 3 times. We need a way for exactly **one** to "win" the job.
+
+**Analogy: a shared chore chart on the fridge.** Three roommates all see "take out trash" is due. To avoid all three doing it (or arguing), the rule is: whoever **grabs the pen and writes their name on it first** owns it; the others see it's taken and skip it. That "write your name to claim it" is the **atomic claim**.
+
+#### The atomic claim — how one node "wins"
+
+The database can only let **one** update change a row from `SCHEDULED` to `PICKED`. That's the pen.
+
+```sql
+-- Every scheduler runs this for a due job. The DB guarantees only ONE succeeds.
+UPDATE jobs
+SET    status = 'PICKED', locked_by = 'scheduler-7', lock_expiry = now() + interval '60 seconds'
+WHERE  job_id = 42 AND status = 'SCHEDULED';   -- ← the magic: only works if still SCHEDULED
+```
+
+```java
+int rowsChanged = jdbc.update(claimSql, jobId, myId);
+if (rowsChanged == 1) {
+    queue.enqueue(job);   // I won the race — I own this job, hand it off
+} else {
+    // rowsChanged == 0 → someone else already flipped it to PICKED. Skip it, no harm done.
+}
+```
+
+The key is `AND status = 'SCHEDULED'`. Two schedulers race to run this same `UPDATE`. The DB processes them one at a time: the first flips it to `PICKED` and reports **"1 row changed."** The second now finds no row that is still `SCHEDULED`, so it changes **"0 rows"** — it lost, and quietly moves on. No duplicate.
+
+#### `SELECT ... FOR UPDATE SKIP LOCKED` — many pollers, no traffic jam
+
+If you want **many** pollers grabbing **different** jobs at the same time (not just claiming one-by-one), `SKIP LOCKED` tells the DB "give me due rows that nobody else has locked right now, and don't wait around for locked ones."
+
+```sql
+-- Poller A and Poller B run this simultaneously and get DIFFERENT rows — no blocking.
+SELECT * FROM jobs
+WHERE  status = 'SCHEDULED' AND next_run <= now()
+ORDER  BY next_run
+LIMIT  100
+FOR UPDATE SKIP LOCKED;    -- "skip rows another poller already grabbed"
+```
+
+Analogy: a buffet line where each person takes the next *available* tray and steps around any tray someone's already reaching for — nobody stands frozen waiting.
+
+#### The lease (TTL) — what if the winner then dies?
+
+Winning the job isn't enough: what if scheduler-7 claims the job, hands it to a worker, and the **worker crashes mid-run**? The job is stuck in `PICKED`/`RUNNING` forever — it never finishes and never re-runs. Bad.
+
+Fix: the claim comes with a **lease — an expiry time** (`lock_expiry`). The worker must "check in" (heartbeat) to keep it. If it dies, the lease **expires**, and a sweeper makes the job claimable again.
+
+```java
+// A background sweep: any job that's been "claimed" but whose lease ran out is reset.
+// It's like a library book whose loan expired — it goes back on the shelf for anyone.
+@Scheduled(fixedRate = 30_000)
+void reclaimExpiredLeases() {
+    jdbc.update("""
+        UPDATE jobs SET status = 'SCHEDULED', locked_by = NULL
+        WHERE  status IN ('PICKED','RUNNING') AND lock_expiry < now()
+    """);
+}
+```
+
+#### Q: If a crashed worker's job re-runs, isn't that a double-run?
+
+It **can be** — and this is why we say **"exactly-once-ish"**, not exactly-once. The honest target is:
+
+> **at-least-once delivery + idempotent jobs = exactly-once *effect*.**
+
+We accept that a job might occasionally run twice (crash right after doing the work but before recording success → it looks unfinished → re-runs). We make that **safe** by writing jobs so running them twice does no extra harm — that's **idempotency**.
+
+```java
+// NOT idempotent — running twice charges the customer twice. Dangerous on retry.
+void chargeCustomer(Job job) {
+    payments.charge(job.customerId, job.amount);
+}
+
+// Idempotent — the idempotency key makes a repeat a no-op.
+void chargeCustomer(Job job) {
+    if (ledger.alreadyProcessed(job.idempotencyKey)) return;   // did this already → skip
+    payments.charge(job.customerId, job.amount);
+    ledger.markProcessed(job.idempotencyKey);
+}
+```
+
+Analogy: pressing a **crosswalk button** that's already lit — pressing again changes nothing. Idempotent jobs are crosswalk buttons: extra presses are harmless.
+
+#### Q: Leader election vs sharding — what's the difference?
+
+Both stop multiple schedulers from stepping on each other, but differently:
+
+| | **Leader election** | **Sharding / partitioning** |
+| --- | --- | --- |
+| Idea | Only **one** scheduler is "active"; the rest stand by | **All** schedulers active, but each owns a **slice** of jobs |
+| How | A lock in ZooKeeper/etcd/Redis; whoever holds it leads | `job_id % N` → scheduler N handles that slice |
+| If it dies | Standby grabs the lock and takes over | Its slice is reassigned to survivors |
+| Trade-off | Simple; single leader can bottleneck | Scales out; more moving parts |
+
+The **atomic claim above still applies within either** — it's your last line of defense against a duplicate even if two nodes briefly overlap (e.g., during a leader handover).
+
 ---
 
 ## 7. Recurring Jobs (cron)
@@ -139,6 +439,64 @@ On job completion (or at claim time) for a recurring job:
 - **Missed windows** (system down over a fire time) → policy: **skip**, **run-once-catchup**, or **run-all-missed** (per job).
 - Timezone/DST-aware cron for wall-clock schedules.
 
+### Plain-English: a recurring alarm re-arms itself
+
+A one-time alarm rings once and is done. A **recurring** alarm ("every day at 2am") is a **snooze that reschedules itself**: the moment it fires, it computes *when do I next go off?* and sets a fresh alarm for that time. There's never a "list of all future occurrences" sitting in the DB — just **one row that keeps updating its `next_run`.**
+
+```java
+// After a recurring job runs, arm the next occurrence.
+void scheduleNext(Job job) {
+    if (!job.isRecurring()) return;
+
+    // A cron like "0 2 * * *" means "2:00 every day". A parser turns it into the next fire time.
+    Instant next = cronParser.next(job.cronExpr, /* from = */ job.scheduledTime);
+
+    job.nextRun = next;
+    job.status  = "SCHEDULED";     // back in the pool for §5's due-lookup to find later
+    jobStore.save(job);
+}
+```
+
+#### Q: Why compute the next time from the *scheduled* time, not from *now*?
+
+Because "now" drifts. Say the job is due at 2:00:00 but the system is busy and it actually runs at 2:00:47.
+
+```java
+// GOOD — anchor to the SCHEDULED time → next run is 2:00 tomorrow, exactly. No drift.
+Instant next = cronParser.next(cron, job.scheduledTime);   // scheduledTime = 2:00:00
+
+// BAD — anchor to NOW → next run creeps to 2:00:47, then later, then later... drifts daily.
+Instant next = cronParser.next(cron, Instant.now());        // now = 2:00:47
+```
+
+Analogy: a **weekly team meeting** is "every Monday 10am" — it doesn't slide to 10:07 just because last week's ran a bit late. You anchor to the intended slot, not to when the previous one happened to end.
+
+#### Q: The server was down for 3 hours over a 2am job — now what? (missed windows)
+
+When the scheduler comes back and sees a fire time already passed, you need a **policy** per job — there's no universally right answer:
+
+| Policy | What it does | Good for |
+| --- | --- | --- |
+| **Skip** | Forget the missed run, just schedule the next one | A dashboard refresh — a stale one doesn't matter |
+| **Run-once-catchup** | Run it **one** time now, then resume normal schedule | A daily report — you want today's, but not 3 copies |
+| **Run-all-missed** | Fire once for **every** slot that was missed | Billing/accruals — every period must be accounted for |
+
+```java
+void handleMissed(Job job, Instant downSince, Instant backAt) {
+    List<Instant> missed = cronParser.between(job.cronExpr, downSince, backAt);
+    switch (job.missedPolicy) {
+        case SKIP        -> {}                              // do nothing, move on
+        case CATCHUP_ONE -> run(job);                       // one make-up run
+        case RUN_ALL     -> missed.forEach(t -> run(job));  // one per missed slot
+    }
+    scheduleNext(job);   // then re-arm the future as usual
+}
+```
+
+#### Q: Why does DST/timezone matter for cron?
+
+"Every day at 2:00 AM" is a **wall-clock** promise. On the night the clocks spring forward, 2:00 AM **doesn't exist** (it jumps 1:59 → 3:00); on the night they fall back, 2:00 AM happens **twice**. A timezone/DST-aware cron parser decides whether to skip, run once, or run twice — so "2am daily" stays sane for humans. (Storing/scheduling in UTC internally avoids most of this; the conversion happens at the wall-clock boundary.)
+
 ---
 
 ## 8. Retries, Failures & DLQ
@@ -152,6 +510,64 @@ job fails → attempt++
 - Exponential backoff **with jitter** (avoid a thundering herd of simultaneous retries — see Kafka note).
 - **DLQ** for jobs that exhaust retries → manual inspection/replay.
 - **Timeouts** — a job running too long → kill + retry (lease expiry handles crashed workers).
+
+### Plain-English: retrying like a polite person, not a stalker
+
+A job failed (network blip, downstream service down). Don't give up, but don't hammer either. **Analogy: calling a friend who didn't pick up.** You don't redial instantly 500 times — you wait a bit, then a bit longer, and after several tries you conclude something's wrong and stop.
+
+#### Exponential backoff — wait longer each time
+
+```java
+void onFailure(Job job) {
+    job.attempt++;
+
+    if (job.attempt < job.maxAttempts) {
+        // wait longer after each failure: 1s, 2s, 4s, 8s, 16s ...
+        long backoffMs = (long) (Math.pow(2, job.attempt) * 1000);
+        job.nextRun = Instant.now().plusMillis(backoffMs + jitter());  // +jitter, see below
+        job.status  = "SCHEDULED";      // re-armed → §5's poll will pick it up again
+        jobStore.save(job);
+    } else {
+        moveToDLQ(job, "exhausted retries");   // gave up — set aside for a human (below)
+    }
+}
+```
+
+Waiting longer each time gives a struggling downstream service **room to recover** instead of getting pounded.
+
+#### Q: Why add jitter? Isn't a clean "1s, 2s, 4s" better?
+
+No — because failures often hit **many jobs at once** (the payment service went down → 10,000 jobs all fail at 2:00:00). With clean backoff, all 10,000 retry at *exactly* 2:00:01, then all at 2:00:03... you've built a **synchronized stampede** that knocks the service over again the instant it recovers.
+
+```java
+// jitter = a small random offset so retries SPREAD OUT instead of all landing together
+long jitter() {
+    return ThreadLocalRandom.current().nextLong(0, 1000);  // 0–1000ms of randomness
+}
+```
+
+Analogy: if a concert lets out and everyone rushes the same exit at once, it jams. Jitter is staggering people out over a few minutes so the door flows. (Same idea as the midnight-herd jitter in §3.)
+
+#### Q: What is a DLQ and why not just retry forever?
+
+A **DLQ (Dead Letter Queue)** is the "**giving up** shelf." Some jobs will **never** succeed no matter how many times you retry — a bug in the job, malformed data, a permanently-deleted target (a *poison job*). Retrying forever wastes resources and hides the problem.
+
+```java
+void moveToDLQ(Job job, String reason) {
+    job.status = "FAILED";
+    deadLetterRepo.save(new DeadLetterJob(job.jobId, reason, Instant.now()));
+    alerts.page("Job " + job.jobId + " dead-lettered: " + reason);  // tell a human
+}
+```
+
+After `maxAttempts`, the job moves to the DLQ and **alerts a human**, who inspects it, fixes the root cause, and can **replay** it. Analogy: a mail carrier who can't deliver a package after several tries doesn't keep circling your house forever — it goes to the depot ("undeliverable") for someone to sort out.
+
+#### Q: What about a job that hangs forever (never fails, never finishes)?
+
+That's a **timeout**. A failure at least tells you it failed; a *hung* job just sits in `RUNNING` silently. Two guards cover it:
+
+- **Timeout:** if a job runs past its allowed time, kill it and treat it as a failure (→ retry/backoff).
+- **Lease expiry (from §6):** if the whole *worker* dies (so it can't even report a timeout), the lease's TTL runs out and the job becomes re-claimable. Belt and suspenders.
 
 ---
 
@@ -185,6 +601,58 @@ CREATE TABLE dead_letter_jobs ( job_id BIGINT PRIMARY KEY, reason TEXT, moved_at
 ```
 
 > **Tables to consider:** jobs, job_runs (history), dead_letter_jobs, tenants, plus optional Redis ZSET for the due-index.
+
+### Plain-English: what each table is for
+
+Two tables carry the whole design; the rest are support. **Analogy: a shared kitchen.**
+
+| Table | Analogy | Holds | Why separate |
+| --- | --- | --- | --- |
+| **`jobs`** | The **current chore chart** | One row per alarm, with its *current* state and *next* fire time | It's the live "what should happen and when" — constantly updated |
+| **`job_runs`** | The **logbook** ("who did what, when") | One row per *actual execution* — start, end, success/fail, error | History/audit; you never edit the past, only append |
+| **`dead_letter_jobs`** | The **"broken, needs a human" bin** | Jobs that exhausted retries | Keeps poison jobs out of the live flow (§8) |
+
+#### Q: Why is `job_runs` separate from `jobs`? Isn't that duplication?
+
+They answer **different questions**, so they're deliberately split:
+
+- `jobs` = *"what's the plan?"* — mutable, one row per job, always shows the **latest** state and the **next** run.
+- `job_runs` = *"what actually happened?"* — append-only history, **many** rows per job (one per execution attempt).
+
+A recurring "daily at 2am" job is **one** row in `jobs` but grows **one new row per day** in `job_runs`. Mixing them would mean either losing history (if you overwrite) or bloating the live table you poll every second (bad for §5's fast lookup).
+
+```sql
+-- "What runs next for job 42?" — one row, the live plan.
+SELECT next_run, status FROM jobs WHERE job_id = 42;
+
+-- "Show me job 42's last 10 executions" — history, many rows.
+SELECT started_at, status, error FROM job_runs
+WHERE job_id = 42 ORDER BY started_at DESC LIMIT 10;
+```
+
+#### Q: What is that `WHERE status = 'SCHEDULED'` doing on the index?
+
+That's a **partial index** — the single most important performance trick in the schema:
+
+```sql
+CREATE INDEX idx_jobs_due ON jobs(next_run) WHERE status = 'SCHEDULED';
+```
+
+It builds a sorted index **only over rows that are still SCHEDULED** — the only ones the poller cares about (§5). Jobs that are `DONE`, `RUNNING`, `CANCELLED` etc. aren't in this index at all, so it stays small and fast even when the table holds 100M mostly-finished rows. Analogy: a to-do list index that only tracks **unchecked** items — the thousands of already-done items don't slow down "what's next?"
+
+#### Q: How does this table map to everything else in the doc?
+
+Almost every mechanism is just a column here:
+
+| Column | Powers | Section |
+| --- | --- | --- |
+| `next_run` + partial index | Fast due-lookup | §5 |
+| `status`, `locked_by`, `lock_expiry` | Atomic claim + lease | §6 |
+| `idempotency_key` | Exactly-once *effect* | §6 |
+| `cron_expr` | Recurring re-arm | §7 |
+| `attempt`, `max_attempts` | Retry then DLQ | §8 |
+
+So the "data model" isn't a separate topic — it's the **physical home** for every idea above. Read a column, and you can point to the section that uses it.
 
 ---
 

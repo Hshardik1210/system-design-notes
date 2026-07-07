@@ -2,6 +2,8 @@
 
 > **Core challenge:** build an in-memory key-value cache spanning **many nodes**, serving reads/writes in **sub-millisecond** time, **sharding with minimal reshuffling** on scaling, **evicting** intelligently under memory pressure, and optionally **replicating** for availability. The heart is **consistent hashing + eviction + replication + stampede protection**.
 
+> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java/pseudo-code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+
 ---
 
 ## Contents
@@ -32,6 +34,41 @@ GET/SET key → hash the key → route to the node owning that key → in-memory
 
 A giant distributed hash map held in **RAM**, partitioned across nodes, with **eviction** (bounded memory) and optional **replication** (HA).
 
+### Plain-English: what problem are we even solving?
+
+**Analogy used throughout: a shared, super-fast sticky-note board hanging in front of a slow filing cabinet.**
+
+- The **filing cabinet** is your database (Postgres/MySQL). It's the source of truth, but it's on disk, and looking things up takes real work (parse SQL, seek disk, lock rows). Under heavy traffic it gets slow and can fall over.
+- The **sticky-note board** is the cache (Redis/Memcached). It lives in **RAM**, so reading a note is essentially instant. Before anyone walks all the way to the cabinet, they glance at the board first.
+
+The rule the whole team follows:
+
+> "Need something? **Check the board first.** If it's there (a **hit**), take it and go. If it's not (a **miss**), walk to the cabinet, get it, and *pin a copy on the board* so the next person doesn't have to walk."
+
+That's the entire idea. Everything else in this doc is answering *"how do we run this sticky-note board when it's so big and so busy that one board (one machine) can't hold it or keep up?"*
+
+### Plain-English: why not just use the database directly?
+
+The database is slower and more expensive **per read** than RAM, by a lot:
+
+| | Database (disk/SSD) | Cache (RAM) |
+| --- | --- | --- |
+| Typical read latency | ~1–10 ms (or worse under load) | ~0.1 ms (sub-millisecond) |
+| Cost of a repeated read | Re-does the query every time | Trivial map lookup |
+| Under a traffic spike | Can saturate, queue, time out | Absorbs millions of ops/sec |
+
+Most real workloads are **read-heavy and skewed** (the classic 80/20): a small set of "hot" items — the trending tweet, the logged-in user's profile, the front-page product — get read over and over. Caching those hot items means the database only sees the *occasional* miss instead of the full firehose.
+
+> **Key insight that drives the whole design:** don't make everyone walk to the slow cabinet for the same popular items. Keep the hot items on a fast shared board in RAM, and only touch the cabinet on a miss.
+
+```
+Without cache:   every request ─────────────► Database  (slow, overloaded)
+
+With cache:      request ─► Cache ─ hit ─► done (fast)
+                              │
+                              └─ miss ─► Database ─► copy back into Cache
+```
+
 ---
 
 ## 2. Requirements
@@ -56,6 +93,28 @@ Memory is the constraint (RAM is expensive) → eviction + right-sizing the hot 
 
 > Cache sizing is the key estimation: **cache the hot working set** (80/20), not the whole dataset. RAM cost drives node count.
 
+### Plain-English: how big should the sticky-note board be?
+
+The trap: "let's just cache *everything* in the database." RAM is ~10–100× more expensive per GB than disk, so caching a 1 PB database in RAM is absurd. You don't need to.
+
+**You only cache the hot working set** — the small slice of data that's actually being read right now. Think of the sticky-note board: it physically can't hold the whole filing cabinet, and it doesn't need to. It holds the handful of files everyone keeps asking for today.
+
+- **Working set** = the set of keys read frequently in a given window (say, last hour). Often ~20% of data serves ~80% of reads.
+- Size the cache to hold *that*, plus headroom. Anything colder just misses and gets fetched from the DB — that's fine and expected.
+
+```
+Total data:        1 PB in the database  (the whole filing cabinet)
+Hot working set:   ~1 TB actually being read a lot  → THIS is what we cache
+Cache nodes:       ~16 nodes × 64 GB RAM ≈ 1 TB      → holds the hot set
+```
+
+#### Q: What's a good hit rate, and why does it matter so much?
+
+**Hit rate** = fraction of reads served by the cache (hits ÷ total). A cache earning its keep usually runs **90%+**. The leverage is huge:
+
+- At 95% hit rate, the DB sees only **5%** of read traffic — a 20× reduction.
+- Drop to 90% and the DB load *doubles* (10% vs 5%). So a few percentage points of hit rate is the difference between a calm DB and a melting one. That's why eviction policy (§7) and avoiding mass expiry (§12) matter.
+
 ---
 
 ## 4. Architecture
@@ -67,6 +126,31 @@ Miss → app fetches from the source DB → SET into cache (cache-aside)
 Topology: consistent-hash ring (or Redis 16384 slots); replicas per shard; controller/sentinel for failover
 ```
 
+### Plain-English: who decides which node holds a key?
+
+One board isn't enough — we have a *wall of boards* (many cache nodes), each holding part of the data. So there's a new question every request must answer: **"which board is this note on?"**
+
+Nobody wants to search all 16 boards. Instead, the key itself tells you the board via **hashing**: run the key through a hash function, and the result maps to exactly one node. Same key → same node, every time. This is the **router's** job (a client library, a proxy, or the cluster itself — see §10).
+
+```
+key "user:123"
+   → hash("user:123")            // turns the key into a number
+   → maps to node #4 on the ring // deterministic: always node #4
+   → GET on node #4
+```
+
+The three moving parts of the architecture, in plain terms:
+
+| Piece | Sticky-note analogy | Job |
+| --- | --- | --- |
+| **Router** (client/proxy/cluster) | The rule "note X lives on board Y" | Turn a key into the one node that owns it |
+| **Cache node** | One sticky-note board | Hold a slice of keys in RAM; answer GET/SET in O(1) |
+| **Source DB** | The slow filing cabinet | Truth; consulted only on a miss |
+
+#### Q: What is "cache-aside" that the diagram mentions?
+
+It's the most common way the app and cache cooperate: the **app** manages the cache, and the cache sits *aside* the main path (it doesn't talk to the DB itself). On a miss, the app fetches from the DB and back-fills the cache. Full walkthrough with code is in §9 — for now just know "miss → app loads DB → app puts it in cache."
+
 ---
 
 ## 5. Single-Node Cache Internals
@@ -77,6 +161,65 @@ Topology: consistent-hash ring (or Redis 16384 slots); replicas per shard; contr
 - **Memory management**: slab allocation (Memcached) to reduce fragmentation; Redis uses jemalloc + efficient encodings for small values.
 - **Persistence (Redis, optional)**: **RDB** snapshots + **AOF** append-only log → survive restarts (but a cache is usually rebuildable from the DB).
 - **Threading**: Redis = single-threaded command execution (no locks → atomic ops); Memcached = multi-threaded.
+
+### Plain-English: what's inside one sticky-note board?
+
+Zoom into a single cache node. At its core it's just a **hash map (dictionary)** living in RAM: key → value. That's why `GET`/`SET` are **O(1)** — no scanning, you jump straight to the slot.
+
+```java
+// The heart of one cache node: a plain in-memory map.
+Map<String, byte[]> store = new HashMap<>();
+
+byte[] get(String key) { return store.get(key); }   // O(1)
+void   set(String key, byte[] value) { store.put(key, value); }   // O(1)
+```
+
+Everything else on the node is bookkeeping around that map: expiry, eviction, and memory management.
+
+#### Q: What's the difference between TTL expiry and eviction? They sound the same.
+
+They're different reasons a key leaves the cache, and it's a very common mix-up:
+
+| | **Expiry (TTL)** | **Eviction** |
+| --- | --- | --- |
+| Trigger | *Time*: you said "this key lives 60s" | *Memory pressure*: the box is full |
+| Which key leaves | The one whose clock ran out | Whichever the policy picks (LRU/LFU — §7) |
+| Analogy | A sticky note dated "toss after 5pm" | Board is full, so you pull down the note nobody's looked at in ages to make room |
+
+#### Q: "Lazy" vs "active" expiration — why both?
+
+Say a key's TTL passed. When does it actually get removed?
+
+- **Lazy**: only when someone next tries to read it. On `GET`, the node checks "is this expired? yes → delete it, return miss." Cheap, but a dead key nobody reads just sits there wasting RAM.
+- **Active**: a background sweeper periodically **samples** random keys and deletes expired ones, so dead keys don't accumulate. It samples rather than scanning *everything* because scanning millions of keys would stall the node.
+
+Real Redis does both: lazy on access + a sampling sweeper in the background.
+
+```java
+// LAZY: piggyback the check on a normal read
+byte[] get(String key) {
+    Entry e = store.get(key);
+    if (e == null) return null;              // never existed → miss
+    if (e.expireAt < now()) {                // TTL passed
+        store.remove(key);                   // delete on access
+        return null;                         // treat as miss
+    }
+    return e.value;
+}
+
+// ACTIVE: background timer samples a few keys and reaps expired ones
+@Scheduled(fixedRate = 100)                  // ~10×/sec
+void sweep() {
+    for (String key : store.sampleRandomKeys(20)) {  // sample, don't scan all
+        Entry e = store.get(key);
+        if (e != null && e.expireAt < now()) store.remove(key);
+    }
+}
+```
+
+#### Q: Why is Redis single-threaded — isn't that slower?
+
+Counterintuitively it's a feature. One thread executing commands one at a time means **no locks and no race conditions** — every command is naturally atomic (`INCR` can't interleave with another `INCR`). And because the work is just RAM lookups (no slow disk waits to overlap), a single core already pushes 100k+ ops/sec. Memcached takes the other route (multi-threaded) because its model is simpler. Either way, the app doesn't notice.
 
 ---
 
@@ -98,6 +241,103 @@ Virtual nodes (vnodes) → each physical node at many ring points → even distr
 
 > See the **Consistent Hashing** concept note and the routing comparison in **Databases — Deep Dive** (Redis slots vs Mongo config servers vs Cassandra ring). This is the #1 thing to say.
 
+### Plain-English: why `hash % N` is a trap
+
+The obvious way to pick a board for a key: number the boards 0..N-1 and do `board = hash(key) % N`. Works great — until you **add or remove a board**.
+
+The instant `N` changes (say 4 → 5), the `% N` math changes for **almost every key**, so almost every key now maps to a *different* board than before. Every lookup misses. All that traffic slams the database at once — a **cache stampede** that can take the DB down. Adding capacity shouldn't nuke your cache.
+
+```
+N = 4:   hash=101 → 101 % 4 = 1  (board 1)
+Add one board, N = 5:
+         hash=101 → 101 % 5 = 1  (still 1, lucky)
+         hash=102 → 102 % 4 = 2  →  102 % 5 = 2   ... but MOST keys shift:
+         hash=103 → 103 % 4 = 3  →  103 % 5 = 3
+         hash=100 → 100 % 4 = 0  →  100 % 5 = 0
+   In practice ~all keys land on a different board → mass miss.
+```
+
+### Plain-English: the ring (a clock everyone agrees on)
+
+**Consistent hashing** fixes this. Picture a **clock face** (a ring of positions, say 0 to 2³²-1). Two things get placed on this same clock:
+
+1. **Nodes** — each cache node is hashed to a position on the clock.
+2. **Keys** — each key is hashed to a position on the clock.
+
+Rule to find a key's owner: **start at the key's position and walk clockwise; the first node you bump into owns the key.**
+
+```
+        node A (12 o'clock)
+             ●
+   node D ●     ● node B
+             ●
+        node C (6 o'clock)
+
+key "user:123" lands at ~1 o'clock → walk clockwise → first node is B → B owns it.
+```
+
+Now the magic: **add node E** between B and C. The only keys that move are the ones sitting between B and E — they used to walk past to C, now they stop at E. **Everyone else is untouched.** Removing a node is the mirror image: only *its* keys shift to the next node clockwise. Either way ≈ **1/N of keys move**, not all of them.
+
+```java
+// A consistent-hash ring. A TreeMap keeps ring positions sorted so we can
+// "walk clockwise" cheaply with ceilingKey / firstKey.
+class HashRing {
+    // ring position -> node name. Sorted by position (that's the "clock").
+    private final TreeMap<Long, String> ring = new TreeMap<>();
+
+    void addNode(String node) {
+        ring.put(hash(node), node);      // place the node on the clock
+    }
+    void removeNode(String node) {
+        ring.remove(hash(node));         // only this node's arc is affected
+    }
+
+    // find which node owns a key: walk CLOCKWISE to the next node.
+    String getNode(String key) {
+        long pos = hash(key);
+        // first ring entry at position >= pos ...
+        Map.Entry<Long, String> e = ring.ceilingEntry(pos);
+        // ... or wrap around the clock back to the start (12 o'clock).
+        if (e == null) e = ring.firstEntry();
+        return e.getValue();
+    }
+
+    long hash(String s) { /* e.g. MD5/murmur → 64-bit */ return /* ... */ 0; }
+}
+```
+
+### Plain-English: virtual nodes (vnodes) — why one point per node isn't enough
+
+Problem with placing each node at a *single* clock position: the gaps between nodes are random, so some nodes end up owning a huge arc (lots of keys) and others a tiny arc. Load is lopsided. And when a node dies, its **entire** arc dumps onto one neighbor.
+
+Fix: give each physical node **many** positions on the clock (e.g. 150 "virtual" points each). Now the keyspace is chopped into many small arcs sprinkled evenly, so:
+
+- **Even distribution** — each physical node owns lots of little arcs that average out.
+- **Smooth failure** — when a node dies, its many little arcs spread across *many* neighbors, not one.
+
+```java
+void addNode(String node, int vnodes) {
+    for (int i = 0; i < vnodes; i++) {
+        // same physical node, many ring points: "A#0", "A#1", ...
+        ring.put(hash(node + "#" + i), node);
+    }
+}
+```
+
+#### Q: How does Redis Cluster's "16384 hash slots" relate to a ring?
+
+Same idea, discretized for simplicity. Instead of a continuous clock, Redis pre-defines **16384 fixed slots**. A key maps to a slot via `CRC16(key) % 16384`, and each node owns a **range of slots**. Rebalancing = **moving slot ranges** between nodes (and only those keys move). It's consistent hashing with fixed buckets — easier to reason about and administer than a free-form ring.
+
+```
+key → CRC16(key) % 16384 = slot 8213
+slot 8213 currently owned by node C → key lives on C
+add a node → hand it, say, slots 0–4095 from others → only those keys move
+```
+
+#### Q: So does this run once at startup, or continuously?
+
+The ring/slot map is **live topology**. Nodes join and leave over time; the mapping is updated and gossiped so everyone agrees on the current owner of each key. Clients cache a copy of the map and refresh it when membership changes (see §10). The point of consistent hashing is that these membership changes are *cheap* — a small slice of keys moves, not the whole cache.
+
 ---
 
 ## 7. Eviction Policies
@@ -114,6 +354,54 @@ When memory is full, evict something:
 
 - Perfect LRU needs per-access list maintenance (costly) → real systems **sample a few keys** and evict the best candidate (**approximate LRU/LFU**).
 
+### Plain-English: the board is full — whose note comes down?
+
+The sticky-note board has finite space. When it's full and a new note needs to go up, you must **take one down**. The eviction policy is just *"which one?"* — and the goal is always **pick the note least likely to be needed soon**, so hit rate stays high.
+
+| Policy | Plain-English "take down the note that…" | Best when |
+| --- | --- | --- |
+| **LRU** | …hasn't been *looked at* in the longest time | General use — recently-used stuff tends to be used again |
+| **LFU** | …has been looked at the *fewest times* overall | A few items are permanently popular; one-off spikes shouldn't evict them |
+| **FIFO** | …has been up the longest, regardless of use | Simple, rarely ideal |
+| **TTL-based** | …is closest to its expiry time | Data that's time-bounded anyway |
+
+**LRU** ("least recently used") is the workhorse. Analogy: notes you glanced at a second ago are probably needed again; the one gathering dust for hours is the safe one to remove.
+
+### Plain-English: why "approximate" LRU (sampling)
+
+Perfect LRU means *always* knowing the exact global order of last-access. That requires moving a key to the front of a linked list on **every single read** — extra bookkeeping on the hottest code path, millions of times a second. Too costly.
+
+So real caches cheat: on eviction, **randomly sample K keys** (Redis default ~5) and evict the "worst" of that little sample. It's not perfectly the least-recently-used key, but it's *almost always* a cold one — and it's O(K) instead of maintaining a global structure. Great trade.
+
+```java
+// Approximate LRU: each entry remembers when it was last touched.
+class Entry { byte[] value; long lastAccess; long accessCount; }
+
+void onRead(String key) {
+    Entry e = store.get(key);
+    e.lastAccess = now();       // cheap: one field write, no list surgery
+    e.accessCount++;            // (LFU would lean on this counter)
+}
+
+// When full, sample K keys and drop the least-recently-used of the sample.
+void evictOne() {
+    Entry victim = null; String victimKey = null;
+    for (String key : store.sampleRandomKeys(5)) {   // K = 5, not the whole map
+        Entry e = store.get(key);
+        if (victim == null || e.lastAccess < victim.lastAccess) {  // "oldest touch"
+            victim = e; victimKey = key;
+        }
+    }
+    store.remove(victimKey);    // make room for the new note
+}
+```
+
+For **LFU**, the same loop compares `accessCount` instead of `lastAccess` ("fewest looks" rather than "oldest look").
+
+#### Q: LRU vs LFU — when does the choice actually matter?
+
+Consider a nightly batch job that reads thousands of cold keys once. Under **LRU**, those just-read cold keys look "recently used" and can push out your genuinely popular keys → hit rate tanks. Under **LFU**, the cold keys have a low frequency count, so they get evicted first and the perennial favorites survive. Rule of thumb: **LRU** for general temporal locality, **LFU** when popularity is skewed and stable and you want to resist one-off scans.
+
 ---
 
 ## 8. Replication & Availability
@@ -127,6 +415,42 @@ Replica serves reads / takes over (failover) if the primary dies
 - **Failover**: a controller/sentinel (Redis Sentinel / Cluster) detects primary death → **promotes a replica**; clients redirected.
 - **Async replication** → a tiny window of possible loss on failover — acceptable for a cache (source of truth is the DB).
 
+### Plain-English: keeping a spare copy of each board
+
+If a cache node dies and its data is gone, all *its* keys instantly become misses → a surge of traffic to the DB for that slice. To avoid that, keep a **copy** of each board.
+
+**Analogy:** every sticky-note board has a photocopy kept on a second wall. One board is the **primary** (leader) — all edits happen here. Whenever a note changes, the change is copied to the **replica** (follower). If the primary board falls off the wall, you promote the photocopy to be the new primary and carry on.
+
+```
+             writes
+App ────────────────► Primary (shard 1) ──copies──► Replica (shard 1)
+                          │                              │
+reads can be served by ───┴──────────────────────────────┘
+```
+
+- **Read scaling**: replicas can serve reads too, so a hot shard's reads spread across primary + replicas.
+- **High availability**: if the primary dies, a controller (Redis **Sentinel** / Cluster) notices and **promotes a replica** to primary, then points clients at it. This is **failover**.
+
+#### Q: What is "async" replication, and why is a little data loss OK here?
+
+- **Sync**: the primary waits for the replica to confirm every write before telling the client "done." Safe, but slower — you pay the network round-trip on every write.
+- **Async** (what caches use): the primary replies "done" immediately and copies to the replica **a moment later**. Faster, but if the primary crashes in that tiny gap, the last few writes weren't copied yet — they're lost.
+
+For a **cache**, that loss is acceptable: the database is the source of truth. A lost cache entry just becomes a miss, and the next read re-fetches it from the DB. Losing speed on *every* write to prevent a rare, self-healing loss isn't worth it. (For a *database*, you'd feel very differently — there, sync/quorum matters.)
+
+```java
+// Primary, async style: reply fast, replicate in the background.
+void set(String key, byte[] value) {
+    store.put(key, value);                 // 1. apply locally
+    ack();                                 // 2. tell client "done" NOW
+    replicationQueue.offer(new Op(key, value));  // 3. copy to replica shortly after
+}
+```
+
+#### Q: What's "split-brain" on failover?
+
+If the network splits and *both* the old primary and a freshly-promoted replica think they're in charge, they accept conflicting writes → two divergent boards. Controllers prevent this with **quorum** (a majority must agree who's primary) and **fencing** (the old primary is told to stand down). Covered again in §12.
+
 ---
 
 ## 9. Consistency & Invalidation
@@ -136,6 +460,141 @@ Replica serves reads / takes over (failover) if the primary dies
 - **Write-back** (write cache, async flush to DB) = fast writes but risk on crash — rarely for a plain cache.
 - **Stampede protection**: on a hot miss, **request coalescing (single-flight)** + **randomized TTL**.
 - **Hot key**: replicate the hot key to multiple nodes / add a **client-local cache** layer.
+
+### Plain-English: the core tension — the board can go stale
+
+The cache is a *copy*. The moment the database changes, the sticky note on the board might be **wrong** until we fix it. The strategies below are all answers to *"when data changes, how do we keep the board from lying?"* Each trades off speed, freshness, and complexity.
+
+### Plain-English: the three big write patterns
+
+**Cache-aside (lazy loading)** — the app manages the cache; the cache doesn't know about the DB.
+
+> Read: check the board; on a miss, walk to the cabinet, then pin a copy. Write: update the cabinet, then **rip the stale note off the board** (delete it). Next read re-fetches the fresh value.
+
+```java
+// CACHE-ASIDE — the most common pattern.
+Object read(String key) {
+    Object v = cache.get(key);
+    if (v != null) return v;              // HIT
+    v = db.query(key);                    // MISS → go to the source of truth
+    cache.set(key, v, ttl);               // back-fill so next read is a hit
+    return v;
+}
+
+void write(String key, Object v) {
+    db.update(key, v);                    // 1. update the DB (source of truth)
+    cache.delete(key);                    // 2. DELETE the stale entry (don't update!)
+    //  → next read misses, reloads the fresh value from DB
+}
+```
+
+Why **delete** rather than update the cache on write? Deleting is simpler and dodges a nasty race: if two writers each *set* the cache, they can interleave and leave a stale value. Deleting just says "this is now unknown — reload it," which is always safe.
+
+**Write-through** — the cache sits *in front* of the DB; every write goes **through** the cache, which writes to the DB synchronously.
+
+> You never write directly to the cabinet. You hand the note to the board; the board updates itself **and** files it in the cabinet before saying "done." Board and cabinet are always in sync — at the cost of a slower write.
+
+```java
+// WRITE-THROUGH — write cache + DB together, synchronously.
+void write(String key, Object v) {
+    cache.set(key, v);                    // update cache
+    db.update(key, v);                    // AND the DB, before returning
+    // reads are always warm & consistent; writes pay both costs
+}
+```
+
+**Write-back (write-behind)** — write to the cache only; flush to the DB **later**, asynchronously.
+
+> Slap the note on the board and walk away. A background clerk files a batch of notes into the cabinet every so often. Blazing-fast writes, but if the board burns down before the clerk files, those writes are **lost**. Rare for a plain cache; used when write speed dominates and some loss is tolerable.
+
+```java
+// WRITE-BACK — fast write now, persist later (risk on crash).
+void write(String key, Object v) {
+    cache.set(key, v);                    // instant
+    dirtyQueue.add(key);                  // remember to flush
+    // background flusher writes batches to the DB every N ms
+}
+```
+
+| Pattern | Write path | Reads | Speed | Risk / cost |
+| --- | --- | --- | --- | --- |
+| **Cache-aside** | DB, then delete cache | Lazy-loaded on miss | Fast writes | First read after a write is a miss |
+| **Write-through** | Cache **and** DB (sync) | Always warm | Slower writes | Every write pays DB latency |
+| **Write-back** | Cache now, DB later | Always warm | Fastest writes | Data loss if node dies before flush |
+
+#### Q: Cache-aside vs write-through — which do I pick?
+
+- **Cache-aside** is the default for read-heavy apps: only data that's actually read ever enters the cache (no wasted RAM on write-only keys), and it degrades gracefully if the cache is down. Downside: the read right after a write is a miss, and there's a brief inconsistency window between the DB update and the cache delete.
+- **Write-through** keeps the cache always fresh (great when you read what you just wrote), but it wastes RAM on keys that may never be read and makes every write slower. Often people combine write-through with a TTL, or just use cache-aside with delete-on-write.
+
+### Plain-English: cache stampede / thundering herd
+
+**The scene:** one super-popular key (the front-page item) is cached. Its entry **expires**. In the very next instant, 10,000 requests all ask for it, all miss, and all **stampede the database** with the same query at once. The DB, which was fine serving one query, gets hit with 10,000 identical ones and can fall over. Also called the **thundering herd**.
+
+Two standard defenses:
+
+**1. Request coalescing (single-flight):** when many requests miss the same key at once, let **one** of them go fetch from the DB; the rest **wait** for that single result and share it. One DB query instead of 10,000.
+
+```java
+// SINGLE-FLIGHT: collapse concurrent misses on the same key into ONE DB load.
+ConcurrentHashMap<String, CompletableFuture<Object>> inflight = new ConcurrentHashMap<>();
+
+Object read(String key) {
+    Object v = cache.get(key);
+    if (v != null) return v;                       // HIT
+
+    // Only the FIRST caller creates the loader; others get the same future.
+    CompletableFuture<Object> f = inflight.computeIfAbsent(key, k ->
+        CompletableFuture.supplyAsync(() -> {
+            Object loaded = db.query(k);           // exactly ONE DB hit
+            cache.set(k, loaded, ttl);
+            inflight.remove(k);                    // clear once done
+            return loaded;
+        })
+    );
+    return f.join();                               // everyone else waits & shares
+}
+```
+
+**2. Randomized (jittered) TTL:** if 10,000 keys were all cached at the same moment with the exact same TTL, they'd all expire at the *same* instant → a mass stampede (this is **cache avalanche**). Add a little random jitter to each TTL so expirations spread out.
+
+```java
+// JITTERED TTL: base 60s ± up to 10s, so keys don't all expire together.
+int ttl = 60 + ThreadLocalRandom.current().nextInt(10);
+cache.set(key, value, ttl);
+```
+
+#### Q: Stampede vs avalanche vs penetration — what's the difference?
+
+Easy to conflate; they're distinct (see §12 for the table):
+
+- **Stampede / thundering herd** — *one* hot key expires; a crowd all miss it at once. Fix: single-flight + jittered TTL.
+- **Avalanche** — *many* keys expire at the *same time* (e.g. all set together), causing a broad miss surge. Fix: jittered TTLs, staggered warmup.
+- **Penetration** — requests for keys that **don't exist anywhere** (not in cache, not in DB), so they always miss and always hit the DB. Fix: **negative caching** (cache the "not found") + a **Bloom filter** to reject absent keys before touching the DB.
+
+### Plain-English: TTL — the note's expiry date
+
+**TTL (time-to-live)** is how long a cached value is allowed to stay before it's considered stale and removed (see lazy/active expiry in §5). It's your main knob for freshness vs load:
+
+- **Short TTL** → data is fresher (the board re-syncs with the cabinet often) but more misses → more DB load.
+- **Long TTL** → fewer misses, less DB load, but the board can be stale longer.
+
+For data that changes on writes, pair a reasonable TTL with **delete-on-write** (cache-aside) so you don't rely on the TTL alone to catch changes. TTL is the safety net; the delete is the prompt fix.
+
+### Plain-English: hot key (one note everyone crowds around)
+
+Distinct from a hot *shard*. A **hot key** is a *single* key (one celebrity's profile) so popular that **all** its traffic lands on the one node that owns it — that node melts while others idle. Sharding doesn't help, because one key can't be split across nodes by hashing.
+
+Fixes:
+
+- **Replicate the hot key** to several nodes and spread reads across the copies (e.g. store it under a few salted names `celebrity:42#0..#3` and pick one at random per read).
+- **Client-local cache**: each app server keeps a tiny in-process cache of the hottest keys (with a short TTL), so most reads never even reach the cache cluster.
+
+```java
+// Spread reads of ONE hot key across R replica copies.
+int r = ThreadLocalRandom.current().nextInt(REPLICAS);   // 0..R-1
+Object v = cache.get("celebrity:42#" + r);               // different node per read
+```
 
 ---
 
@@ -148,6 +607,24 @@ Replica serves reads / takes over (failover) if the primary dies
 | **Cluster mode** | Nodes know the ring/slots; **redirect** clients to the right node (Redis Cluster `MOVED`/`ASK`) |
 
 - Clients **cache the topology/ring**; refresh on membership change (gossip / control plane).
+
+### Plain-English: who holds the "which board has what" map?
+
+Someone has to answer "which node owns this key?" (the ring/slot lookup from §6). There are three places that logic can live:
+
+| Topology | Who does the routing | Analogy |
+| --- | --- | --- |
+| **Client-side sharding** | The app's client library hashes the key and connects straight to the right node | Every employee memorizes the "note → board" rule and walks directly to the board |
+| **Proxy** | A middleman (Twemproxy/Envoy) takes the request and forwards it; clients stay dumb | You hand every request to a front-desk clerk who knows all the boards and fetches for you |
+| **Cluster mode** | The nodes themselves know the map; if you ask the wrong node it **redirects** you | You ask any board; if it's not theirs, they point and say "it's on board 7" (Redis `MOVED`/`ASK`) |
+
+- **Client-side** = one fewer hop (fastest) but every client must know and refresh the ring.
+- **Proxy** = simplest clients, but the proxy is an extra hop and a thing to scale/operate.
+- **Cluster mode** = smart nodes, thin clients; the redirect costs an occasional extra round-trip when topology just changed.
+
+#### Q: How do clients avoid getting redirected on every request?
+
+They **cache the topology** (a local copy of the ring/slot map). They route directly using that cached map, so redirects are rare. When membership changes (a node joins/leaves), the map is updated and propagated (via **gossip** between nodes or a control plane); the client refreshes and gets back to direct routing. A `MOVED` redirect is essentially the cluster telling a client "your map is stale — here's the correct node, and please refresh."
 
 ---
 
@@ -184,6 +661,36 @@ New node joins the ring (vnodes) → owns ~1/N of the keyspace
 | Whole cache down | **Circuit breaker** → serve from DB (provision DB to survive it) |
 | Memory pressure | Eviction (LRU/LFU) + alert |
 | Split-brain on failover | Fencing / quorum in the controller |
+
+### Plain-English: the "three cache disasters," disambiguated
+
+These three sound alike and get mixed up constantly. They differ by *what's being asked for* and *why it hits the DB*:
+
+| Disaster | What happens | Sticky-note picture | Fix |
+| --- | --- | --- | --- |
+| **Penetration** | Requests for keys that exist **nowhere** (not in cache, not in DB) — often malicious | People keep asking for a note that was never written and never will be; every ask forces a cabinet trip that finds nothing | **Negative caching** (cache "not found") + **Bloom filter** to reject absent keys upfront |
+| **Avalanche** | A **big batch** of keys expire at the same moment → broad miss surge | Half the board's notes all had the same "toss at 5pm" time, so at 5:01 the board is bare and everyone runs to the cabinet | **Jittered TTLs** + staggered warmup |
+| **Stampede** (thundering herd) | **One hot key** expires and a crowd all miss it at once | One wildly popular note comes down and 10,000 people rush the cabinet for the same file | **Single-flight** (one loader) + jittered TTL |
+
+#### Q: What's a Bloom filter doing here?
+
+A **Bloom filter** is a tiny, fast, probabilistic "have we *ever* seen this key?" gate. Before hitting the DB for a possibly-nonexistent key, ask the filter: if it says "definitely no," skip the DB entirely (that's how you kill **penetration**). It can have false positives ("maybe yes" when actually no) but **never** false negatives, so it's safe as a pre-filter — a "no" is always trustworthy.
+
+```java
+// Guard against penetration: reject keys the Bloom filter has never seen.
+Object read(String key) {
+    if (!bloom.mightContain(key)) return NOT_FOUND;  // definitely absent → skip DB
+    Object v = cache.get(key);
+    if (v != null) return v;
+    v = db.query(key);
+    cache.set(key, v == null ? NULL_SENTINEL : v, ttl);  // negative-cache misses too
+    return v;
+}
+```
+
+#### Q: What is the "circuit breaker" for a whole-cache outage?
+
+If the **entire** cache cluster is down, every read becomes a miss and the full firehose hits the DB — which may not survive it. A **circuit breaker** detects the cache is failing and **stops trying it** for a while, routing reads straight to the DB (which you've provisioned to survive this) and periodically probing whether the cache is back. It's the electrical-breaker analogy: trip the circuit so one failure doesn't cascade into a total meltdown.
 
 ---
 

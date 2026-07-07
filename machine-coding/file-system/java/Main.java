@@ -12,6 +12,9 @@ import java.util.*;
  */
 public class Main {
 
+    // Composite "component": the common abstraction for both files and directories.
+    // Because everything is a Node with size()/isDir(), callers can treat leaves and
+    // composites the same way when walking the tree.
     static abstract class Node {
         final String name;
         Node(String name) { this.name = name; }
@@ -19,21 +22,27 @@ public class Main {
         abstract int size(); // bytes; dir = sum of children
     }
 
+    // Composite "leaf": a file. It has no children, just text content.
     static class FileNode extends Node {
         StringBuilder content = new StringBuilder();
         FileNode(String name) { super(name); }
         boolean isDir() { return false; }
+        // A file's size is simply the number of characters it holds.
         int size() { return content.length(); }
     }
 
+    // Composite "composite": a directory that holds child nodes (files or sub-dirs).
     static class DirNode extends Node {
         // Sorted map so ls output is alphabetical.
         final TreeMap<String, Node> children = new TreeMap<>();
         DirNode(String name) { super(name); }
         boolean isDir() { return true; }
+        // Recursive size: a directory's size is the sum of all its children's sizes.
         int size() { int s = 0; for (Node n : children.values()) s += n.size(); return s; }
     }
 
+    // The high-level API over the node tree: the operations a user actually calls
+    // (mkdirs, writeFile, ls, size, find, ...). It hides tree-walking details.
     static class FileSystem {
         private final DirNode root = new DirNode("/");
 
@@ -45,13 +54,15 @@ public class Main {
         }
 
         // Create all directories along the path (mkdir -p).
+        // Walk each path segment: create the dir if missing, descend if it already
+        // exists as a dir, or fail if a file blocks the way.
         DirNode mkdirs(String path) {
             DirNode cur = root;
             for (String part : parts(path)) {
                 Node next = cur.children.get(part);
-                if (next == null) { DirNode d = new DirNode(part); cur.children.put(part, d); cur = d; }
-                else if (next.isDir()) cur = (DirNode) next;
-                else throw new IllegalArgumentException(part + " is a file, not a dir");
+                if (next == null) { DirNode d = new DirNode(part); cur.children.put(part, d); cur = d; }  // missing -> create and step in
+                else if (next.isDir()) cur = (DirNode) next;                                              // exists as dir -> step in
+                else throw new IllegalArgumentException(part + " is a file, not a dir");                  // a file blocks the path
             }
             return cur;
         }
@@ -59,8 +70,8 @@ public class Main {
         // Create/overwrite a file and set its content (parent dirs auto-created).
         void writeFile(String path, String content) {
             String[] p = parts(path);
-            String fname = p[p.length - 1];
-            // Walk (creating) all parent directories.
+            String fname = p[p.length - 1];  // last segment is the file name; the rest are parent dirs
+            // Walk (creating) all parent directories, stopping before the file name.
             DirNode dir = root;
             for (int i = 0; i < p.length - 1; i++) {
                 Node next = dir.children.get(p[i]);
@@ -68,11 +79,13 @@ public class Main {
                 else if (next.isDir()) dir = (DirNode) next;
                 else throw new IllegalArgumentException(p[i] + " is a file, not a dir");
             }
+            // Put a fresh file node into the parent dir (overwrites any existing entry).
             FileNode f = new FileNode(fname);
             f.content.append(content);
             dir.children.put(fname, f);
         }
 
+        // Return a file's text content; error if the path is missing or is a directory.
         String readFile(String path) {
             Node n = resolve(path);
             if (n == null || n.isDir()) throw new NoSuchElementException("not a file: " + path);
@@ -88,34 +101,39 @@ public class Main {
         }
 
         // Resolve a path to a node, or null.
+        // Start at root and step down one segment at a time; bail out (null) if a
+        // segment is missing or if we try to descend into a file.
         Node resolve(String path) {
             if (path.equals("/")) return root;
             Node cur = root;
             for (String part : parts(path)) {
-                if (!cur.isDir()) return null;
+                if (!cur.isDir()) return null;                 // can't descend into a file
                 cur = ((DirNode) cur).children.get(part);
-                if (cur == null) return null;
+                if (cur == null) return null;                  // segment doesn't exist
             }
             return cur;
         }
 
         // Recursively find files/dirs whose name contains a substring.
+        // Kicks off a depth-first search from each top-level child.
         List<String> find(String substring) {
             List<String> hits = new ArrayList<>();
             for (Node child : root.children.values()) dfs(child, "", substring, hits);
             return hits;
         }
-        // 'parentPath' is the absolute path of the node's parent (root = "").
+        // Depth-first walk: 'parentPath' is the absolute path of the node's parent (root = "").
         private void dfs(Node node, String parentPath, String needle, List<String> hits) {
-            String path = parentPath + "/" + node.name;
-            if (node.name.contains(needle)) hits.add(path);
-            if (node.isDir())
+            String path = parentPath + "/" + node.name;                    // build this node's full path
+            if (node.name.contains(needle)) hits.add(path);                // record a match
+            if (node.isDir())                                              // recurse into sub-directories
                 for (Node child : ((DirNode) node).children.values()) dfs(child, path, needle, hits);
         }
 
+        // Recursive byte size of a path (0 if the path doesn't exist).
         int size(String path) { Node n = resolve(path); return n == null ? 0 : n.size(); }
     }
 
+    // Demo: build a small tree, then exercise ls / read / size / find.
     public static void main(String[] args) {
         FileSystem fs = new FileSystem();
         fs.mkdirs("/home/alice/docs");

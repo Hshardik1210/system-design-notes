@@ -9,7 +9,10 @@
 #include <unordered_map>
 using namespace std;
 
+// The cache: ties an unordered_map and a hand-built doubly linked list together
+// so both get() and put() are O(1).
 class LRUCache {
+    // One list element: holds the cached key/value plus pointers to its neighbours.
     struct Node {
         int key, value;
         Node *prev = nullptr, *next = nullptr;
@@ -17,33 +20,39 @@ class LRUCache {
     };
 
     int capacity;
-    unordered_map<int, Node*> map;
+    unordered_map<int, Node*> map;  // key -> node, for O(1) lookup
     Node* head; // head->next = MRU
     Node* tail; // tail->prev = LRU
 
+    // Detach a node: make its neighbours point to each other, skipping over it.
     void remove(Node* n) {
-        n->prev->next = n->next;
-        n->next->prev = n->prev;
+        n->prev->next = n->next;   // node before n now points past n
+        n->next->prev = n->prev;   // node after n now points back past n
     }
+    // Splice a node in right after head, making it the new most-recently-used.
     void addFront(Node* n) {
-        n->next = head->next;
-        n->prev = head;
-        head->next->prev = n;
-        head->next = n;
+        n->next = head->next;      // n points to the old first node
+        n->prev = head;            // n points back to head
+        head->next->prev = n;      // old first node points back to n
+        head->next = n;            // head now points to n as the new front
     }
 
 public:
+    // Build an empty list bounded by two dummy sentinel nodes (head and tail).
+    // They carry no real data but ensure every real node has valid neighbours.
     explicit LRUCache(int cap) : capacity(cap) {
         head = new Node(0, 0);
         tail = new Node(0, 0);
         head->next = tail;
         tail->prev = head;
     }
+    // Free every node (including the sentinels) to avoid leaking heap memory.
     ~LRUCache() {
         Node* c = head;
         while (c) { Node* nxt = c->next; delete c; c = nxt; }
     }
 
+    // Look up a key: return its value and promote it to MRU, or -1 on a miss.
     int get(int key) {
         auto it = map.find(key);
         if (it == map.end()) return -1;       // miss
@@ -52,6 +61,8 @@ public:
         return n->value;
     }
 
+    // Insert or update a key; evict the least-recently-used entry if the cache
+    // is full and the key is new.
     void put(int key, int value) {
         auto it = map.find(key);
         if (it != map.end()) {                // update + promote
@@ -62,11 +73,11 @@ public:
         if ((int)map.size() == capacity) {    // evict LRU
             Node* lru = tail->prev;
             remove(lru);
-            map.erase(lru->key);
-            delete lru;
+            map.erase(lru->key);              // keep map and list in sync
+            delete lru;                       // C++: also free the node's memory
         }
         Node* n = new Node(key, value);
-        map[key] = n;
+        map[key] = n;                         // add to map and list together
         addFront(n);
     }
 

@@ -2,6 +2,8 @@
 
 > Companion to **Food Ordering & Delivery — System Design**. **Part A: High-Level Design (HLD)** — architecture. **Part B: Low-Level Design (LLD)** — **all tables**, **full API contracts**, **class design**, **design patterns**, state machines, algorithms, sequences.
 
+> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (Swiggy/Zomato/DoorDash analogies, annotated Java/SQL/API, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand. Running analogy throughout: **you order food on an app, the restaurant cooks it, and a driver delivers it.**
+
 ---
 
 ## Contents
@@ -33,6 +35,23 @@
 - **Consistency:** **strong** for orders/payments; **eventual** for discovery, tracking, ratings.
 - Order core ≈ e-commerce; the unique layer is **hyperlocal discovery + real-time dispatch + live tracking**. Full rationale in the main design note.
 
+### Plain-English: what are we building, and what does "consistency" mean here?
+
+Picture the Swiggy/Zomato app. The whole journey is: **you search for nearby restaurants → add food to a cart → place + pay → the restaurant accepts and cooks → a driver picks it up → you watch the bike move on a map → it arrives → you rate it.** That's the entire system. Everything below is just "how do we build each of those steps so it scales to millions of hungry people."
+
+**"Consistency"** = how fresh/correct the data has to be at the exact moment you read it. Two flavors:
+
+- **Strong consistency** = "the number MUST be right, right now, no exceptions." Used for **money and orders**. If you paid ₹500, the system must never think you paid ₹0 or ₹1000, and an order must never be cooked twice or lost. Correctness beats speed.
+- **Eventual consistency** = "it's fine if it's a second or two stale, as long as it catches up." Used for **discovery, live tracking, ratings**. If a restaurant's star rating shows 4.3 instead of the brand-new 4.31, or the driver dot is 3 seconds behind, nobody gets hurt. Freshness/speed beats perfect accuracy.
+
+#### Q: Why not make *everything* strongly consistent to be safe?
+
+Strong consistency is expensive — it needs locks, coordination, and often a single source of truth that everyone waits on. That's fine for the ~1 order you place, but the map is updating the driver's location 5×/second and thousands of people are browsing restaurants at once. Forcing all of that to be perfectly in-sync would make the app slow and fragile. So we spend the "expensive correctness" budget only where money is involved.
+
+#### Q: What does "order core ≈ e-commerce" mean?
+
+The cart → checkout → pay → fulfill flow is basically the same as Amazon. What makes food delivery *special* (and hard) is the three real-time, location-based pieces bolted on: finding restaurants **near you** (hyperlocal discovery), assigning a **nearby driver** in seconds (real-time dispatch), and showing the **bike moving live** (tracking). Those are the interesting parts of this doc.
+
 ## A2. Architecture Overview
 
 ```
@@ -50,6 +69,33 @@ Customer/Restaurant/Rider apps → API Gateway
               Kafka (event backbone: ORDER_PLACED, ORDER_READY, RIDER_ASSIGNED, DELIVERED)
 ```
 
+### Plain-English: one big app, split into many small specialists
+
+Instead of one giant program doing everything, we split the work into **microservices** — small programs that each do one job well. Think of a big restaurant chain's back office: one team handles menus, another handles payments, another dispatches drivers. Each has its own filing cabinet (database) and they talk to each other by passing notes.
+
+**Analogy for each box:**
+
+| Box | Real-world job | Why it's separate |
+| --- | --- | --- |
+| **API Gateway** | The front desk / receptionist | One entrance; checks your login, routes you to the right department |
+| **Discovery/Search** | "What's open near me?" board | Needs fast location + text search (special tools) |
+| **Catalog/Menu** | The menu binders | Read a lot, changes rarely → cache it |
+| **Cart** | Your tray before you pay | Temporary, throwaway → fast memory (Redis) |
+| **Order** | The order manager who tracks each ticket | The heart; owns the order's life story (state machine) |
+| **Payment** | The cashier | Must be exact (money) |
+| **Dispatch** | The dispatcher matching drivers to orders | Needs "who's nearby?" fast |
+| **Location** | GPS receiver for every driver | Floods of pings → memory, not disk |
+| **Tracking** | The live map you stare at | Pushes updates to your phone |
+| **Notification** | The person texting you "order accepted!" | |
+
+#### Q: What is Kafka (the "event backbone") doing at the bottom?
+
+Kafka is a **shared bulletin board / announcement system**. When something important happens ("ORDER_PLACED"), the Order service pins a note to the board and moves on — it does *not* call every other service one by one. Whoever cares (Dispatch, Notification, Analytics) reads the note and reacts. This way the Order service doesn't need to know or wait for everyone downstream; it just announces "an order was placed!" and gets back to work. (More in §A4.)
+
+#### Q: Why so many separate databases instead of one?
+
+Different jobs need different tools. Money needs a strict ledger (RDBMS). "Restaurants near me" needs a geo/search engine (Elasticsearch + Redis GEO). A throwaway cart needs fast memory (Redis). Forcing all of these into one database would make each job worse. This is the "**right tool for each job**" principle (detailed in §A5).
+
 ## A3. Services & Responsibilities
 
 | Service | Owns | Store |
@@ -66,6 +112,30 @@ Customer/Restaurant/Rider apps → API Gateway
 | Notification | multi-channel updates | (see Notification note) |
 | Rating | reviews + aggregate | RDBMS |
 
+### Plain-English: who owns what (and why "owns" matters)
+
+Each service **owns** a slice of the data — it's the only one allowed to directly write to that slice. Everyone else must ask it. This is like departments in a company: only HR edits your salary record; the marketing team can't reach into HR's cabinet and change it, they have to file a request.
+
+**Concrete walk-through of one order's journey across services:**
+
+```
+You tap "Order"        → Order service creates the order (owns its status)
+Order needs payment    → asks Payment service (owns money)
+Order is placed        → announces on Kafka
+Dispatch hears it      → asks Location "who's nearby?" then offers to a driver (owns matching)
+Driver rides           → Location service ingests GPS pings (owns positions)
+You open the map       → Tracking pushes the driver's dot to your phone (owns the live feed)
+Delivered              → Rating service lets you leave a review (owns reviews)
+```
+
+#### Q: Why can't the Order service just update the driver's location itself?
+
+Because that's not its job, and mixing jobs creates a mess. The Location service handles ~75,000 GPS pings/second (every driver, several times a second). If that firehose hit the Orders database, it would drown the actual orders. Keeping "owns positions" separate from "owns orders" means the location flood can't take down your ability to place orders. **Separation of concerns = a failure in one area doesn't sink the others.**
+
+#### Q: The same store (RDBMS) appears many times — is that one database?
+
+Not necessarily. "RDBMS" is the *type* of store (a SQL relational database). Each service typically has its **own** RDBMS instance/schema so they stay independent. They happen to pick the same *kind* of tool because their needs (transactions, relationships) are similar.
+
 ## A4. Communication — Sync vs Async
 
 | Interaction | Style |
@@ -75,6 +145,37 @@ Customer/Restaurant/Rider apps → API Gateway
 | Rider GPS → Location | **Async fire-and-forget** (high frequency) |
 | Location/Order → Customer app | **WebSocket push** |
 | Services → Payment/Maps gateway | **Sync HTTP** (behind circuit breaker) |
+
+### Plain-English: "wait for the answer" vs "leave a note and move on"
+
+There are two ways for services to talk:
+
+- **Sync (synchronous)** = you **wait** for the reply, like a **phone call**. "Did the payment go through? …I'll hold." You can't continue until you hear back. Use it when you genuinely need the answer *now* (did the card charge succeed?).
+- **Async (asynchronous)** = you **fire off a message and move on**, like a **text message** or pinning a note on Kafka. You don't wait; the other side handles it whenever. Use it when the caller doesn't need to block (notifying the restaurant, telling analytics).
+
+**Analogy:** placing the order is a phone call to the cashier — you stare at the spinner until it says "Payment successful, order placed." But telling the kitchen, the dispatcher, and the SMS system is done by **pinning tickets on a board** — you don't stand there waiting for the kitchen to say "got it."
+
+```java
+// SYNC — you wait for the result because you NEED it to proceed
+PaymentResult r = paymentGateway.charge(order);   // blocks here until bank replies
+if (r.success) { /* only now can we place the order */ }
+
+// ASYNC — fire the event and immediately move on; others react later
+kafka.publish("ORDER_PLACED", order);             // returns instantly; doesn't wait
+// dispatch, notification, analytics each pick this up on their own time
+```
+
+#### Q: Why not just make everything sync? It's simpler to reason about.
+
+Because sync **chains failures and adds waiting**. If placing an order had to synchronously call Payment, then Dispatch, then Notification, then Analytics — and the Notification service was slow or down — *your order would hang or fail* even though the notification is unimportant. Async decouples them: the order succeeds the moment payment clears, and everything else happens in the background. If Notification is down, it catches up later; your order is unaffected.
+
+#### Q: Why is rider GPS "fire-and-forget"?
+
+A driver's phone sends its location several times a second. If each ping waited for a confirmation, we'd waste huge effort on acknowledgements for data that's obsolete in one second anyway. So we fire it and forget it — if one ping is lost, the next one (a fraction of a second later) corrects it. Losing one GPS dot doesn't matter; speed does.
+
+#### Q: What's the "circuit breaker" next to Payment/Maps?
+
+External services (the bank's payment gateway, Google Maps) sometimes get slow or go down. A **circuit breaker** is like a fuse: if the payment gateway starts failing repeatedly, the breaker "trips" and we stop calling it for a while (failing fast with a clear error) instead of piling up thousands of stuck phone-calls that freeze our whole system. It protects us from a partner's outage.
 
 ## A5. Storage Strategy
 
@@ -88,9 +189,55 @@ Customer/Restaurant/Rider apps → API Gateway
 | Cart, sessions, rate limits | Redis |
 | Event backbone | Kafka |
 
+### Plain-English: picking the right container for each kind of data
+
+Different data has different "shape" and access needs, so we store each in the tool built for it. Kitchen analogy: you keep knives on a magnetic strip, spices in a rack, and frozen goods in a freezer — same kitchen, different storage because the *needs* differ.
+
+| Data | Tool | Why (the analogy) |
+| --- | --- | --- |
+| **Orders / payments** | RDBMS (SQL) | A **strict ledger/accountant's book** — supports transactions ("all-or-nothing"), never loses money |
+| **Menu / catalog** | RDBMS + Redis cache | A **printed menu** — rarely changes, read constantly → keep a fast photocopy (cache) |
+| **Discovery index** | Elasticsearch | A **smart search engine** — "cheap veg biryani near me, open now, rated 4+" is a fuzzy multi-filter search |
+| **Rider positions** | Redis GEO | A **live radar screen** — must answer "who's within 3 km?" in milliseconds, updated constantly |
+| **Location history** | Time-series / warehouse | A **flight recorder** — kept for later analysis, not for live use |
+| **Cart / sessions** | Redis | A **sticky note** — temporary, fast, disposable |
+| **Event backbone** | Kafka | The **bulletin board** for announcements between services |
+
+#### Q: What is "ACID" and why do orders/payments need it?
+
+**ACID** = the four guarantees of a serious database transaction: **A**tomic (all steps happen or none do), **C**onsistent (rules never violated), **I**solated (concurrent transactions don't corrupt each other), **D**urable (once saved, it survives crashes). For money this is non-negotiable: charging your card and creating your order must **both** happen or **neither** — you should never be charged for an order that doesn't exist. Redis/Elasticsearch don't give strong ACID guarantees, which is exactly why we don't put orders/payments there.
+
+#### Q: What does "sharded by region/customer" mean for orders?
+
+**Sharding** = splitting one huge table across many databases so no single machine holds everything. Analogy: instead of one nationwide order-book that everyone fights over, each **city** keeps its own order-book. Mumbai's orders live on the Mumbai shard, Delhi's on the Delhi shard. This spreads the load and keeps each database small and fast. The "shard key" (region or customer) decides which shard a given order lands on.
+
+#### Q: What's "rebuilt via CDC" for the discovery index?
+
+**CDC = Change Data Capture.** The source of truth for restaurants/menus is the RDBMS. Elasticsearch is a *copy* optimized for search. CDC is the mechanism that **automatically streams every change** (new restaurant, price update, sold-out toggle) from the RDBMS into Elasticsearch so the search index stays fresh — instead of someone manually re-uploading everything. Think of it as a live feed that mirrors edits from the master book into the searchable copy.
+
 ## A6. Tech Stack
 
 Java/Spring Boot or Go · PostgreSQL (sharded) · Redis (GEO + cache) · Elasticsearch · Kafka · WebSocket service (Go/Node) · Maps/routing (Google Maps/OSRM) · Payment gateway (Razorpay/Stripe) · Kubernetes.
+
+### Plain-English: what each tool is, in one line
+
+- **Java/Spring Boot or Go** — the programming languages/frameworks the services are written in (the "workers" doing the logic).
+- **PostgreSQL** — the SQL database = the strict ledger for orders/payments.
+- **Redis** — an in-memory (super fast) store used for carts, caches, and the "who's nearby" geo radar.
+- **Elasticsearch** — the search engine for restaurant discovery.
+- **Kafka** — the announcement bulletin board between services.
+- **WebSocket service** — keeps a live, always-open pipe to your phone so the map/status can be *pushed* instantly (vs your phone repeatedly asking "any update? any update?").
+- **Maps/routing (Google Maps/OSRM)** — computes driving routes and ETAs.
+- **Payment gateway (Razorpay/Stripe)** — the external company that actually charges cards/UPI.
+- **Kubernetes** — the "operations manager" that runs many copies of each service, restarts crashed ones, and scales them up during dinner rush.
+
+#### Q: What is a WebSocket, and why not just refresh the page?
+
+Normally your phone asks the server "any news?" over and over (polling) — wasteful and laggy. A **WebSocket** is a **phone line left off the hook**: once opened, the server can speak to your phone *the instant* something changes (order accepted, driver moved) without being asked. That's how the live tracking map and status updates feel real-time.
+
+#### Q: Why list two options (Java **or** Go, Razorpay **or** Stripe)?
+
+Because the *design* doesn't depend on the exact brand. Thanks to **Ports & Adapters** (see §B3), payment is called through a `PaymentPort` interface, so swapping Razorpay for Stripe is a plug change, not a rewrite. Listing alternatives signals "these are interchangeable choices, pick per region/cost."
 
 ---
 
@@ -326,6 +473,43 @@ CREATE INDEX idx_outbox_unpublished ON outbox(created_at) WHERE published = FALS
 
 > **Table checklist:** users, addresses, restaurants, restaurant_hours, restaurant_zones, menu_categories, menu_items, item_customizations, delivery_partners, rider_shifts, carts, cart_items, orders, order_items, order_status_history, order_assignments, payments, refunds, wallets, coupons, coupon_redemptions, reviews, outbox. Live rider location = **Redis GEO** (not a table).
 
+### Plain-English: the tables are just the app's filing cabinets
+
+Every table is a **spreadsheet/filing cabinet** for one kind of thing. If you screenshot the app, you can point at what each table stores:
+
+| Table group | What you see in the app |
+| --- | --- |
+| `users`, `addresses` | Your profile + saved "Home/Work" addresses |
+| `restaurants`, `restaurant_hours`, `menu_categories`, `menu_items`, `item_customizations` | A restaurant's page: name, open hours, menu sections, dishes, "extra cheese +₹30" add-ons |
+| `delivery_partners`, `rider_shifts` | The drivers and when they were online |
+| `carts`, `cart_items` | Your tray before checkout |
+| `orders`, `order_items`, `order_status_history` | A placed order, its dishes (frozen at purchase time), and its timeline |
+| `order_assignments` | Each "offer" sent to a driver to take the order |
+| `payments`, `refunds`, `wallets` | Money in, money back, app credits |
+| `coupons`, `coupon_redemptions` | Discount codes and who used them |
+| `reviews` | Your star ratings + comment |
+| `outbox` | An internal "outbox tray" of events waiting to be announced (see §B4) |
+
+#### Q: Why does `order_items` copy `name` and `price` — isn't that already in `menu_items`?
+
+This is a **snapshot** (notice the `-- snapshot` comments). When you order a "Margherita ₹200", we copy the name and price *into the order*. Why? Because tomorrow the restaurant might rename it or raise the price to ₹250. Your receipt must forever say what you actually bought and paid — ₹200. If `order_items` just *pointed* to the live menu, your old receipt would silently change when the menu changes. **Orders freeze the facts at purchase time.**
+
+#### Q: Why is money stored as `INT` (paise/cents), not a decimal like 200.50?
+
+Decimals/floats are imprecise on computers (0.1 + 0.2 famously ≠ 0.3). For money that's unacceptable. So we store the amount in the **smallest unit as a whole number**: ₹200.50 → `20050` paise. All math stays exact integer math; we only divide by 100 when *displaying* it.
+
+#### Q: What is `idempotency_key` on `orders` and why `UNIQUE`?
+
+Your phone's network is flaky. You tap "Place Order", the request is slow, you tap again — now the server might get the request **twice**. To avoid charging you and cooking two identical orders, the app generates one **idempotency key** per checkout attempt and sends it with both taps. The `UNIQUE (idempotency_key)` constraint means the database physically **rejects the second insert** — same key can exist only once. Result: duplicate taps = one order. ("Idempotent" = doing it twice has the same effect as doing it once.)
+
+#### Q: What's the `outbox` table for — why not just send the Kafka event directly?
+
+Danger: you save the order to the DB, then try to announce "ORDER_PLACED" to Kafka — but the app crashes in between. Now the order exists but nobody was told → it's stuck forever. The **Outbox pattern** fixes this: in the *same database transaction* that saves the order, you also insert a row into `outbox`. Since it's one transaction, either both happen or neither. A separate relay process then reads unpublished outbox rows and pushes them to Kafka, marking them published. The event can never be lost. (More in §B4.)
+
+#### Q: Why is the live rider location NOT a table?
+
+Drivers send GPS ~every second → tens of thousands of writes per second. A SQL database would melt under that (same "too many writes" wall as high-traffic counters). Live position lives in **Redis GEO** (fast memory, and it can answer "who's near this restaurant?" instantly). The SQL `delivery_partners` table only holds slow-changing facts (name, vehicle, status).
+
 ---
 
 ## B2. API Contracts (complete)
@@ -378,6 +562,45 @@ ORDER_PLACED · ORDER_ACCEPTED · ORDER_REJECTED · ORDER_READY
 RIDER_ASSIGNED · ORDER_PICKED_UP · ORDER_DELIVERED · ORDER_CANCELLED
 PAYMENT_SUCCESS · PAYMENT_FAILED · REFUND_INITIATED
 ```
+
+### Plain-English: APIs are the buttons in the app
+
+An **API** is just the list of "buttons" each app can press on the server. There are three apps (Customer, Restaurant, Rider), so three sets of buttons, plus internal Kafka "events" (announcements, not buttons a human presses).
+
+**Reading an endpoint:** `POST /v1/orders` means "the Customer app sends (POST = create) a request to the `/orders` address to make a new order." `GET` = read, `POST` = create, `PATCH`/`PUT` = update, `DELETE` = remove. The `/v1/` is the version, so we can change things later without breaking old apps.
+
+**Map the customer's taps to endpoints:**
+
+```
+Tap on the app                         → API call
+──────────────────────────────────────────────────────────────
+Log in with OTP                        → POST /v1/auth/otp, /verify
+Home screen "restaurants near me"      → GET  /v1/restaurants?lat=&lng=
+Open a restaurant                      → GET  /v1/restaurants/{id}/menu
+Add a dish to cart                     → POST /v1/cart/items
+Apply a promo code                     → POST /v1/cart/apply-coupon
+Tap "Place Order"                      → POST /v1/orders     (Idempotency-Key!)
+Watch the live map                     → WS   /v1/orders/{id}/track
+Rate the order                         → POST /v1/orders/{id}/review
+```
+
+#### Q: What does `(Idempotency-Key)` on `POST /v1/orders` mean?
+
+The app sends a special header — a unique ID for *this* checkout attempt. If the request is retried (flaky network, double tap), the server sees the same key and returns the **already-created order** instead of making a second one. It's the API-level partner of the `UNIQUE(idempotency_key)` DB constraint from §B1. Example of what the client sends:
+
+```
+POST /v1/orders
+Idempotency-Key: 7f3c-order-attempt-abc123     ← same on every retry of THIS checkout
+Body: { restaurantId: 88, addressId: 5, items: [...], couponCode: "SAVE50" }
+```
+
+#### Q: Why is `/track` a "WS" (WebSocket) but the others are GET/POST?
+
+`GET /v1/orders/{id}` is a one-time "give me the current state" (a snapshot). But live tracking needs **continuous** updates as the bike moves — you don't want to hammer `GET` every second. So `WS /v1/orders/{id}/track` opens a WebSocket (the always-open phone line from §A6) and the server *pushes* new positions/status as they happen.
+
+#### Q: Why do the same actions appear under different apps (e.g. `/orders/{id}/picked-up`)?
+
+Because different actors trigger different parts of one order's life. The **restaurant** app presses `accept` / `ready`; the **rider** app presses `picked-up` / `delivered`; the **customer** app presses `place` / `cancel` / `review`. They're all editing the *same* order, but each is only allowed to make its legal moves — enforced by the order **state machine** (§B5).
 
 ---
 
@@ -463,6 +686,104 @@ interface OrderRepository { Optional<Order> findByKey(String k); Order insert(Or
 interface NotificationPort { void notify(long userId, String type, Map<String,Object> data); }
 ```
 
+### Plain-English: turning the app into Java objects
+
+Low-level design = deciding **which classes exist and how they collaborate**. Think of it as casting the roles for the restaurant play: there's a `Restaurant`, a `MenuItem`, a `Cart`, an `Order`, a `DeliveryPartner`, and a manager (`OrderOrchestrator`) who coordinates everyone.
+
+Here's the same domain as small, self-contained beginner classes (illustrative — the doc's versions are terser):
+
+```java
+// A dish on the menu
+class MenuItem {
+    long   itemId;
+    String name;          // "Margherita Pizza"
+    int    priceInPaise;  // 20000 = ₹200.00  (integer money, see B1)
+    boolean available;    // false = "sold out" toggle
+}
+
+// A restaurant
+class Restaurant {
+    long   id;
+    String name;
+    double lat, lng;      // where it is (for "near me")
+    boolean open;
+    int    prepTimeAvgMins;   // used to estimate ETA
+    List<MenuItem> menu;
+}
+
+// One line in your cart: 2× Margherita with extra cheese
+class CartLine {
+    MenuItem item;
+    int      qty;
+    List<String> customizations;   // ["Extra cheese", "Large"]
+
+    int lineTotal() {
+        return item.priceInPaise * qty;   // (add-on deltas omitted for clarity)
+    }
+}
+
+// Your cart before checkout
+class Cart {
+    long userId;
+    Long restaurantId;               // a cart belongs to ONE restaurant
+    List<CartLine> lines = new ArrayList<>();
+
+    void add(MenuItem item, int qty, List<String> custom) {
+        lines.add(new CartLine(item, qty, custom));
+    }
+
+    int subtotal() {
+        return lines.stream().mapToInt(CartLine::lineTotal).sum();
+    }
+}
+```
+
+The **orchestrator** is the manager who runs the checkout step-by-step — notice it doesn't *do* payment or dispatch itself, it *delegates* to specialists:
+
+```java
+class OrderOrchestrator {
+
+    Order placeOrder(PlaceOrderCmd cmd) {
+        // 1. Idempotency: already placed this exact attempt? return it, don't redo.
+        var existing = repo.findByKey(cmd.idempotencyKey);
+        if (existing.isPresent()) return existing.get();
+
+        // 2. Validate (restaurant open? items in stock? deliverable? price still right?)
+        validate(cmd);
+
+        // 3. Compute the price (base + surge + tax − discount)
+        Money total = pricing.price(cmd);
+
+        // 4. Save the order as "awaiting payment"
+        Order o = repo.insert(buildOrder(cmd, total, PENDING_PAYMENT));
+
+        // 5. Charge the card via the Payment specialist
+        PaymentResult r = payment.charge(o);
+
+        // 6. Success → announce it; failure → mark failed
+        if (r.success) {
+            o.transitionTo(PLACED, SYSTEM);      // legal move, guarded by state machine
+            queue.publish("ORDER_PLACED", o);    // announce; dispatch/notify react
+        } else {
+            o.transitionTo(PAYMENT_FAILED, SYSTEM);
+        }
+        return repo.save(o);
+    }
+}
+```
+
+#### Q: What are all these `...Port` interfaces (`PaymentPort`, `GeoIndexPort`)?
+
+A **Port** is a **socket in the wall**: the domain code says "I need to charge a card" by calling `PaymentPort.charge(...)`, without knowing *who's plugged in*. Razorpay or Stripe is the **adapter** (the plug). Swapping payment providers = swapping the plug; the room's wiring (business logic) never changes. This is the **Ports & Adapters (Hexagonal)** style — it keeps the core logic clean and testable (in tests you plug in a fake payment that always "succeeds").
+
+#### Q: What does `order.transitionTo(PLACED, SYSTEM)` do — why not just `order.status = PLACED`?
+
+Directly setting `status` would let buggy code make illegal jumps (e.g. `DELIVERED` before the food was even picked up). `transitionTo` is **guarded**: it checks the **state machine** (§B5) and throws if the move is illegal. It also records *who* did it (`SYSTEM`, `RIDER`, etc.) into `order_status_history`. It's the difference between "quietly overwrite a field" and "make a legal, audited move."
+
+#### Q: What is a "Saga" and why is the orchestrator called one?
+
+A single order touches multiple services (Payment, Dispatch, Restaurant) that each have their *own* database — so you can't wrap it all in one classic transaction. A **Saga** is a sequence of local steps where, if a later step fails, you run **compensating actions** to undo earlier ones. Example: payment succeeded but the restaurant rejects the order → the saga issues a **refund** to compensate. The `OrderOrchestrator` is the coordinator running that sequence.
+
 ---
 
 ## B4. Design Patterns Used / Applicable
@@ -487,6 +808,81 @@ interface NotificationPort { void notify(long userId, String type, Map<String,Ob
 | **Singleton / Object Pool** | DB/HTTP connection pools, Kafka producer | Reuse expensive resources |
 | **Publish-Subscribe + WebSocket (Fan-out)** | Live tracking push | One rider location → all subscribers of that order |
 | **CQRS (lite)** | Write path (orders RDBMS) vs read path (discovery on ES) | Separate optimized read model from the write model |
+
+### Plain-English: design patterns are reusable "recipes"
+
+A **design pattern** is a named, proven solution to a common problem — like a cooking technique ("sauté", "braise") that any chef recognizes. You don't invent them per project; you spot the situation and apply the known recipe. Here are the key ones with a food-delivery analogy and tiny code.
+
+**State** — an order can only make legal moves:
+
+```java
+// You can't deliver food that was never picked up. The State pattern enforces this.
+enum OrderStatus { PENDING_PAYMENT, PLACED, ACCEPTED, PREPARING,
+                   OUT_FOR_DELIVERY, DELIVERED, CANCELLED }
+// transitionTo() checks a table of "from → allowed next states" and rejects illegal jumps.
+```
+
+**Strategy** — swap the dispatch algorithm without touching callers:
+
+```java
+interface DispatchStrategy { Optional<Long> pickRider(Order o, List<DeliveryPartner> nearby); }
+
+class NearestIdleStrategy   implements DispatchStrategy { /* just grab the closest free driver */ }
+class BatchOptimizeStrategy implements DispatchStrategy { /* one driver carries 2 nearby orders */ }
+
+// Dispatch service holds ONE field; swap the recipe (even A/B test) without changing dispatch code:
+dispatch.strategy = new NearestIdleStrategy();
+```
+
+Analogy: "how do we assign a driver?" is like choosing a route-planning technique — you can switch from "closest driver wins" to "batch two orders on one trip" by swapping the strategy object.
+
+**Chain of Responsibility** — the validation pipeline before an order is accepted:
+
+```java
+// Each check is a link. First failure short-circuits the chain (rest is skipped).
+List<OrderCheck> pipeline = List.of(
+    new RestaurantOpenCheck(),      // is the restaurant open right now?
+    new ItemsAvailableCheck(),      // nothing sold out?
+    new ServiceableAreaCheck(),     // do they deliver to your address?
+    new PriceUnchangedCheck(),      // cart price still matches the menu?
+    new FraudCheck()                // does this look legit?
+);
+for (OrderCheck check : pipeline) check.validate(cmd);   // throws on first failure
+```
+
+Analogy: a series of quality-control gates on an assembly line; the item stops at the first gate it fails.
+
+**Decorator** — building the final price by stacking modifiers:
+
+```java
+// Start with the base, wrap it with each modifier. Each layer adds one thing.
+Price p = new BasePrice(subtotal);
+p = new SurgeFee(p);      // + busy-hour surge
+p = new Tax(p);           // + GST
+p = new Discount(p, coupon);  // − coupon
+p = new PackagingFee(p);  // + packaging
+int total = p.value();    // base → +surge → +tax → −discount → +packaging
+```
+
+**Observer / Pub-Sub** — one event, many independent reactions (this IS Kafka):
+
+```java
+kafka.publish("ORDER_PLACED", order);   // publisher doesn't know or care who listens
+// Subscribers each react on their own: Dispatch (find a driver),
+// Notification (text the customer), Analytics (record a sale).
+```
+
+#### Q: There are ~15 patterns listed — do I need all of them in an interview?
+
+No. Know the **headliners for this problem** cold: **State** (order lifecycle), **Strategy** (dispatch/pricing), **Saga + Outbox** (reliable multi-service orders), **Observer/Pub-Sub** (Kafka), and **Circuit Breaker** (protecting payment/maps calls). The rest are good to *recognize*. Patterns are a vocabulary — the point is to say "I'd use the State pattern here" and explain *why*, not to cram every one in.
+
+#### Q: What's the difference between Saga and Outbox — they both sound like "reliable orders"?
+
+They solve different halves. **Saga** = "how do I coordinate a multi-step process across services and *undo* if a step fails" (payment → accept → dispatch, with refund-on-failure). **Outbox** = "how do I guarantee an event I promised to send actually gets sent even if I crash right after saving to the DB." Saga is about *coordination + compensation*; Outbox is about *not losing the announcement*. They're often used together.
+
+#### Q: What is CQRS "lite" here?
+
+**CQRS = Command Query Responsibility Segregation** — use *different* models for writing vs reading. Here: orders are **written** to the strict SQL database (accuracy), but restaurant **discovery is read** from Elasticsearch (fast search). The write model and the read model are separate and optimized differently, kept in sync via CDC (§A5). "Lite" because we're not going full event-sourced CQRS, just splitting the read path onto a search-optimized store.
 
 ---
 
@@ -515,6 +911,68 @@ INITIATED ─→ SUCCESS ─(reject/cancel)→ REFUNDED
 OFFERED ─accept→ ACCEPTED
    │ reject / timeout → REJECTED/TIMEOUT → (offer next rider)
 ```
+
+### Plain-English: an order's life is a board game with legal moves
+
+A **state machine** is the rulebook for what an order (or payment, or driver offer) can do next. Like a board game: from a given square you can only move to certain other squares. You can't teleport from "PLACED" straight to "DELIVERED" — you must pass through "ACCEPTED → PREPARING → OUT_FOR_DELIVERY" first.
+
+**Follow one order through its states:**
+
+```
+PENDING_PAYMENT   you tapped Order, we're charging your card
+   │ payment ok
+PLACED            paid; waiting for the restaurant to see it
+   │ restaurant taps Accept
+ACCEPTED          restaurant agreed to cook it
+   │
+PREPARING         food is being cooked (a driver is matched in parallel)
+   │ driver picks it up
+OUT_FOR_DELIVERY  on the bike, headed to you
+   │ driver taps Delivered
+DELIVERED         done — you can now rate it
+```
+
+...and the "unhappy" exits: payment fails → `PAYMENT_FAILED`; restaurant rejects or you cancel → `CANCELLED` (which triggers a refund if you'd paid).
+
+Here's the rulebook as code — a map of "from state → allowed next states":
+
+```java
+class OrderStateMachine {
+
+    // The legal moves. Anything not listed here is FORBIDDEN.
+    static final Map<OrderStatus, Set<OrderStatus>> ALLOWED = Map.of(
+        PENDING_PAYMENT, Set.of(PLACED, PAYMENT_FAILED),
+        PLACED,          Set.of(ACCEPTED, REJECTED, CANCELLED),
+        ACCEPTED,        Set.of(PREPARING, CANCELLED),
+        PREPARING,       Set.of(RIDER_ASSIGNED, CANCELLED),
+        RIDER_ASSIGNED,  Set.of(OUT_FOR_DELIVERY, CANCELLED),
+        OUT_FOR_DELIVERY,Set.of(DELIVERED)
+        // DELIVERED / CANCELLED / PAYMENT_FAILED are terminal — no moves out
+    );
+
+    void transitionTo(Order o, OrderStatus next, Actor by) {
+        Set<OrderStatus> legal = ALLOWED.getOrDefault(o.status, Set.of());
+        if (!legal.contains(next)) {
+            throw new IllegalStateException(
+                "Illegal move: " + o.status + " → " + next);   // e.g. PLACED → DELIVERED
+        }
+        o.status = next;
+        history.record(o.orderId, next, by);   // audit: who moved it and when
+    }
+}
+```
+
+#### Q: Why bother with a state machine — can't I just check `if` conditions everywhere?
+
+Because order logic is touched by *many* places (customer app, restaurant app, rider app, background jobs). If each writes its own ad-hoc `if`, someone will eventually allow an illegal move (mark an unpaid order as delivered) and corrupt data + money. Centralizing the rules in one guarded `transitionTo` means **every** path obeys the same rulebook, and illegal moves are impossible by construction. It also gives you a free audit trail (`order_status_history`).
+
+#### Q: The diagram says the rider is "assigned in parallel" — how does that fit one linear machine?
+
+Cooking and driver-matching happen *at the same time* (the restaurant preps while Dispatch finds a driver), but the *order's* status still advances through a single line. The parallelism is: the **Dispatch/Assignment** state machine (`OFFERED → ACCEPTED`) runs on its own for the driver side, while the order sits in `PREPARING`. Once both "food ready" and "driver has it" are true, the order moves to `OUT_FOR_DELIVERY`. Two small machines, loosely coordinated by events.
+
+#### Q: What are "terminal" states?
+
+States with no moves out — the game is over. `DELIVERED`, `CANCELLED`, and `PAYMENT_FAILED` are terminal. A delivered order can't become "out for delivery" again. Recognizing terminal states prevents bugs like re-refunding an already-cancelled order.
 
 ---
 
@@ -569,6 +1027,107 @@ cancel(order):
     release rider lock if held; notify parties
 ```
 
+### Plain-English: the four core "how-to" recipes
+
+These are the actual step-by-step logic for the hard parts. Let's translate each.
+
+#### Recipe 1 — Placing an order (the careful checkout)
+
+The order matters: **check first, charge second, announce third.** We validate everything *before* touching money, save the order + outbox event in one transaction, then charge, then announce.
+
+```java
+Order placeOrder(PlaceOrderCmd cmd) {
+    // Duplicate tap / retry? Return the order we already made. (idempotency)
+    if (repo.exists(cmd.idempotencyKey)) return repo.findByKey(cmd.idempotencyKey);
+
+    validateChain(cmd);              // open? in stock? deliverable? price still valid?
+    Money total = price(cmd);        // base + surge + tax − discount
+
+    // ONE transaction: the order and the "to-be-announced" event save together or not at all
+    beginTx();
+      Order o = repo.insert(order(cmd, total, PENDING_PAYMENT));
+      outbox.insert("ORDER_PLACED", o);   // Outbox: guarantees the event survives a crash
+    commitTx();
+
+    PaymentResult pay = payment.charge(o);   // circuit-breaker protected external call
+    if (pay.success) o.transitionTo(PLACED, SYSTEM);
+    else             o.transitionTo(PAYMENT_FAILED, SYSTEM);
+    return repo.save(o);
+}
+```
+
+#### Recipe 2 — Dispatch (finding a driver) — the interesting one
+
+"Find a nearby free driver, offer the order, and if they say no or don't answer, offer the next one" — all while making sure **two orders never grab the same driver**.
+
+```java
+void dispatch(Order order) {
+    // Ask the geo radar for free drivers within 3 km of the restaurant
+    List<DeliveryPartner> candidates =
+        geo.nearbyRiders(order.restaurantLat, order.restaurantLng, 3000)
+           .stream().filter(r -> r.status == ONLINE).toList();
+
+    // Rank them: closest, heading the right way, not overloaded, ready in time
+    List<DeliveryPartner> ranked = strategy.rank(candidates, order);
+
+    for (DeliveryPartner rider : ranked) {
+        // Atomically "claim" this rider so no other order can grab them (Redis SET NX)
+        if (claimRider(rider.id, order.orderId)) {
+            offer(rider, order);                 // ping the rider's app
+            if (awaitAccept(rider, Duration.ofSeconds(20))) {
+                order.transitionTo(RIDER_ASSIGNED, SYSTEM);
+                return;                          // done!
+            }
+            releaseClaim(rider.id);              // declined/timed out → free them, try next
+        }
+    }
+    // nobody accepted → hold in queue, widen radius, maybe add surge (see B10)
+}
+```
+
+Analogy: a dispatcher radios the nearest free driver — "got a pickup, take it?" — if they don't answer in 20 seconds, radio the next nearest. The **claim/lock** is like putting a sticky "RESERVED" note on that driver so two dispatchers can't both hand them a job.
+
+#### Recipe 3 — Location ingest (the GPS firehose)
+
+Every driver's phone pings location constantly. Keep it **only in fast memory**, never the orders DB.
+
+```java
+void onPing(long riderId, double lat, double lng) {
+    geo.geoAdd("riders:online", lng, lat, "rider:" + riderId);  // update the radar
+    redis.setEx("loc:rider:" + riderId, json(lat, lng), 30);    // latest value, 30s TTL
+    kafka.publishSampled("rider.location", riderId, lat, lng);  // sampled → tracking/analytics
+    // NEVER write to the orders database (would melt under the write volume)
+}
+```
+
+#### Recipe 4 — Cancellation + refund (undoing safely)
+
+If you cancel, we reverse the earlier steps — the "compensation" half of the Saga.
+
+```java
+void cancel(Order o, Actor by) {
+    if (o.status == DELIVERED || o.status == OUT_FOR_DELIVERY)
+        throw new CannotCancelException("too late / partial only");
+
+    o.transitionTo(CANCELLED, by);
+    if (o.paymentStatus == PAID) refund.initiate(o);   // give the money back (compensation)
+    if (o.riderId != null) releaseClaim(o.riderId);    // free the driver
+    notify(o.customerId, "ORDER_CANCELLED");
+}
+```
+
+#### Q: In dispatch, why do we "claim/lock" the rider *before* offering, not after they accept?
+
+Because two orders can be looking at the *same* nearby driver at the exact same moment. If we waited until acceptance, both might offer to that driver and both might think they won → the driver gets double-booked. Claiming *first* (an atomic Redis `SET NX` = "set only if not already set") means exactly one order wins the driver; the other immediately moves on to the next candidate. It's a reservation before the offer. (See §B8.)
+
+#### Q: What does "sampled" mean for publishing location to Kafka?
+
+The driver pings maybe 5×/second, but tracking and analytics don't need *every* dot. **Sampling** = only forward, say, 1 in every few pings (or one per second). Redis always has the freshest position for the live map; Kafka gets a lighter, thinned stream so we don't flood analytics with redundant points.
+
+#### Q: Why can't you cancel once it's `OUT_FOR_DELIVERY`?
+
+The food is cooked and already on the bike — the cost is already incurred. Allowing a free cancel then would mean wasted food and an unpaid driver trip. So late cancels are refused or only **partially** refunded. This is a business rule encoded right into the algorithm and the state machine.
+
 ---
 
 ## B7. Sequences
@@ -596,6 +1155,33 @@ Customer  OrderSvc  Payment  Kafka  Restaurant  Dispatch  Rider  Customer(map)
 charge → FAILED → order=PAYMENT_FAILED → notify customer → (no dispatch)
 ```
 
+### Plain-English: reading the "who-talks-to-whom" diagram
+
+A **sequence diagram** shows the *timeline* of one scenario — who sends what message to whom, top to bottom. Each vertical line is a service; each arrow is a message. Read it like a comic strip of a single order.
+
+**The happy path, in plain words:**
+
+```
+1. You tap Place Order         → Order service creates a PENDING order
+2. Order asks Payment to charge → card charged OK
+3. Order announces ORDER_PLACED → (via Kafka) the Restaurant is notified
+4. Restaurant taps Accept       → order moves to ACCEPTED/PREPARING
+5. Order announces ORDER_READY  → Dispatch starts matching a driver
+6. Dispatch offers to a driver  → driver taps Accept → RIDER_ASSIGNED
+7. Driver picks up + rides      → GPS flows to your app → you watch the live map
+8. Driver taps Delivered        → order DELIVERED → you can rate it
+```
+
+Notice the two styles from §A4 in action: steps 1–2 are **sync** (Order *waits* for Payment), while steps 3, 5, 6 are **async** announcements over Kafka (fire-and-move-on).
+
+#### Q: Why does the failure path (payment fails) just stop?
+
+Because nothing downstream should happen without money. If the charge fails, the order becomes `PAYMENT_FAILED`, the customer is notified, and **no** ORDER_PLACED event is announced — so Dispatch and the Restaurant never even hear about it. There's nothing to undo because we deliberately charged *before* announcing. Contrast with a cancel *after* payment succeeded, which needs a refund (compensation).
+
+#### Q: The diagram shows dispatch happening "in parallel" with cooking — is that a race condition?
+
+It's *concurrency*, not a bug. The restaurant cooking and Dispatch finding a driver genuinely happen at the same time to save minutes. They're coordinated by **events**, not by one waiting on the other: the order only advances to `OUT_FOR_DELIVERY` once *both* "food ready" and "driver has it" are true. The dangerous races (two orders grabbing one driver) are handled separately by atomic locks — see §B8.
+
 ---
 
 ## B8. Concurrency & Correctness
@@ -611,6 +1197,58 @@ charge → FAILED → order=PAYMENT_FAILED → notify customer → (no dispatch)
 | Location firehose | Redis only; never RDBMS |
 | Coupon over-use | `coupon_redemptions` unique + atomic decrement of usage limit |
 
+### Plain-English: what goes wrong when many things happen at once
+
+**Concurrency** = lots of actions happening simultaneously. Bugs appear when two actions touch the same thing at the same moment. Each row above is a "two people grab the last cookie" problem and its fix.
+
+**The two orders / one driver race (the classic):**
+
+```java
+// WITHOUT a lock — both orders think they got the driver:
+if (rider.isFree()) { assign(rider, order); }   // order A checks: free! 
+                                                 // order B checks: also free! → DOUBLE-BOOKED
+
+// WITH an atomic Redis lock — exactly one wins:
+boolean gotIt = redis.set("rider:" + riderId, orderId, "NX", "EX", 30);
+//   NX = "set only if the key does NOT already exist"  → only the FIRST caller succeeds
+//   EX 30 = auto-expire in 30s so a crashed order doesn't lock the driver forever
+if (gotIt) offer(rider, order);   // order A wins
+else       tryNextRider();        // order B is told "taken", moves on
+```
+
+`SET NX` is atomic — the database guarantees only one caller can create the key. It's the digital version of "first hand on the cookie wins, and everyone can see whose hand got there first."
+
+**The duplicate-tap race (idempotency):**
+
+```java
+// UNIQUE(idempotency_key) makes the DB itself reject the second insert.
+try {
+    repo.insert(order);                 // first tap: succeeds
+} catch (DuplicateKeyException e) {
+    return repo.findByKey(key);         // second tap: DB refused → return the existing order
+}
+```
+
+**Order state races (two actors act at once)** use *optimistic* locking:
+
+```sql
+-- Only update if the status is STILL what we expect. If someone changed it first,
+-- 0 rows update → we know we lost the race and retry/reject.
+UPDATE orders SET status = 'ACCEPTED'
+ WHERE order_id = 123 AND status = 'PLACED';   -- guard clause
+```
+
+#### Q: Optimistic vs pessimistic locking — what's the difference?
+
+- **Pessimistic** = "assume conflict, lock first." You grab an exclusive lock before touching the row; others wait. Safe but slow, and can cause traffic jams. (The Redis `SET NX` driver claim is lock-style.)
+- **Optimistic** = "assume no conflict, verify at write time." You don't lock; you just add `WHERE status = <what I read>` to your update. If someone changed it meanwhile, your update affects 0 rows and you retry. Fast when conflicts are rare — which they usually are for a single order.
+
+Rule of thumb: use pessimistic/atomic locks for genuinely contended resources (a driver everyone wants); use optimistic checks for things rarely touched at the same instant (one specific order's status).
+
+#### Q: What's a "dual-write" problem and how does Outbox fix it?
+
+A **dual write** is writing to two systems that can't share one transaction — e.g. save the order to the DB *and* publish to Kafka. If the app crashes between them, they disagree (order exists, event lost, or vice versa). The **Outbox** avoids this: you only ever write to *one* system (the DB) in the transaction — the event goes into the `outbox` table in that *same* transaction. A separate relay later reads the outbox and publishes to Kafka, retrying until it succeeds. One atomic write, zero lost events.
+
 ---
 
 ## B9. Caching Design
@@ -623,6 +1261,47 @@ charge → FAILED → order=PAYMENT_FAILED → notify customer → (no dispatch)
 | `riders:online` (GEO set) | rider positions | live |
 | `cart:{userId}` | cart | session |
 | `ratelimit:{userId}` | counters | window |
+
+### Plain-English: keep a fast copy of stuff you read a lot
+
+A **cache** is a small, fast copy of data you'd otherwise fetch the slow way every time. Analogy: a waiter memorizes today's specials instead of walking to the kitchen to ask for every table. If lots of people ask the same thing, answer from memory.
+
+Each cache entry has a **TTL (time to live)** — how long before the copy is thrown away and refetched. Short TTL = fresher but more work; long TTL = faster but can be stale.
+
+```java
+String getMenu(long restaurantId) {
+    String key = "menu:" + restaurantId;
+    String cached = redis.get(key);
+    if (cached != null) return cached;          // fast path: served from memory
+
+    String menu = db.loadMenu(restaurantId);    // slow path: hit the SQL DB
+    redis.setEx(key, menu, Duration.ofMinutes(10));  // remember it for 10 min
+    return menu;
+}
+
+// When the restaurant edits its menu, don't wait for TTL — invalidate immediately:
+void onMenuEdit(long restaurantId) {
+    db.saveMenu(...);
+    redis.del("menu:" + restaurantId);          // next read repopulates fresh
+}
+```
+
+#### Q: How do I pick the TTL for each thing?
+
+Match it to how fast the data changes and how bad staleness is:
+
+- **Discovery list (30–60s)** — restaurants opening/closing changes minute-to-minute; a slightly stale list is fine.
+- **Menu (minutes, + invalidate on edit)** — changes rarely, so cache longer, but *actively clear* it the moment the restaurant edits, so a sold-out item disappears right away.
+- **Rider location (30s)** — very fresh, but a short TTL also means "if pings stop, the stale dot auto-vanishes."
+- **Cart (session)** — lives as long as you're shopping.
+
+#### Q: What's the danger of caching, and how do we avoid serving wrong data?
+
+The classic problem is **stale reads** — the cache says an item is available but it just sold out. Two defenses: (1) **short TTLs** so wrong data self-corrects quickly, and (2) **invalidation** — proactively delete the cache entry the instant the source changes (as in `onMenuEdit` above). Critically, we **never cache money/order state**; those are always read strongly-consistent from the SQL DB. Caching is for read-heavy, tolerant-of-slightly-stale data (menus, discovery), not for correctness-critical data.
+
+#### Q: What is `ratelimit:{userId}` doing in a cache?
+
+**Rate limiting** = capping how often someone can do something (e.g. max 5 OTP requests per minute) to stop abuse. Redis counts the requests in a short window and blocks once you exceed the limit. It lives in Redis because it must be checked on *every* request and needs to be blazing fast.
 
 ---
 
@@ -638,6 +1317,38 @@ charge → FAILED → order=PAYMENT_FAILED → notify customer → (no dispatch)
 | Item sold out at checkout | Validation chain rejects; suggest alternatives |
 | Redis/location down | Tracking degrades to last-known + ETA; orders unaffected |
 | Dispatch double-assign | Atomic rider lock |
+
+### Plain-English: planning for when things go wrong
+
+Real systems spend most of their code on the *unhappy* paths. Good design means every failure has a defined, graceful response — the app should degrade, not crash. Walk through the common ones:
+
+- **No riders available** → don't fail the order; hold it in the dispatch queue, widen the search radius, show a longer ETA, and maybe **surge** (temporarily pay drivers more to attract them). The food still gets delivered, just slower.
+- **Restaurant doesn't accept in time** → auto-cancel and refund; alert ops. Don't leave you waiting forever on a restaurant that's ignoring the tablet.
+- **Rider cancels mid-delivery** → re-dispatch to a new driver, recompute the ETA, notify you. The order continues.
+- **Payment succeeded but order-creation crashed** → the scariest one (you paid but have no order). Caught by **Outbox/reconciliation**: a background job reconciles payments against orders and auto-refunds anything unrecoverable. You never lose money silently.
+- **Item sold out at checkout** → the validation chain (§B4) rejects the order and suggests alternatives, instead of accepting an order the kitchen can't fulfill.
+- **Redis/location down** → tracking **degrades gracefully** to "last known location + ETA" while orders keep working. A tracking outage must never block ordering.
+
+Example of a graceful degradation in code — tracking falling back when Redis is down:
+
+```java
+Location trackDriver(long orderId) {
+    try {
+        return redis.getLatest("loc:rider:" + riderOf(orderId));   // normal: live dot
+    } catch (RedisDownException e) {
+        // Don't fail the whole screen — show the last known point + an ETA estimate
+        return lastKnownLocation(orderId).withNote("Live tracking temporarily unavailable");
+    }
+}
+```
+
+#### Q: What does "degrade gracefully" actually mean?
+
+It means when a *non-critical* part breaks, the app loses that feature but keeps its **core** function working. If live tracking dies, you can still place and receive orders — you just don't see the moving dot. The opposite (a "hard failure") would be the whole app going down because one minor service hiccuped. Rule: isolate failures so a small problem stays small.
+
+#### Q: "Payment ok but order crashed" — how does reconciliation actually recover it?
+
+Because payment and order live in different services, a crash can leave money charged with no order attached. A periodic **reconciliation** job compares the Payment ledger against the Orders table: any successful payment with no matching completed order is either **completed** (if we can safely finish it) or **auto-refunded**. This is the safety net that makes "charge first, then create" acceptable — nothing falls through the cracks permanently. It's the same spirit as the batch reconciliation used for billing in stream systems: trust the durable ledger, fix drift afterward.
 
 ---
 

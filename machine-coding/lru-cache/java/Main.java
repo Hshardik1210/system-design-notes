@@ -13,39 +13,54 @@ import java.util.*;
  */
 public class Main {
 
-    // Doubly linked list node.
+    // One element of the doubly linked list. It stores the cached key/value and
+    // pointers to the previous and next node, so we can walk the list both ways.
     static class Node {
         int key, value;
         Node prev, next;
         Node(int k, int v) { key = k; value = v; }
     }
 
+    // The cache itself: it wires the HashMap and the doubly linked list together
+    // so both get() and put() run in O(1) time.
     static class LRUCache {
         private final int capacity;
+        // Maps a key straight to its Node, so lookups are O(1) (no list scanning).
         private final Map<Integer, Node> map = new HashMap<>();
         // Sentinels: head.next = MRU, tail.prev = LRU. Avoids null checks.
+        // "Dummy" nodes that always sit at the two ends of the list. They hold no
+        // real data; they just guarantee every real node has a prev and a next,
+        // so the relinking code never has to special-case the ends.
         private final Node head = new Node(0, 0);
         private final Node tail = new Node(0, 0);
 
         LRUCache(int capacity) {
             this.capacity = capacity;
+            // Start with an empty list: head and tail point at each other.
             head.next = tail;
             tail.prev = head;
         }
 
         // Unlink a node from the list.
+        // Detaches a node by making its neighbours point to each other,
+        // skipping over the node. The node's own pointers are left as-is (that is
+        // fine, because callers either drop it or immediately re-insert it).
         private void remove(Node n) {
-            n.prev.next = n.next;
-            n.next.prev = n.prev;
+            n.prev.next = n.next;   // node before n now points past n
+            n.next.prev = n.prev;   // node after n now points back past n
         }
         // Insert a node right after head (mark as most-recently-used).
+        // Splices n between head and the current first real node, so n becomes
+        // the new front (most-recently-used).
         private void addFront(Node n) {
-            n.next = head.next;
-            n.prev = head;
-            head.next.prev = n;
-            head.next = n;
+            n.next = head.next;     // n points to the old first node
+            n.prev = head;          // n points back to head
+            head.next.prev = n;     // old first node points back to n
+            head.next = n;          // head now points to n as the new front
         }
 
+        // Look up a key. Returns its value, or -1 if not present. On a hit we also
+        // mark the node as most-recently-used by moving it to the front.
         int get(int key) {
             Node n = map.get(key);
             if (n == null) return -1;      // miss
@@ -53,6 +68,8 @@ public class Main {
             return n.value;
         }
 
+        // Insert or update a key. If the cache is full and the key is new, we first
+        // evict the least-recently-used entry (the node just before tail).
         void put(int key, int value) {
             Node existing = map.get(key);
             if (existing != null) {        // update + promote
@@ -63,10 +80,10 @@ public class Main {
             if (map.size() == capacity) {  // evict LRU (node before tail)
                 Node lru = tail.prev;
                 remove(lru);
-                map.remove(lru.key);
+                map.remove(lru.key);       // keep map and list in sync: drop it from both
             }
             Node n = new Node(key, value);
-            map.put(key, n);
+            map.put(key, n);               // add to map and list together
             addFront(n);
         }
 
