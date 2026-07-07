@@ -75,11 +75,24 @@ End-to-end designs that apply the concepts above.
 
 ---
 
+## 💻 Machine Coding / LLD (Java + C++)
+
+**32 runnable, interview-ready implementations** of classic machine-coding problems across 3 tiers — each with a `java/` and `cpp/` folder plus a README (design + patterns). Browse the full **[section index](machine-coding/)**.
+
+- **Tier 1 (staples):** Parking Lot, Elevator, Vending Machine, Splitwise, Snake & Ladder, Tic-Tac-Toe, LRU + LFU Cache, Rate Limiter, Logging Framework, BookMyShow, URL Shortener
+- **Tier 2 (common):** Notification System, KV Store (transactions), Cab Booking, Food Delivery, Hotel Management, ATM, Meeting Scheduler, Coffee Machine, Library, Stack Overflow
+- **Tier 3 (advanced):** Task Scheduler, Text Editor (undo/redo), Card Game, Digital Wallet, File System, Pub-Sub, Online Auction, Airline Booking, CricBuzz, Amazon Locker
+
+Every implementation compiles and runs standalone (`javac Main.java && java Main` / `g++ -std=c++17 main.cpp && ./main`).
+
+---
+
 ## 🗂️ Structure
 
 ```
 .
 ├── README.md              ← this index
 ├── concepts/              ← reusable building blocks
-└── system-design/         ← full end-to-end designs
+├── system-design/         ← full end-to-end designs
+└── machine-coding/        ← runnable LLD (Java + C++)
 ```
