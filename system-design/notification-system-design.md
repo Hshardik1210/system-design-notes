@@ -30,10 +30,13 @@
 - [22. DB Bottlenecks & Mitigations](#22-db-bottlenecks--mitigations)
 - [23. Failure Scenarios & Mitigations](#23-failure-scenarios--mitigations)
 - [24. Observability](#24-observability)
-- [25. Final Architecture](#25-final-architecture)
-- [26. How to Drive the Interview](#26-how-to-drive-the-interview)
-- [27. Interview Cheat Sheet](#27-interview-cheat-sheet)
-- [28. Final Takeaways](#28-final-takeaways)
+- [25. Security, PII & Compliance](#25-security-pii--compliance)
+- [26. Read Models, Counters & Digests](#26-read-models-counters--digests)
+- [27. Final Architecture](#27-final-architecture)
+- [28. How to Drive the Interview](#28-how-to-drive-the-interview)
+- [29. Interview Cheat Sheet](#29-interview-cheat-sheet)
+- [30. Design Patterns (that can be used)](#30-design-patterns-that-can-be-used)
+- [31. Final Takeaways](#31-final-takeaways)
 
 ---
 
@@ -277,6 +280,8 @@ PUT  /v1/users/{userId}/notification-preferences
 
 > Single responsibility: **orchestrate**, not **deliver**.
 
+> ⚠️ **Dual-write hazard:** "insert DB row" + "publish to Kafka" are **two separate systems**. If the process crashes between them, the row is stuck in `PENDING` and never delivered. Fix with an **outbox** (write the row + an outbox record in one transaction; a relay publishes to Kafka) or a **reconciliation sweeper** — see [§23](#23-failure-scenarios--mitigations).
+
 ### 6.2 Message Queue
 
 Topics (channel × priority example):
@@ -366,8 +371,9 @@ Step 5: Create notification record
 
 Step 6: Enqueue to Kafka
 ────────────────────────
-  → notification-push-normal   { notif_1, userId, title, body, ... }
-  → notification-email-normal  { notif_1, userId, subject, html, ... }
+  → notification-push-normal   { notificationId: 1, channel: "PUSH" }
+  → notification-email-normal  { notificationId: 1, channel: "EMAIL" }
+  (minimal payload — worker loads title/body from DB; see §13)
 
 Step 7: Workers deliver
 ───────────────────────
@@ -379,8 +385,10 @@ Step 8: Update status
   PENDING → SENT (with sent_at timestamp)
 
   On failure:
-  PENDING → FAILED → RETRYING → SENT
-                              └→ DLQ (after max retries)
+  PENDING → RETRYING → SENT
+                    └→ FAILED → DLQ (after max retries)
+
+  Multi-channel: push SENT + email FAILED → PARTIALLY_SENT
 ```
 
 ---
@@ -425,7 +433,7 @@ Example:
 
 ```sql
 CREATE TABLE notifications (
-    notification_id   BIGINT PRIMARY KEY,
+    notification_id   BIGINT PRIMARY KEY,      -- Snowflake / distributed ID, not a single DB sequence (see note)
     notification_key  VARCHAR(255) NOT NULL,  -- idempotency key
     user_id           BIGINT NOT NULL,
     type              VARCHAR(100) NOT NULL,
@@ -433,7 +441,7 @@ CREATE TABLE notifications (
     template_version  INT,                     -- snapshot: which version was rendered
     title             TEXT,                    -- rendered snapshot (audit)
     body              TEXT,
-    status            VARCHAR(50) NOT NULL,  -- PENDING, RETRYING, SENT, FAILED, CANCELLED
+    status            VARCHAR(50) NOT NULL,  -- PENDING, PROCESSING, SENT, PARTIALLY_SENT, FAILED, RETRYING, CANCELLED, RATE_LIMITED
     priority          VARCHAR(20) DEFAULT 'NORMAL',
     next_retry_at     TIMESTAMP,               -- optional; prefer Kafka retry topics at scale
     created_at        TIMESTAMP NOT NULL DEFAULT now(),
@@ -485,6 +493,8 @@ CREATE INDEX idx_attempts_retry
 >
 > Support asks: *"Why didn't SMS arrive?"* → check `notification_attempts`. Retries update the **same** `notification_id` — no re-insert needed.
 
+> **ID generation:** at ~15k inserts/sec a single auto-increment sequence becomes a bottleneck and couples you to one DB (bad for sharding). Use **Snowflake-style IDs** (time-ordered 64-bit: timestamp + worker id + sequence) or UUIDv7 — generated app-side, roughly time-sortable, and shard-friendly.
+
 ### Device tokens (push)
 
 ```sql
@@ -526,8 +536,8 @@ CREATE INDEX idx_scheduled_due
 
 ```sql
 CREATE TABLE notification_templates (
-    template_id     BIGINT PRIMARY KEY,
-    type            VARCHAR(100) NOT NULL,     -- ORDER_CONFIRMED
+    template_id     BIGINT PRIMARY KEY,        -- surrogate key (BIGINT or UUID — see §15)
+    type            VARCHAR(100) NOT NULL,     -- ORDER_CONFIRMED (the "why", stays stable)
     channel         VARCHAR(50) NOT NULL,
     language        VARCHAR(20) DEFAULT 'en',
     version         INT NOT NULL DEFAULT 1,
@@ -537,16 +547,30 @@ CREATE TABLE notification_templates (
     created_at      TIMESTAMP NOT NULL DEFAULT now(),
     UNIQUE (type, channel, language, version)
 );
+
+-- Enforce EXACTLY ONE active template per (type, channel, language).
+-- Postgres partial unique index — prevents "which one is live?" ambiguity.
+CREATE UNIQUE INDEX uniq_active_template
+    ON notification_templates (type, channel, language)
+    WHERE is_active = TRUE;
 ```
 
 When copy changes, **insert a new version** — do not overwrite v1:
 
-| type | channel | version | body_template |
-| --- | --- | --- | --- |
-| ORDER_CONFIRMED | PUSH | 1 | "Order {{orderId}} confirmed" |
-| ORDER_CONFIRMED | PUSH | 2 | "Hi {{name}}, order {{orderId}} confirmed!" |
+| type | channel | version | is_active | body_template |
+| --- | --- | --- | --- | --- |
+| ORDER_CONFIRMED | PUSH | 1 | false | "Order {{orderId}} confirmed" |
+| ORDER_CONFIRMED | PUSH | 2 | true | "Hi {{name}}, order {{orderId}} confirmed!" |
 
-The `notifications` row stores `template_version = 1` plus rendered `title`/`body` — so you always know exactly what was sent, even after v2 is live.
+**Selecting the template to use for a new send** — always pick the active row:
+
+```sql
+SELECT * FROM notification_templates
+WHERE type = 'ORDER_CONFIRMED' AND channel = 'PUSH' AND language = 'en'
+  AND is_active = TRUE;
+```
+
+The `notifications` row stores `template_type` + `template_version` (or a direct `template_id` FK — see [§15](#15-template-system)) **plus** the rendered `title`/`body` snapshot — so you always know exactly what was sent, even after v2 goes live.
 
 ---
 
@@ -578,6 +602,8 @@ CREATE INDEX idx_inapp_user_unread
 4. User taps → `PATCH /notifications/{id}/read`
 
 > In-app is cheap (DB write) and always available — good fallback when push token is invalid.
+
+> The unread badge count should not be a `COUNT(*)` on every open — use a **Redis counter** (see [§26](#26-read-models-counters--digests)).
 
 ---
 
@@ -663,6 +689,8 @@ Delivery fails often — provider down, timeout, invalid token, rate limit.
 | 3 | 5 minutes |
 | 4 | 30 minutes |
 | 5+ | → **DLQ** |
+
+> **Add jitter.** Fixed delays cause a **thundering herd**: when a provider recovers from an outage, every failed message retries at the same instant and knocks it over again. Randomize each delay, e.g. `delay = base ± rand(0, base * 0.5)` (full/decorrelated jitter).
 
 Implementation options:
 
@@ -888,6 +916,69 @@ notifications.body             = ...
 Old notifications still reference `template_version = 1` — support and compliance can always answer *"what exact text was sent?"*
 
 Campaigns can **pin** a specific version so a running campaign doesn't pick up mid-flight copy changes.
+
+### Template identity — `type` vs `template_id`
+
+Keep two ideas separate:
+
+| Concept | Meaning | Changes over time? |
+| --- | --- | --- |
+| `type` (a.k.a. `event_type`) | **Why** the notification is sent — `ORDER_CONFIRMED` | **No** — stable forever |
+| `template_id` | The **exact template row** that produced the text | **Yes** — new copy → new row |
+| `is_active` | Whether this row is used for **new** sends | Flips old → false, new → true |
+
+```
+type       = ORDER_CONFIRMED     (stable — the business event)
+template_id = uuid-1  is_active=false   ← old copy, kept for audit
+template_id = uuid-2  is_active=true    ← current copy for new sends
+```
+
+### Surrogate key: `BIGINT` vs `UUID`
+
+`template_id` can be a `BIGINT` (auto-increment) or a `UUID`. UUID is a clean choice because it is globally unique and lets templates be created/imported across environments without id collisions. Avoid **encoding meaning into the key** (e.g. `ORDER_CONFIRMED_PUSH_002`) — put the meaning in real columns (`type`, `channel`, `version`) instead:
+
+```sql
+CREATE TABLE notification_templates (
+    template_id     UUID PRIMARY KEY,          -- opaque, no meaning encoded
+    type            VARCHAR(100) NOT NULL,     -- ORDER_CONFIRMED
+    channel         VARCHAR(50)  NOT NULL,     -- PUSH / EMAIL / SMS
+    language        VARCHAR(20)  DEFAULT 'en',
+    version         INT NOT NULL DEFAULT 1,
+    title_template  TEXT,
+    body_template   TEXT NOT NULL,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMP NOT NULL DEFAULT now()
+);
+```
+
+### Referencing the template from a notification: version vs id
+
+Two equally valid ways to record *"what was sent"* on the `notifications` row:
+
+| Approach | Store on notification | Trade-off |
+| --- | --- | --- |
+| **Version snapshot** | `template_type` + `template_version` | Human-readable; needs `(type, channel, language, version)` to locate the row |
+| **Direct FK** | `template_id` (UUID) | One-hop lookup to the exact row; add a foreign key if same DB |
+
+```sql
+ALTER TABLE notifications
+    ADD CONSTRAINT fk_notifications_template
+    FOREIGN KEY (template_id) REFERENCES notification_templates(template_id);
+```
+
+Either way, **also store the rendered `title`/`body`** on the notification. The FK/version tells you *which* template; the snapshot tells you the *exact text* even if the template row is later edited or deleted.
+
+### Enforce a single active template
+
+There must be exactly **one** active template per `(type, channel, language)` — otherwise the render step can't decide which copy to use. Enforce it in the DB so it's impossible to get two live rows:
+
+```sql
+CREATE UNIQUE INDEX uniq_active_template
+    ON notification_templates (type, channel, language)
+    WHERE is_active = TRUE;
+```
+
+Publishing a new version becomes a small transaction: flip the old row to `is_active = false`, insert the new row with `is_active = true`.
 
 ---
 
@@ -1204,9 +1295,26 @@ Balance: **worker count ≤ what DB can sustain**. Kafka absorbs spikes; workers
 | **Template missing** | Fail fast + alert; don't send blank notification |
 | **Campaign sends too fast** | Rate limit per user + provider throughput cap |
 
-### Event publishing reliability
+### Event publishing reliability (the dual-write problem)
 
-Source services (Order, Payment) should use **Transactional Outbox** — write order + outbox row in same DB transaction, separate publisher reads outbox → Kafka. Prevents lost events.
+Two boundaries in this system are both dual-writes — a DB write and a Kafka publish that are **not atomic**:
+
+| Boundary | Failure if naïve | Fix |
+| --- | --- | --- |
+| **Source → Notification** (Order emits event) | Order committed but event lost → user never notified | **Transactional Outbox** in source: write order + outbox row in one TX; a relay publishes outbox → Kafka |
+| **Notification API → Kafka** (insert row, then enqueue) | Row inserted, process crashes before enqueue → stuck in `PENDING`, never delivered | **Outbox** in notification DB *or* a **reconciliation sweeper** (below) |
+
+**Reconciliation sweeper** (safety net for stuck rows):
+
+```sql
+-- Runs every 1–5 min; re-enqueues rows that were persisted but never delivered
+SELECT notification_id, ... FROM notifications
+WHERE status = 'PENDING' AND created_at < now() - interval '5 minutes'
+LIMIT 1000;
+-- → re-publish to Kafka (idempotent: worker skips if attempt already SENT)
+```
+
+Because the whole pipeline is **at-least-once + idempotent**, re-enqueuing a row that *was* actually delivered is harmless — the worker sees `attempt.status = SENT` and skips.
 
 > See: [Outbox & Saga](../concepts/outbox-and-saga.md).
 
@@ -1225,7 +1333,70 @@ Source services (Order, Payment) should use **Transactional Outbox** — write o
 
 ---
 
-## 25. Final Architecture
+## 25. Security, PII & Compliance
+
+Notifications touch sensitive data (email, phone, device tokens) and legally-regulated channels (SMS, email). Interviewers love this follow-up because most candidates forget it.
+
+### Authentication & authorization
+
+| Boundary | Control |
+| --- | --- |
+| Internal service → Notification API | **mTLS** or signed **service tokens (JWT/OAuth client-creds)** — not open to the internet |
+| User → in-app / preferences API | User auth token; a user can only read/modify **their own** notifications |
+| Worker → provider (FCM/SES/Twilio) | Secrets in a **vault** (not env files/code); rotate keys |
+
+### PII handling
+
+| Data | Risk | Mitigation |
+| --- | --- | --- |
+| `email`, `phone`, `device_token` | PII / hijackable | **Encrypt at rest** (column-level or KMS); TLS in transit |
+| Rendered `title`/`body` snapshot | May contain PII (name, amount, address) | Encrypt sensitive fields; restrict who can read history; mask in logs |
+| Logs / traces | Accidental PII leak | Log `notification_id`/`user_id` only — **never** the message body or raw token |
+
+### Compliance
+
+- **Consent & unsubscribe** — every promotional email needs a one-click unsubscribe (CAN-SPAM / GDPR / CASL); SMS marketing needs prior opt-in. Unsubscribe flips the relevant `notification_preferences` flag.
+- **Quiet hours & regional law** — some jurisdictions ban marketing SMS at night; enforce per-user timezone.
+- **Right to be forgotten (GDPR)** — a "delete my data" request must purge/anonymize PII in `notifications`, `in_app_notifications`, `user_devices`. Time-partitioning makes bulk deletion of old data cheap.
+- **Data retention** — keep detailed history 30–90 days hot; anonymize or archive beyond that.
+- **Transactional vs promotional** — legally distinct. Transactional (OTP, receipts) bypass marketing opt-outs; promotional must honor them. This is *why* the type→preference mapping matters.
+
+> **One-liner:** "Service-to-service auth via mTLS/signed tokens, encrypt PII (tokens, phone, email) at rest, never log message bodies, honor unsubscribe + quiet hours for promotional sends, and support GDPR delete via partitioned data + purge job."
+
+---
+
+## 26. Read Models, Counters & Digests
+
+### Unread-count read model
+
+The bell icon needs a fast unread count. `SELECT COUNT(*) ... WHERE is_read = FALSE` on every app open is expensive at scale.
+
+```
+Redis:  unread:{userId} = 7
+  create in-app notification  → INCR unread:{userId}
+  user reads one             → DECR unread:{userId}
+  "mark all read"            → SET unread:{userId} = 0
+```
+
+DB remains source of truth; Redis is the hot counter (rebuild by counting on cache miss). This turns an O(n) scan into an O(1) read.
+
+### Aggregation / digest notifications
+
+Users hate 20 separate pings. Coalesce many events into one:
+
+| Strategy | Example |
+| --- | --- |
+| **Count rollup** | "You have **5** new messages" instead of 5 pushes |
+| **Time-window batching** | Buffer non-urgent events for N minutes, then send one summary |
+| **Scheduled digest** | Daily/weekly email: "Here's what happened this week" |
+
+Implementation: a buffer keyed by `(user_id, type)` in Redis or a staging table; a job flushes the window → renders a **digest template** → single notification. Transactional/high-priority events (OTP, payment) **bypass** batching and send immediately.
+
+> **Trade-off:** batching reduces spam and cost but adds latency — only apply it to low-priority, high-frequency types.
+
+---
+
+## 27. Final Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1267,7 +1438,7 @@ Source services (Order, Payment) should use **Transactional Outbox** — write o
 
 ---
 
-## 26. How to Drive the Interview
+## 28. How to Drive the Interview
 
 Use this **30-minute framework**:
 
@@ -1296,7 +1467,7 @@ Use this **30-minute framework**:
 
 ---
 
-## 27. Interview Cheat Sheet
+## 29. Interview Cheat Sheet
 
 > **"Walk me through sending an order confirmation notification."**
 >
@@ -1328,9 +1499,9 @@ Use this **30-minute framework**:
 
 > **"How do template changes work?"**
 >
-> "Versioned templates — new copy gets version 2, v1 stays for audit. Notification row stores `template_version` plus rendered title/body snapshot so you always know what was sent."
+> "Versioned templates — new copy gets version 2, v1 stays for audit. `type` (the event) is stable; `template_id` points to the exact row. A partial unique index enforces exactly one `is_active` template per `(type, channel, language)`, so render is never ambiguous. The notification row stores `template_version`/`template_id` plus a rendered title/body snapshot, so you always know what was sent — even after the template is edited."
 
-> **"Walk me through sending an order confirmation notification."**
+> **"How do you notify millions of users in a campaign?"**
 >
 > "Campaign pipeline: segment service streams user IDs, batch producer enqueues batches to Kafka, push workers scale horizontally. Rate limit per user. Never one synchronous API call for 1M users."
 
@@ -1354,9 +1525,40 @@ Use this **30-minute framework**:
 >
 > "In-app = DB row the app fetches (bell icon). Push = FCM/APNS to device. In-app worker writes DB + optionally notifies WebSocket service for instant UI update."
 
+> **"You insert the row, then publish to Kafka — what if you crash in between?"**
+>
+> "That's a dual-write. The row is stuck in `PENDING`. I'd use an outbox (row + outbox record in one transaction, a relay publishes) or a reconciliation sweeper that re-enqueues `PENDING` rows older than a few minutes. Safe because the pipeline is at-least-once + idempotent — the worker skips if the attempt is already SENT."
+
+> **"How do you handle PII and compliance?"**
+>
+> "mTLS/signed tokens between services, encrypt device tokens/phone/email at rest, never log message bodies, one-click unsubscribe + quiet hours for promotional sends, and GDPR delete via partitioned data + a purge job. Transactional messages bypass marketing opt-outs; promotional ones honor them."
+
+> **"How does the unread bell-icon count stay fast?"**
+>
+> "Redis counter per user — INCR on create, DECR on read, SET 0 on mark-all-read. DB is source of truth; the counter turns an O(n) scan into O(1). Avoid duplicate pings with digest/aggregation for low-priority types; OTP and payment bypass batching."
+
 ---
 
-## 28. Final Takeaways
+## 30. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Producer-Consumer** | API enqueues → channel workers consume (Kafka) | Decouple + scale delivery |
+| **Strategy** | Per-channel delivery (push/email/SMS), retry/backoff, template rendering | Swap behavior per channel |
+| **Ports & Adapters (Hexagonal)** | Provider ports (FCM/SES/Twilio), queue, repo | Swap providers without touching core |
+| **Idempotency Key** | `notification_key` unique constraint | Dedup duplicate events |
+| **Outbox** | Reliable event → Kafka publish | No dual-write loss |
+| **Observer / Pub-Sub** | Domain events → notification pipeline; WebSocket fan-out | Decouple |
+| **State** | Notification + attempt lifecycle | Guard transitions |
+| **Factory** | Channel-worker / provider creation | Extensible channels |
+| **Template Method** | Common worker skeleton, channel-specific `deliver()` | Reuse flow |
+| **Circuit Breaker + Retry** | Provider calls (with fallback provider) | Fail fast + resilience |
+| **Priority Queue** | High/normal/low topics | Critical (OTP) drains first |
+| **Decorator / Chain** | Preference → quiet-hours → rate-limit checks before send | Composable gating |
+
+---
+
+## 31. Final Takeaways
 
 - **Async queue-based architecture** — API enqueues, workers deliver; never block source systems.
 - **Two stages** — unique index = **create once** (`notifications`); retries = **send many times** (`notification_attempts` on same `notification_id`).
@@ -1373,10 +1575,16 @@ Use this **30-minute framework**:
 - **Partition Kafka by `user_id`** — ordering and even load.
 - **Push = multi-device fan-out** — one user, many tokens; invalidate stale tokens.
 - **Transactional outbox** at source — don't lose events before they reach the notification system.
+- **Dual-write inside the service too** — insert-then-publish can strand rows in `PENDING`; use an outbox or a reconciliation sweeper.
+- **Retry with jitter** — fixed backoff causes a thundering herd when a provider recovers.
+- **Distributed IDs** — Snowflake/UUIDv7, not a single auto-increment sequence, so you can shard.
+- **Security & PII** — mTLS/signed tokens, encrypt tokens/phone/email, never log bodies, honor unsubscribe + GDPR delete.
+- **Fast read models** — Redis unread counter (O(1)); digest/aggregation to cut spam for low-priority types.
 
 ### Related notes
 
 - [Notification System — HLD & LLD](notification-system-hld-lld.md) — architecture diagram, full DDL, API contracts, class design, state machines, sequences
+- [Fan-Out / Fan-In & Celebrity Problem](../concepts/fan-out-fan-in.md) — event fan-out to many users + batch pipeline
 - [Idempotency](../concepts/idempotency.md)
 - [Rate Limiting](../concepts/rate-limiting.md)
 - [Outbox & Saga](../concepts/outbox-and-saga.md)

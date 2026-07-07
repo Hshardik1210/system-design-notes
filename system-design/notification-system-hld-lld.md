@@ -138,6 +138,10 @@
 
 > **Rule:** everything between "event received" and "provider called" is async. The API returns **202 Accepted** immediately after enqueue.
 
+**Auth per boundary:** internal service → API uses **mTLS or signed service tokens (OAuth client-creds/JWT)**; user → in-app/preferences API uses the user's auth token (can only touch their own data); worker → provider uses secrets from a **vault** (rotated), never env files.
+
+**Dual-write caveat:** `insert notification` (DB) + `publish` (Kafka) are not atomic. Guard with an **outbox** or a **reconciliation sweeper** for `PENDING` rows (see B5, B12).
+
 ---
 
 ## A5. Storage Strategy
@@ -151,9 +155,14 @@
 | WebSocket connection map | **Redis** | fast lookup `user_id → connection_id` |
 | Device tokens | **RDBMS** (source of truth) + optional Redis | multi-device fan-out; invalidate on bad token |
 | Campaign progress | **RDBMS** | durable counts (sent, failed, total) |
+| Unread count | **Redis counter** `unread:{userId}` | O(1) bell-icon read; DB is source of truth |
 | Old notifications archive | **S3 / cold storage** | partition by month; TTL after 90 days |
 
 **Partitioning:** Kafka topics partitioned by `user_id`. Notification DB sharded by `user_id` at very large scale.
+
+**IDs:** `notification_id` is a **Snowflake / UUIDv7** (app-generated, time-sortable) — not a single DB auto-increment sequence, which bottlenecks writes and blocks sharding.
+
+**PII at rest:** encrypt `device_token`, `phone`, `email`, and sensitive rendered bodies (KMS / column encryption); never log message bodies or raw tokens; support GDPR delete via time-partitioned purge.
 
 ---
 
@@ -290,7 +299,7 @@ Adding workers to fix Kafka lag can **overload the DB**.
 ```sql
 -- ---------- Core notification domain ----------
 CREATE TABLE notifications (
-    notification_id   BIGINT PRIMARY KEY,
+    notification_id   BIGINT PRIMARY KEY,          -- Snowflake / UUIDv7 (app-generated, shard-friendly)
     notification_key  VARCHAR(255) NOT NULL,     -- idempotency: userId:type:entityId
     user_id           BIGINT NOT NULL,
     type              VARCHAR(100) NOT NULL,       -- ORDER_CONFIRMED, OTP, PROMOTION
@@ -343,8 +352,8 @@ CREATE TABLE notification_preferences (
 );
 
 CREATE TABLE notification_templates (
-    template_id       BIGINT PRIMARY KEY,
-    type              VARCHAR(100) NOT NULL,
+    template_id       BIGINT PRIMARY KEY,        -- or UUID (opaque; never encode meaning in the key)
+    type              VARCHAR(100) NOT NULL,      -- the "why"; stable across versions
     channel           VARCHAR(50) NOT NULL,
     language          VARCHAR(20) NOT NULL DEFAULT 'en',
     version           INT NOT NULL DEFAULT 1,
@@ -355,7 +364,12 @@ CREATE TABLE notification_templates (
     UNIQUE (type, channel, language, version)
 );
 -- New copy → INSERT version 2; never UPDATE version 1 in place
--- notifications.template_version stores which version was rendered
+-- notifications.template_version (or FK notifications.template_id) records what was rendered
+
+-- Exactly ONE active template per (type, channel, language) — no ambiguity at render time
+CREATE UNIQUE INDEX uniq_active_template
+    ON notification_templates (type, channel, language)
+    WHERE is_active = TRUE;
 
 -- ---------- Push devices ----------
 CREATE TABLE user_devices (
@@ -911,6 +925,7 @@ class RedisWebSocketAdapter     implements WebSocketPort   { /* pub to ws:user:{
 > - `SchedulerJob` — polls `scheduled_notifications`, calls orchestrator.
 > - `CampaignBatchProducer` — streams segment users → `campaign_batches` → Kafka.
 > - `RetryDispatcher` — polls `notification_attempts WHERE next_retry_at <= now()`.
+> - `ReconciliationSweeper` — re-enqueues `notifications WHERE status='PENDING' AND created_at < now()-N` (fixes dual-write gaps; idempotent).
 
 ---
 
@@ -1025,7 +1040,8 @@ handleFailure(job, attempt):
         update attempt status=FAILED
         return
 
-    delay = backoff[attempt_count]    # 0, 1m, 5m, 30m
+    base  = backoff[attempt_count]    # 0, 1m, 5m, 30m
+    delay = base + rand(0, base/2)    # JITTER — avoid thundering herd on provider recovery
     update attempt: status=RETRYING, next_retry_at=now+delay
     kafka.publish(delayed_retry_topic, job, delay)
 ```
@@ -1192,6 +1208,7 @@ BookSvc    NotifAPI    DB(scheduled)    Scheduler(cron)    Kafka    PushWorker
 | Campaign memory blow-up | Stream segment with cursor; batch size cap |
 | Scheduler double-dispatch | `UPDATE ... WHERE status='PENDING'` + check rows affected; or `SELECT FOR UPDATE SKIP LOCKED` |
 | Lost events from source | Transactional outbox in Order/Payment service |
+| Lost enqueue after DB insert | Outbox in notification DB, or reconciliation sweeper for stale `PENDING` rows |
 | Stale device token | Deactivate on provider error; don't retry same token |
 
 ---
@@ -1205,6 +1222,7 @@ BookSvc    NotifAPI    DB(scheduled)    Scheduler(cron)    Kafka    PushWorker
 | `notif_count:{userId}:{type}:{date}` | integer | end of day | rate limiting |
 | `ws:user:{userId}` | `{ connectionId, serverId }` | session | refreshed on heartbeat |
 | `devices:{userId}` | list of active tokens | 5 min | optional; DB is source of truth |
+| `unread:{userId}` | integer | none (rebuild on miss) | bell-icon count; INCR on create, DECR on read, SET 0 on read-all |
 
 ---
 
@@ -1215,6 +1233,8 @@ BookSvc    NotifAPI    DB(scheduled)    Scheduler(cron)    Kafka    PushWorker
 | Duplicate API request | `UNIQUE(notification_key)` → `handleDuplicate()`; never re-insert |
 | Duplicate Kafka message | Worker skips if attempt already `SENT` |
 | Delivery failed after insert | Update same `notification_id` to RETRYING; republish to retry topic — **no re-insert** |
+| Crash between DB insert and Kafka publish (dual-write) | Row stuck in `PENDING`; outbox or reconciliation sweeper re-enqueues rows older than N min (idempotent — worker skips if attempt already `SENT`) |
+| Provider recovers after outage | Jittered backoff spreads retries; avoids thundering herd |
 | User opted out | `intersect()` returns empty → no record or `SKIPPED` |
 | All push tokens invalid | Deactivate tokens; attempt → `FAILED` or retry if transient |
 | Email bounces (hard) | Permanent failure; no retry; mark attempt `FAILED` |
@@ -1224,6 +1244,8 @@ BookSvc    NotifAPI    DB(scheduled)    Scheduler(cron)    Kafka    PushWorker
 | Campaign too fast | Throttle batch publish rate; rate limit per user still applies |
 | Scheduled event cancelled | Update `scheduled_notifications.status = CANCELLED` |
 | Template missing | Fail fast; alert; don't send blank message |
+| Two active templates for same `(type, channel, language)` | Impossible — `uniq_active_template` partial unique index rejects the second; publishing a version flips old → false, inserts new → true in one tx |
+| Template edited after send | Notification stored rendered `title`/`body` snapshot + `template_id`/`version`; audit still exact |
 | Queue backlog | Autoscale workers; prioritize HIGH topic |
 
 ---
@@ -1247,6 +1269,9 @@ BookSvc    NotifAPI    DB(scheduled)    Scheduler(cron)    Kafka    PushWorker
 | "Schema?" | A5 storage | B1 DDL + indexes |
 | "Class design?" | A3 services | B3 orchestrator + workers + ports |
 | "Real-time in-app" | Main note §18 | B3 WebSocketPort, InAppWorker |
+| "Crash between insert and enqueue?" | Main note §6.1, §23 dual-write | B5 idempotency, B10, B12, `ReconciliationSweeper` |
+| "PII & compliance?" | Main note §25 | A4 auth, A5 PII-at-rest |
+| "Fast unread count / digests?" | Main note §26 | A5 + B11 `unread:{userId}` counter |
 
 ---
 

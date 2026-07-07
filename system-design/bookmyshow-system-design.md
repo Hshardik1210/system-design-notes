@@ -32,7 +32,8 @@
 - [24. Reliability & Observability](#24-reliability--observability)
 - [25. How to Drive the Interview (framework)](#25-how-to-drive-the-interview-framework)
 - [26. Interview Cheat Sheet](#26-interview-cheat-sheet)
-- [27. Final Takeaways](#27-final-takeaways)
+- [27. Design Patterns (that can be used)](#27-design-patterns-that-can-be-used)
+- [28. Final Takeaways](#28-final-takeaways)
 
 ---
 
@@ -125,10 +126,16 @@ POST /v1/bookings                                  → create booking + start pa
      header: Idempotency-Key: <uuid>
      → 201 { bookingId, status: PENDING }
 
+POST /v1/shows/{showId}/release                    → free a held lock (user backs out)
+POST /v1/coupons/validate                          → validate/apply a coupon pre-booking
 POST /v1/payments/webhook                          → gateway callback (success/failure)
-GET  /v1/bookings/{bookingId}                       → poll booking status
+GET  /v1/bookings/{bookingId}                       → poll booking status (+ ticket/QR)
 POST /v1/bookings/{bookingId}/cancel                → cancel + refund (optional)
+GET  /v1/users/{userId}/bookings                    → booking history (cursor paginated)
+GET  /v1/cities                                     → list cities (browse)
 ```
+
+> Full request/response contracts (browse, lock, booking, coupon, cancel/refund, history, webhook, Kafka events) are in the [HLD & LLD companion](bookmyshow-hld-lld.md) §B2.
 
 > The **lock** and **booking** endpoints are the ones that must be **idempotent** — retries must not create duplicate holds or double charges.
 
@@ -178,10 +185,21 @@ Client (App/Web) │   CDN        │  (posters, static seat-map layout)
 | **City** | `city_id`, `name` |
 | **Cinema / Theatre** | `cinema_id`, `city_id`, `name`, `location` |
 | **Screen** | `screen_id`, `cinema_id`, `layout` (rows × cols) |
-| **Show** | `show_id`, `movie_id`, `screen_id`, `start_time`, `price` |
-| **Seat** | `seat_id`, `show_id`, `seat_number`, `status`, `locked_by`, `lock_expiry`, `version` |
-| **Booking** | `booking_id`, `user_id`, `show_id`, `seat_ids`, `status`, `idempotency_key` |
-| **Payment** | `payment_id`, `booking_id`, `amount`, `status`, `gateway_ref` |
+| **Show** | `show_id`, `movie_id`, `screen_id`, `city_id`, `start_time`, `base_price`, `format` |
+| **SeatCategory** | `category_id`, `screen_id`, `name` (Regular/Premium/Recliner), `price_multiplier` |
+| **Seat** | `seat_id`, `show_id`, `category_id`, `seat_number`, `price`, `status`, `locked_by`, `lock_expiry`, `version` |
+| **User** | `user_id`, `name`, `email`, `phone` |
+| **Booking** | `booking_id`, `user_id`, `show_id`, `status`, `subtotal`, `discount`, `amount`, `coupon_code`, `idempotency_key` |
+| **BookingSeat** (join) | `booking_id`, `seat_id`, `price` — preferred over a `seat_ids[]` array |
+| **Payment** | `payment_id`, `booking_id`, `amount`, `method`, `status`, `gateway_ref`, `idempotency_key` |
+| **PaymentWebhookEvent** | `event_id`, `payment_id`, `status`, `processed` — dedup at-least-once callbacks |
+| **Refund** | `refund_id`, `booking_id`, `payment_id`, `amount`, `status` |
+| **Ticket** | `ticket_id`, `booking_id`, `qr_code`, `checked_in` — issued after CONFIRMED |
+| **Coupon** / **CouponRedemption** | `code`, `type`, `value`, limits / `(code, booking_id)` |
+| **Review** (optional) | `movie_id`, `user_id`, `rating`, `comment` |
+| **Outbox** | `event_id`, `event_type`, `payload`, `status` — reliable eventing |
+
+> **Full DDL, indexes, and the complete table checklist live in the [HLD & LLD companion](bookmyshow-hld-lld.md) §B1.** Model at least city→cinema→screen→show→seat plus booking/payment; mention seat categories (pricing tiers), tickets, coupons, refunds, and the outbox for a complete answer.
 
 ### 💺 Seat — `status`: `AVAILABLE` / `LOCKED` / `BOOKED`
 
@@ -900,7 +918,26 @@ Lock → Try → Either CONFIRM or ROLLBACK (release seat + DEL Redis key)
 
 ---
 
-## 27. Final Takeaways
+## 27. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Optimistic Locking / CAS** | Atomic conditional seat `UPDATE ... WHERE status='AVAILABLE'` | Prevent double-booking without heavy locks |
+| **Idempotency Key** | "Pay" / booking creation | Safe retries, no duplicate bookings/charges |
+| **Saga / Orchestration** | Lock → pay → confirm, with compensation (release/refund) | Distributed transaction without 2PC |
+| **Outbox** | Publish booking events reliably | No dual-write loss between DB and Kafka |
+| **State** | Seat/booking lifecycle (AVAILABLE→LOCKED→BOOKED) | Guard legal transitions |
+| **Strategy** | Locking (pessimistic/optimistic/Redis-hybrid), pricing | Swap approaches |
+| **Leaky Bucket / Token Bucket** | Virtual waiting room + rate limiting | Shape blockbuster spikes |
+| **Cache-Aside** | Seat map / show / search caching | Read scale |
+| **CQRS** | Search read model (ES) vs booking write model | Optimized reads |
+| **Repository** | Data access | Testable domain |
+| **Circuit Breaker + Retry** | Payment gateway calls | Handle slow/failing providers |
+| **Producer-Consumer** | Background jobs (cleanup, reconciliation) via queue | Scalable async work |
+
+---
+
+## 28. Final Takeaways
 
 - **Seats must never be double-booked** — every decision serves this
 - **Lock first → then confirm** (never book directly)

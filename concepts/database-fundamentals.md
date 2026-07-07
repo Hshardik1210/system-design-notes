@@ -424,3 +424,8 @@ spring.datasource.hikari.maximum-pool-size=10
 - **Sharding** scales writes; the hard parts are **shard key choice, hot shards, cross-shard ops, resharding**.
 - **Consistent hashing** (separate note) is the standard way to shard with minimal reshuffling.
 - **Connection pools** reuse a configurable min/max of open connections; watch **exhaustion**, **leaks**, and the DB's own **`max_connections`** across all services/shards.
+
+### Related notes
+
+- [Databases — Deep Dive](databases-deep-dive.md) — storage internals (B-Tree/LSM/column/vector), MySQL vs Postgres at scale, Mongo/Cassandra/Redis/Elasticsearch/Vector DBs with example queries, and how clusters route to the right node.
+- [Database Indexing](database-indexing.md) · [Consistent Hashing](consistent-hashing.md) · [Caching Strategies](caching-strategies.md)

@@ -28,6 +28,7 @@
 - [B9. Caching Design](#b9-caching-design)
 - [B10. Error Handling & Edge Cases](#b10-error-handling--edge-cases)
 - [B11. Cheat-Sheet Mapping (HLD ↔ LLD)](#b11-cheat-sheet-mapping-hld-↔-lld)
+- [B12. Design Patterns (that can be used)](#b12-design-patterns-that-can-be-used)
 
 ---
 
@@ -186,16 +187,37 @@ CREATE TABLE show (
     show_id    BIGINT PRIMARY KEY,
     movie_id   BIGINT NOT NULL REFERENCES movie(movie_id),
     screen_id  BIGINT NOT NULL REFERENCES screen(screen_id),
+    city_id    BIGINT NOT NULL REFERENCES city(city_id),   -- for city-scoped listing
     start_time TIMESTAMP NOT NULL,
-    base_price NUMERIC(10,2) NOT NULL
+    base_price NUMERIC(10,2) NOT NULL,
+    language   VARCHAR(50), format VARCHAR(20)              -- 2D/3D/IMAX
 );
-CREATE INDEX idx_show_lookup ON show (movie_id, start_time);
+CREATE INDEX idx_show_lookup ON show (movie_id, city_id, start_time);
+
+-- ---------- Users ----------
+CREATE TABLE app_user (
+    user_id     BIGINT PRIMARY KEY,
+    name        VARCHAR(255),
+    email       VARCHAR(255) UNIQUE,
+    phone       VARCHAR(20) UNIQUE,
+    created_at  TIMESTAMP NOT NULL DEFAULT now()
+);
+
+-- ---------- Seat pricing tiers (Regular / Premium / Recliner) ----------
+CREATE TABLE seat_category (
+    category_id BIGINT PRIMARY KEY,
+    screen_id   BIGINT NOT NULL REFERENCES screen(screen_id),
+    name        VARCHAR(30) NOT NULL,           -- REGULAR, PREMIUM, RECLINER
+    price_multiplier NUMERIC(4,2) NOT NULL DEFAULT 1.0   -- final price = show.base_price * multiplier
+);
 
 -- ---------- Booking domain ----------
 CREATE TABLE seat (
     seat_id     BIGINT PRIMARY KEY,
     show_id     BIGINT NOT NULL REFERENCES show(show_id),
+    category_id BIGINT REFERENCES seat_category(category_id),  -- pricing tier
     seat_number VARCHAR(10) NOT NULL,           -- e.g. 'A1'
+    price       NUMERIC(10,2),                   -- resolved price for this seat/show
     status      VARCHAR(12) NOT NULL DEFAULT 'AVAILABLE', -- AVAILABLE|LOCKED|BOOKED
     locked_by   BIGINT,                          -- user_id holding the lock
     lock_expiry TIMESTAMP,
@@ -207,24 +229,86 @@ CREATE INDEX idx_seat_expiry      ON seat (lock_expiry) WHERE status = 'LOCKED';
 
 CREATE TABLE booking (
     booking_id      BIGINT PRIMARY KEY,
-    user_id         BIGINT NOT NULL,
+    user_id         BIGINT NOT NULL REFERENCES app_user(user_id),
     show_id         BIGINT NOT NULL REFERENCES show(show_id),
-    seat_ids        BIGINT[] NOT NULL,           -- or a booking_seat join table
     status          VARCHAR(12) NOT NULL,        -- PENDING|CONFIRMED|FAILED|CANCELLED
-    amount          NUMERIC(10,2) NOT NULL,
+    subtotal        NUMERIC(10,2) NOT NULL,
+    discount        NUMERIC(10,2) DEFAULT 0,
+    amount          NUMERIC(10,2) NOT NULL,      -- final payable
+    coupon_code     VARCHAR(50),
     idempotency_key VARCHAR(64) NOT NULL,
     created_at      TIMESTAMP NOT NULL DEFAULT now(),
     UNIQUE (idempotency_key)
 );
-CREATE INDEX idx_booking_user ON booking (user_id);
+CREATE INDEX idx_booking_user ON booking (user_id, created_at DESC);
+
+-- Join table (preferred over seat_ids[] — clean FKs + queries)
+CREATE TABLE booking_seat (
+    booking_id BIGINT NOT NULL REFERENCES booking(booking_id),
+    seat_id    BIGINT NOT NULL REFERENCES seat(seat_id),
+    price      NUMERIC(10,2) NOT NULL,           -- snapshot at booking time
+    PRIMARY KEY (booking_id, seat_id)
+);
 
 CREATE TABLE payment (
-    payment_id  BIGINT PRIMARY KEY,
+    payment_id      BIGINT PRIMARY KEY,
+    booking_id      BIGINT NOT NULL REFERENCES booking(booking_id),
+    amount          NUMERIC(10,2) NOT NULL,
+    status          VARCHAR(12) NOT NULL,        -- INITIATED|SUCCESS|FAILED|REFUNDED|UNKNOWN
+    method          VARCHAR(20),                 -- UPI|CARD|WALLET|NETBANKING
+    gateway         VARCHAR(30),
+    gateway_ref     VARCHAR(128),
+    idempotency_key VARCHAR(64) UNIQUE,          -- never double-charge
+    created_at      TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE TABLE payment_webhook_events (            -- dedup at-least-once gateway callbacks
+    event_id     VARCHAR(128) PRIMARY KEY,       -- gateway event id
+    payment_id   BIGINT, gateway_ref VARCHAR(128),
+    status       VARCHAR(20), processed BOOLEAN DEFAULT FALSE,
+    received_at  TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE TABLE refund (
+    refund_id   BIGINT PRIMARY KEY,
     booking_id  BIGINT NOT NULL REFERENCES booking(booking_id),
+    payment_id  BIGINT NOT NULL REFERENCES payment(payment_id),
     amount      NUMERIC(10,2) NOT NULL,
-    status      VARCHAR(12) NOT NULL,            -- INITIATED|SUCCESS|FAILED|REFUNDED|UNKNOWN
-    gateway_ref VARCHAR(128),
+    reason      VARCHAR(100),
+    status      VARCHAR(20) NOT NULL,            -- INITIATED|DONE|FAILED
     created_at  TIMESTAMP NOT NULL DEFAULT now()
+);
+
+-- Issued ticket (QR / entry pass) after CONFIRMED
+CREATE TABLE ticket (
+    ticket_id   BIGINT PRIMARY KEY,
+    booking_id  BIGINT NOT NULL REFERENCES booking(booking_id),
+    qr_code     VARCHAR(255) UNIQUE,
+    issued_at   TIMESTAMP NOT NULL DEFAULT now(),
+    checked_in  BOOLEAN DEFAULT FALSE
+);
+
+-- ---------- Coupons / offers ----------
+CREATE TABLE coupon (
+    code         VARCHAR(50) PRIMARY KEY,
+    type         VARCHAR(10) NOT NULL,           -- FLAT|PERCENT
+    value        NUMERIC(10,2) NOT NULL,
+    min_amount   NUMERIC(10,2) DEFAULT 0,
+    max_discount NUMERIC(10,2),
+    valid_from   TIMESTAMP, valid_to TIMESTAMP,
+    usage_limit  INT, per_user_limit INT DEFAULT 1,
+    is_active    BOOLEAN DEFAULT TRUE
+);
+CREATE TABLE coupon_redemption (
+    code VARCHAR(50), user_id BIGINT, booking_id BIGINT, redeemed_at TIMESTAMP,
+    PRIMARY KEY (code, booking_id)
+);
+
+-- ---------- Movie ratings/reviews (optional) ----------
+CREATE TABLE review (
+    review_id BIGINT PRIMARY KEY, movie_id BIGINT, user_id BIGINT,
+    rating SMALLINT, comment TEXT, created_at TIMESTAMP,
+    UNIQUE (movie_id, user_id)
 );
 
 -- ---------- Outbox (in Booking DB) ----------
@@ -238,7 +322,7 @@ CREATE TABLE outbox (
 CREATE INDEX idx_outbox_pending ON outbox (status, created_at);
 ```
 
-> **Alternative to `seat_ids[]`:** a `booking_seat (booking_id, seat_id)` join table — cleaner for queries and FKs. Array shown for brevity.
+> **Tables to consider (checklist):** movie, city, cinema, screen, show, seat_category, seat, app_user, booking, booking_seat, payment, payment_webhook_events, refund, ticket, coupon, coupon_redemption, review, outbox. (Search index for movies/shows lives in Elasticsearch; virtual-waiting-room queue lives in Redis.)
 
 ---
 
@@ -291,7 +375,56 @@ POST /v1/payments/webhook
 
 ```
 GET /v1/bookings/{bookingId}
-200 OK { "bookingId": 700, "status": "CONFIRMED", "seatNumbers": ["A1","A2"] }
+200 OK { "bookingId": 700, "status": "CONFIRMED", "seatNumbers": ["A1","A2"], "ticket": { "qr": "..." } }
+```
+
+### Browse / discovery (Search + Catalog services)
+
+```
+GET /v1/cities                                   → list cities
+GET /v1/movies?cityId=1&date=2026-06-21&lang=en  → now-showing movies (Search/ES)
+GET /v1/movies/{movieId}/shows?cityId=1&date=    → shows (cinema, screen, time, price)
+GET /v1/shows/{showId}                            → show detail + seat categories/pricing
+```
+
+### Release a held lock (user backs out)
+
+```
+POST /v1/shows/{showId}/release
+{ "lockId": "lk_88", "userId": 123 }
+200 OK   # frees LOCKED seats immediately (else expiry sweep would)
+```
+
+### Apply / validate coupon (pre-booking)
+
+```
+POST /v1/coupons/validate
+{ "code": "WELCOME50", "userId": 123, "amount": 500.0 }
+200 OK { "valid": true, "discount": 50.0, "payable": 450.0 }
+409 { "error": "COUPON_INVALID" }
+```
+
+### Cancel booking + refund
+
+```
+POST /v1/bookings/{bookingId}/cancel
+Idempotency-Key: 550e8400-...
+200 OK { "bookingId": 700, "status": "CANCELLED", "refund": { "amount": 450.0, "status": "INITIATED" } }
+# releases seats (→ AVAILABLE) + initiates refund per policy
+```
+
+### User booking history
+
+```
+GET /v1/users/{userId}/bookings?cursor=&limit=20
+200 OK { "items": [ { "bookingId": 700, "status": "CONFIRMED", "showId": 42, ... } ], "nextCursor": ... }
+```
+
+### Internal / events (Kafka)
+
+```
+BOOKING_CONFIRMED · BOOKING_FAILED · BOOKING_CANCELLED
+PAYMENT_SUCCESS · PAYMENT_FAILED · REFUND_INITIATED
 ```
 
 ---
@@ -715,6 +848,31 @@ Redis: del seat_lock:*
 | "Handle payment" | Async Saga (A4), Payment Service | B4 state machines, B7 |
 | "Scale for a blockbuster" | A6 waiting room/sharding | B9 caching, B1 sharding |
 | "Schema?" | A5 storage | B1 DDL + indexes |
+
+---
+
+## B12. Design Patterns (that can be used)
+
+| Pattern | Where in this design | Why |
+| --- | --- | --- |
+| **Optimistic Locking / CAS** | Seat lock: `UPDATE ... WHERE status='AVAILABLE'` + `version` | Single winner without heavy locks — the core anti-double-book |
+| **Idempotency Key** | Lock, booking, payment, cancel (unique constraints) | Safe retries; no duplicate holds/bookings/charges |
+| **Saga / Orchestration** | Lock → pay → confirm, with compensation (release seats / refund) | Distributed transaction across Booking+Payment without 2PC |
+| **Outbox** | `outbox` written in the same TX as the state change | No lost events between DB commit and Kafka |
+| **State** | Seat, Booking, Payment state machines (B4) | Enforce legal transitions |
+| **Ports & Adapters (Hexagonal)** | `SeatLockManager`, `SeatRepository`, `PaymentPort`, `OutboxRepository` | Swap Redis/JDBC/gateway; testable core |
+| **Repository** | `SeatRepository`, `BookingRepository` | Abstract persistence |
+| **Strategy** | Locking strategy (pessimistic/optimistic/Redis-hybrid), pricing (category multiplier), refund policy | Swap algorithms/policies |
+| **Token Bucket / Leaky Bucket** | Virtual waiting room + gateway rate limiting | Shape blockbuster admission |
+| **Circuit Breaker + Retry** | `PaymentPort` calls to the gateway | Fail fast + resilience on a flaky dependency |
+| **Cache-Aside** | `seatmap:{showId}`, now-showing listings | Read scale on the browse path |
+| **CQRS** | Search/browse read model (Elasticsearch) vs booking write model (SQL) | Optimized reads independent of the write path |
+| **Producer-Consumer** | `OutboxPublisher`, `LockExpiryJob`, `PaymentReconciliationJob` | Async background work off the request path |
+| **Observer / Pub-Sub** | Booking events → Notification / Analytics / Invoice | Decouple downstream consumers |
+| **Template Method** | Common worker skeleton, job-specific step | Reuse background-job flow |
+| **Factory** | Payment-provider / notification-channel creation | Extensible providers |
+
+> **How to say it:** "The correctness core is **optimistic locking + idempotency**; the failure handling is **saga + compensation**; reliable eventing is **outbox**; the architecture is **hexagonal (ports & adapters)** so Redis/DB/gateway are swappable; and spikes are handled with **token-bucket rate limiting + a virtual waiting room**."
 
 ---
 
