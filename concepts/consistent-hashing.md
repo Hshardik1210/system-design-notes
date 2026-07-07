@@ -99,6 +99,36 @@ After:   ... S1 ──[some keys now go to S4]── S4 ──[rest go to S2]─
 
 > Redis Cluster uses **hash slots** (fixed 16384 slots mapped to nodes) — same goal (minimal movement on resize), slightly different mechanism.
 
+### Replication placement (which N nodes hold a key)
+
+With a replication factor **RF**, a key lives on the node it hashes to **plus the next RF−1 distinct physical nodes clockwise**.
+
+```
+key → first node clockwise = primary; next 2 distinct nodes clockwise = replicas (RF=3)
+"distinct physical" → skip extra vnodes of the same physical node so replicas aren't co-located
+```
+
+- This is exactly how **Cassandra/Dynamo** place replicas on the ring → data survives node loss, and reads/writes use a quorum of those RF nodes.
+
+### Bounded loads (hot keys / skew)
+
+Plain consistent hashing can still overload one node if a **key is hot** or arcs are uneven. **Consistent hashing with bounded loads** caps each node at `(1+ε)·average`; if the target node is "full", the key spills to the next node clockwise → no node exceeds the cap.
+
+### How many virtual nodes?
+
+- Too few → uneven distribution; too many → more memory + slower ring ops.
+- Typical: **~100–200 vnodes per physical node** balances distribution vs overhead.
+
+### Alternatives
+
+| Technique | Idea | When |
+| --- | --- | --- |
+| **Rendezvous (HRW) hashing** | For each key, compute `hash(key, node)` for all nodes → pick the max → the winner owns the key | Simple, no ring; great for smaller node sets / weighted |
+| **Jump consistent hash** | O(1), no memory, maps key → bucket in `[0, N)` with minimal movement | Fixed-ish bucket count (can't remove an arbitrary node) |
+| **Hash slots (Redis)** | Fixed 16384 slots → nodes | Explicit slot ownership + easy resharding |
+
+> **Interview add-on:** "consistent hashing places replicas on the next RF distinct nodes clockwise (Dynamo/Cassandra); bounded-load variants cap per-node load to handle skew; rendezvous/jump hash are simpler alternatives."
+
 ---
 
 ## 6. Trade-offs
