@@ -72,12 +72,14 @@ UPDATE clicks SET count = count + 1 WHERE ad_id = 123;
 
 Clean, and fine for a small website. Why big systems can't do it:
 
-| Wall | Problem |
-| --- | --- |
-| **1. Write throughput** | Every `UPDATE` = find row, lock, change, write to disk, unlock. A single DB handles a few thousand/sec; we need millions/sec. Melts. |
+
+| Wall                        | Problem                                                                                                                                                                                             |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. Write throughput**     | Every `UPDATE` = find row, lock, change, write to disk, unlock. A single DB handles a few thousand/sec; we need millions/sec. Melts.                                                                |
 | **2. Hot row (the killer)** | 50,000 people clicking the **same ad** all update the **same row**. A DB lets only one update a row at a time (a *lock*), so everyone queues for ONE row. This is the **hot key** problem (see §8). |
-| **3. Race conditions** | Two clicks read count=100, both write 101 → one click vanishes. `count=count+1` avoids this specific bug, but caching/multiple servers reintroduce it. Wrong count = wrong money. |
-| **4. Lose all breakdowns** | One `count` can't answer "last 10 min?", "per hour/day?", "India vs US?". You need counts broken down by time (and region), not one lifetime total. |
+| **3. Race conditions**      | Two clicks read count=100, both write 101 → one click vanishes. `count=count+1` avoids this specific bug, but caching/multiple servers reintroduce it. Wrong count = wrong money.                   |
+| **4. Lose all breakdowns**  | One `count` can't answer "last 10 min?", "per hour/day?", "India vs US?". You need counts broken down by time (and region), not one lifetime total.                                                 |
+
 
 **So instead:** (1) write the click down somewhere cheap/fast (a log) — no math yet; (2) separately, a counting machine reads big **batches** and does the math in memory, writing **one** summary row. That "log cheaply → count in batches" split is exactly Kafka (the log) + the stream processor (the counting machine) — detailed in §4.
 
@@ -86,11 +88,13 @@ Clean, and fine for a small website. Why big systems can't do it:
 ## 2. Requirements
 
 **Functional**
+
 - Record ad **click events** (ad_id, user, ts, ...); aggregate counts per ad per time window (minute/hour/day).
 - Query aggregates (dashboards) + feed **billing** (accurate totals); drill-down by region/campaign.
 - Filter **fraud/bot** clicks.
 
 **Non-functional**
+
 - **Massive write throughput** (millions/sec); **near-real-time** dashboards (seconds); **accurate** billing (reconcile); handle **duplicates + late/out-of-order** events; scalable, fault-tolerant.
 
 ---
@@ -136,6 +140,7 @@ When a click happens, don't count. Just **append it to a giant shared notepad** 
 > **Kafka is an append-only list.** Messages come in, Kafka tacks each onto the end, in order. Never edits the middle. Write, write, write, forever.
 
 Why better than the DB `UPDATE` from §1:
+
 - **Appending to the end is stupidly fast** — no find/lock/math/unlock. Millions/sec on one setup.
 - **No fighting over one row** — everyone just adds to the end.
 
@@ -223,17 +228,144 @@ raw click {ad_123, ip: 49.36.x.x}
    → Kafka → counter adds 1 to the (ad_123, 2:05, India) bucket
 ```
 
+### Plain-English: how do we detect bot / fraud clicks?
+
+We keep saying "fraud filter drops bots **before** counting" — but *how* do we know a click is a bot? First, **why bots even click ads:**
+
+- A **competitor** clicks your ad 10,000 times to burn your daily budget so your real customers never see it.
+- A shady **publisher** (site showing the ads) fakes clicks on ads on their own page to earn more payout.
+- **Click farms / botnets** — scripts or cheap labour generating clicks at scale.
+
+If we count these, the advertiser gets **overbilled for worthless clicks** → refunds, lawsuits, lost trust. So we try to catch them.
+
+**Key idea: a bot doesn't behave like a human.** We score each click on a bunch of **signals** and drop the ones that look fake. Think of a **bouncer at a club**: no single thing gets you turned away, but "fake ID + drunk + no shoes + on the banned list" together is an easy no.
+
+#### The signals (what smells like a bot)
+
+| Signal | Human | Bot / fraud | Why it works |
+| --- | --- | --- | --- |
+| **Click rate** (per IP / user / device) | a few clicks/min | 500 clicks/sec from one IP | humans are slow, machines are fast |
+| **Time-to-click** (impression → click) | ~1–3 seconds | 5 milliseconds (no human reads that fast) | you physically can't react in 5ms |
+| **IP reputation** | home/mobile IP | known **datacenter** IP (AWS/proxy), or on a blocklist | real people don't browse from inside a server farm |
+| **Behaviour** | mouse moves, scrolls, then clicks | click with zero mouse movement / headless browser | bots skip the physical human motions |
+| **Conversions** | some clicks → purchases | 100k clicks, **zero** purchases ever | fraud generates clicks, not customers |
+| **Device fingerprint** | varied, real devices | 10,000 clicks from the *identical* device/user-agent | one machine faking a whole crowd |
+| **Click pattern** | irregular, human timing | perfectly even (one click every 200ms, like a metronome) | real behaviour is messy; automation is suspiciously regular |
+
+> **No single signal is proof** — a real user *could* be on a VPN or click fast. It's the **combination** (the bouncer logic): datacenter IP **+** 5ms click **+** zero conversions **+** 500/sec together = confidently fake.
+
+#### Two layers of defence (fast now + smart later)
+
+Fraud detection is split into **two layers**, because "instant" and "accurate" pull in opposite directions:
+
+```
+Layer 1 — REAL-TIME filter (at ingestion, before Kafka/counting)
+          cheap, rule-based: rate limits + IP blocklists. Milliseconds.
+          Goal: drop the obvious junk before it inflates live numbers.
+
+Layer 2 — OFFLINE / ML analysis (batch, during reconciliation §9)
+          heavy models look across ALL of a day's data, catch subtle bots,
+          and CLAW BACK (refund) fraud that slipped past Layer 1.
+```
+
+**Layer 1** — the fast filter that runs in the ingestion API:
+
+```java
+@Component
+public class FraudFilter {
+
+    // per-IP click counter with a short TTL — "how many clicks from this IP recently?"
+    private final RateCounter ipRate = new RateCounter(Duration.ofMinutes(1));
+
+    // refreshed from config/Redis — known-bad IPs, datacenter ranges, banned devices
+    private volatile Set<String> ipBlocklist = Set.of();
+
+    /** returns true if the click looks fake and should be dropped. */
+    public boolean isFraud(ClickEvent c) {
+        // 1. hard blocklist — known bad actor
+        if (ipBlocklist.contains(c.ip)) return true;
+
+        // 2. rate limit — one IP can't legitimately click 500x/min
+        if (ipRate.increment(c.ip) > 100) return true;
+
+        // 3. impossible speed — clicked 5ms after seeing the ad = script, not human
+        if (c.clickTimeMs - c.impressionTimeMs < 50) return true;
+
+        // 4. datacenter / headless signals (bots rarely run on real phones)
+        if (c.isDatacenterIp || c.isHeadlessBrowser) return true;
+
+        return false;   // looks human → let it through to be counted
+    }
+}
+```
+
+Reading that filter line by line:
+
+- **`RateCounter ipRate` (1-minute TTL)** — a per-IP tally that only remembers *recent* clicks (the count fades after a minute), so it answers "how many times has this IP clicked lately?" without storing forever. (Same TTL trick as the dedup state in §7.)
+- **`volatile Set<String> ipBlocklist`, refreshed from Redis/config** — the bad-IP list can be updated at runtime **without a redeploy**, so ops (or an auto-detector) can block a new attacker in seconds. (Same live-config pattern as the "hot ad list" in §8.)
+- **Each `if` = one signal from the table above**, and every check is judgeable from a **single click in isolation** — that's exactly what makes it cheap enough to run in real time.
+
+Wire it into ingestion — fraud clicks never reach the counter:
+
+```java
+public void ingest(ClickEvent c) {
+    enrich(c);                              // geo-IP, campaign (see above)
+
+    if (fraudFilter.isFraud(c)) {
+        c.isFraud = true;
+        s3.archive(c);                      // STILL archived (for audit + ML training)
+        return;                             // but NOT sent to the counting pipeline
+    }
+
+    kafka.send("clicks", c.adId, c);        // clean click → counted normally
+}
+```
+
+The two lines that carry all the weight:
+
+- **`return;` before `kafka.send`** — this is the whole point. A fraud click **never enters Kafka**, so the counting machines never see it, so it can't inflate the count or the bill.
+- **`s3.archive(c)` even for fraud** — we never truly throw the click away. It's kept for two reasons: (1) if the filter was too aggressive and flagged a real person, the nightly Layer-2 job can re-read the record and add it back; (2) flagged clicks become **training data** for the ML models.
+
+**Layer 2** — the batch job (this is the `AND is_fraud = false` you already saw in the §9 reconciliation query). Overnight, ML models look at the *whole* day and spot patterns a single-click rule can't: "these 40,000 clicks all had zero conversions, came from 3 device fingerprints, and clicked in a perfectly even rhythm → fraud ring." Those get marked fraudulent and **refunded** in reconciliation.
+
+#### Q: Why not just do it all in real time?
+
+Because the strongest signals **need the full picture**, which you don't have at click-time:
+
+- "This ad got **zero conversions** all day" — you can't know that on click #1.
+- "These clicks form a **coordinated pattern** across 10,000 IPs" — invisible looking at one click alone.
+
+So real-time catches the **obvious** stuff fast (protects live dashboards + billing from wild inflation), and the batch layer catches the **subtle** stuff accurately (protects the final invoice).
+
+This is the **same fast-but-approximate + slow-but-exact split** that shows up everywhere in this design — it's the recurring theme, not a coincidence:
+
+| Concern | Fast path | Slow path |
+| --- | --- | --- |
+| **Fraud** (this section) | Layer 1 real-time rule filter | Layer 2 nightly ML pass |
+| **Counting** (Lambda, §9) | streaming rollups (approximate) | batch reconciliation (exact) |
+| **Late events** (§7) | flush on watermark (may miss stragglers) | correction/batch job fixes them |
+
+The fast path protects **freshness** (live numbers now); the slow path guarantees **accuracy** (the final invoice).
+
+#### Q: What if we wrongly flag a real click (false positive)?
+
+That's why we **archive even the dropped clicks to S3** (`s3.archive(c)` above). Nothing is truly deleted — if a filter was too aggressive, the batch layer can re-examine the raw record and add legit clicks back. We'd rather review from the full record than lose data forever.
+
+> **One line:** a bot is caught by *behaving inhumanly* — too fast, too many, wrong origin, no conversions. We score clicks on those signals in a **fast rule-based filter before counting** (blocklists + rate limits), then a **heavier ML/batch pass during reconciliation** catches the subtle fraud and refunds it.
+
 ---
 
 ## 6. Aggregation (windowing)
 
 Aggregate counts over **time windows** keyed by `ad_id`.
 
-| Window | Meaning |
-| --- | --- |
+
+| Window       | Meaning                                                              |
+| ------------ | -------------------------------------------------------------------- |
 | **Tumbling** | Fixed, non-overlapping (per-minute buckets) — most common for counts |
-| **Sliding** | Overlapping (last 5 min, updated each min) |
-| **Session** | Grouped by activity gaps |
+| **Sliding**  | Overlapping (last 5 min, updated each min)                           |
+| **Session**  | Grouped by activity gaps                                             |
+
 
 ```
 key = (ad_id, minute_bucket)
@@ -302,8 +434,9 @@ ad_id | minute | country | campaign | clicks
 ```
 
 Why it stays manageable:
+
 - **Only combos that actually got a click create rows.** 3 countries clicked → 3 rows, not 200.
-- **Still a massive win.** 50,000 clicks → ~5 summary rows (vs 50,000 raw rows). Billions/day of raw (~1.5 TB) collapses to a tiny table.
+- **Still a massive win.** 50,000 clicks → ~~5 summary rows (vs 50,000 raw rows). Billions/day of raw (~~1.5 TB) collapses to a tiny table.
 
 **The real dial = cardinality** (number of *distinct combinations*), which is multiplicative:
 
@@ -405,17 +538,20 @@ Event time keeps history accurate — and creates the puzzle: *if a 2:05 click c
 
 Billing can't over/under-count.
 
-| Problem | Handling |
-| --- | --- |
-| **Duplicate clicks** (retries, at-least-once Kafka) | Each event carries a unique **`click_id`**; **dedup** in the processor's keyed state store (with TTL per window) |
-| **Late events** (mobile offline, network) | **Watermarks + allowed lateness**; update the window if within grace, else route very-late events to a **correction/batch** job |
-| **Exactly-once counts** | Flink **checkpoints** + **transactional (two-phase-commit) sinks** (Kafka EOS / transactional OLAP write) → exactly-once aggregation |
-| **Fraud/bots** | Filtering stage (rate limits, ML) **before** counting |
-| **Reprocessing** | Raw events in S3 → **replay** to rebuild aggregates if logic changes / a bug is found |
+
+| Problem                                             | Handling                                                                                                                             |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **Duplicate clicks** (retries, at-least-once Kafka) | Each event carries a unique `**click_id`**; **dedup** in the processor's keyed state store (with TTL per window)                     |
+| **Late events** (mobile offline, network)           | **Watermarks + allowed lateness**; update the window if within grace, else route very-late events to a **correction/batch** job      |
+| **Exactly-once counts**                             | Flink **checkpoints** + **transactional (two-phase-commit) sinks** (Kafka EOS / transactional OLAP write) → exactly-once aggregation |
+| **Fraud/bots**                                      | Filtering stage (rate limits, ML) **before** counting                                                                                |
+| **Reprocessing**                                    | Raw events in S3 → **replay** to rebuild aggregates if logic changes / a bug is found                                                |
+
 
 ### Plain-English: watermarks & late events
 
 Dilemma: bucket by event time (§6), but a 2:05 click may arrive at 2:08. **When is it safe to finalize 2:05?**
+
 - Flush too **early** → miss late clicks → undercount → underbill.
 - Flush too **late** → stale dashboards, memory fills.
 
@@ -512,10 +648,12 @@ We **don't** retroactively edit a finalized/billed count; stragglers go to a **c
 
 Two different "counted twice" problems (people mix them up):
 
-| Problem | Cause | Fix |
-| --- | --- | --- |
-| **Duplicate clicks** | Same click enters twice (network **retries**; Kafka is at-least-once) | **Dedup by `click_id`** |
-| **Reprocessing after a crash** | Consumer dies, re-reads clicks it already counted / loses memory | **Exactly-once** (checkpoints + offsets + idempotent sink) |
+
+| Problem                        | Cause                                                                 | Fix                                                        |
+| ------------------------------ | --------------------------------------------------------------------- | ---------------------------------------------------------- |
+| **Duplicate clicks**           | Same click enters twice (network **retries**; Kafka is at-least-once) | **Dedup by `click_id`**                                    |
+| **Reprocessing after a crash** | Consumer dies, re-reads clicks it already counted / loses memory      | **Exactly-once** (checkpoints + offsets + idempotent sink) |
+
 
 #### Problem 1 — Duplicate clicks → dedup by `click_id`
 
@@ -711,11 +849,13 @@ Price of salting = that **extra combine stage**. You usually salt only **detecte
 
 **No per-incident deploys.** Options, naive → production:
 
-| Option | How | Verdict |
-| --- | --- | --- |
-| **A. Hardcode + redeploy** | `Set.of("123","456")` in code; edit + redeploy when an ad goes viral | ❌ Too slow (spikes happen in seconds); nobody does this |
-| **B. Always salt, driven by config** | Keep a "hot ad list" in Redis/config, refreshed at runtime; salting code already deployed & dormant; flip an ad on by adding it to the set (can be **auto-detected** by a throughput monitor) | ✅ Common — zero deploys |
-| **C. Salt everything, always** | Every ad keyed `adId + "-" + salt`; always run the combine stage | ✅ Simplest ops; pay combine cost even for tiny ads; fine at huge scale |
+
+| Option                               | How                                                                                                                                                                                           | Verdict                                                                |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **A. Hardcode + redeploy**           | `Set.of("123","456")` in code; edit + redeploy when an ad goes viral                                                                                                                          | ❌ Too slow (spikes happen in seconds); nobody does this                |
+| **B. Always salt, driven by config** | Keep a "hot ad list" in Redis/config, refreshed at runtime; salting code already deployed & dormant; flip an ad on by adding it to the set (can be **auto-detected** by a throughput monitor) | ✅ Common — zero deploys                                                |
+| **C. Salt everything, always**       | Every ad keyed `adId + "-" + salt`; always run the combine stage                                                                                                                              | ✅ Simplest ops; pay combine cost even for tiny ads; fine at huge scale |
+
 
 Option B in code:
 
@@ -743,6 +883,7 @@ public class SaltingKeyResolver {
 ```
 
 **New topic?** Two ways to do the combine stage:
+
 - **Way 1 — same topic, combine in memory (no new topic):** if one instance owns all salted slices for an ad, strip the salt while counting and merge in its own map. (Usually slices are spread across instances, so this is limited.)
 - **Way 2 — a second topic for partials (common):** stage-1 consumers write to a `partial-counts` topic; a stage-2 combiner reads it, strips salt, sums.
 
@@ -758,11 +899,13 @@ That extra topic is a **one-time, permanent pipeline component created at design
 
 Billing wants **accuracy**; dashboards want **freshness**.
 
-| | **Lambda** | **Kappa** |
-| --- | --- | --- |
-| Paths | **Batch** (accurate, slow) + **Streaming** (fast, approximate) | **Streaming only** (reprocess by replaying the log) |
-| Pros | Batch corrects streaming's approximations | One codebase; simpler |
-| Cons | Two codebases to maintain | Relies on a replayable log + strong exactly-once stream processing |
+
+|       | **Lambda**                                                     | **Kappa**                                                          |
+| ----- | -------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Paths | **Batch** (accurate, slow) + **Streaming** (fast, approximate) | **Streaming only** (reprocess by replaying the log)                |
+| Pros  | Batch corrects streaming's approximations                      | One codebase; simpler                                              |
+| Cons  | Two codebases to maintain                                      | Relies on a replayable log + strong exactly-once stream processing |
+
 
 ```
 Lambda: fast streaming rollups for live dashboards
@@ -840,11 +983,13 @@ Flow: dashboard shows streamed number now → overnight batch computes exact →
 
 Yes, **replay exists in both** — it's not the distinguishing factor. The difference is **codebases**:
 
-| | **Lambda** | **Kappa** |
-| --- | --- | --- |
+
+|              | **Lambda**                                        | **Kappa**                                          |
+| ------------ | ------------------------------------------------- | -------------------------------------------------- |
 | Reprocessing | Yes — a **separate batch job** recomputes from S3 | Yes — **replay the log through the streaming job** |
-| Codebases | **Two** (stream + batch) — can drift | **One** (stream only) |
-| Needs | — | Trustworthy exactly-once stream + a replayable log |
+| Codebases    | **Two** (stream + batch) — can drift              | **One** (stream only)                              |
+| Needs        | —                                                 | Trustworthy exactly-once stream + a replayable log |
+
 
 In **Lambda** the batch layer is a **separate program** (often a different tool, e.g. Spark SQL) that reprocesses S3 — two implementations of the same logic that can drift. In **Kappa** there's **no separate batch layer**; you replay the **same** streaming job. This is literally the argument Kappa's creator made: *if your stream can replay and get the exact answer, the batch layer is redundant — delete it.* So: replay a **separate batch program** = Lambda; replay the **same streaming program** with no batch layer = Kappa. Kappa needs the streaming layer to be trustworthy enough (solid exactly-once, replayable log) that you don't need a batch safety net.
 
@@ -893,12 +1038,14 @@ CREATE TABLE ads ( ad_id BIGINT PRIMARY KEY, campaign_id BIGINT, advertiser_id B
 
 **OLAP = Online Analytical Processing** — a *category* of database built to **answer aggregation/summary queries over huge data, fast**. In our design the "results / aggregate store" feeding dashboards is OLAP (**Druid**, **ClickHouse**). Contrast with the OLTP DBs you're used to:
 
-| | **OLTP** (MySQL, Postgres) | **OLAP** (ClickHouse, Druid) |
-| --- | --- | --- |
-| Built for | Many small reads/writes of **individual rows** | **Summarizing** millions of rows (SUM, COUNT, GROUP BY) |
-| Typical query | "Get user 123's profile" / "update this order" | "Total clicks per country per hour this month" |
-| Stores data by | **Row** (all of a row's fields together) | **Column** (each field stored together) |
-| Sweet spot | App backends, transactions | Analytics, dashboards, reporting |
+
+|                | **OLTP** (MySQL, Postgres)                     | **OLAP** (ClickHouse, Druid)                            |
+| -------------- | ---------------------------------------------- | ------------------------------------------------------- |
+| Built for      | Many small reads/writes of **individual rows** | **Summarizing** millions of rows (SUM, COUNT, GROUP BY) |
+| Typical query  | "Get user 123's profile" / "update this order" | "Total clicks per country per hour this month"          |
+| Stores data by | **Row** (all of a row's fields together)       | **Column** (each field stored together)                 |
+| Sweet spot     | App backends, transactions                     | Analytics, dashboards, reporting                        |
+
 
 The magic word is **columnar storage**. Our query is usually "SUM the `clicks` column, GROUP BY country." A columnar DB stores all `clicks` values physically together, so it reads just that column and blazes through the sum, ignoring `ad_id`, `campaign`, etc. A row DB (MySQL) must walk every full row. That's why OLAP aggregates billions of rows in a fraction of a second.
 
@@ -929,31 +1076,35 @@ Nightly batch over S3 raw events → recompute exact per-ad totals → compare w
 
 ## 12. Consistency & Failure
 
-| Concern | Handling |
-| --- | --- |
-| Double-count | `click_id` dedup + exactly-once processing |
-| Late/out-of-order | Event-time windows + watermarks + allowed lateness; correction job for very-late |
-| Hot ad | Key salting → partial aggregates → sum |
-| Processor crash | Flink checkpoints → resume exactly-once; Kafka retains offsets |
-| Bad logic / bug | Reprocess from S3 raw events (Event Sourcing) |
-| Dashboard vs billing mismatch | Dashboards approximate (fast); billing reconciled from raw (accurate) |
-| Fraud inflation | Filter before counting; post-hoc clawback via reconciliation |
+
+| Concern                       | Handling                                                                         |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| Double-count                  | `click_id` dedup + exactly-once processing                                       |
+| Late/out-of-order             | Event-time windows + watermarks + allowed lateness; correction job for very-late |
+| Hot ad                        | Key salting → partial aggregates → sum                                           |
+| Processor crash               | Flink checkpoints → resume exactly-once; Kafka retains offsets                   |
+| Bad logic / bug               | Reprocess from S3 raw events (Event Sourcing)                                    |
+| Dashboard vs billing mismatch | Dashboards approximate (fast); billing reconciled from raw (accurate)            |
+| Fraud inflation               | Filter before counting; post-hoc clawback via reconciliation                     |
+
 
 ---
 
 ## 13. Design Patterns (that can be used)
 
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Producer-Consumer** | Ingest → Kafka → stream processors | Absorb + parallelize firehose |
-| **Windowed Aggregation (stream)** | Tumbling/sliding windows by event time | Core rollup |
-| **Idempotency / Dedup** | `click_id` dedup in processor | No double-count |
-| **CQRS + Materialized View** | Pre-aggregated rollups vs raw events | Fast queries |
-| **Lambda / Kappa** | Batch+stream vs stream-only | Accuracy vs freshness |
-| **Event Sourcing** | Raw event log as truth; replay to rebuild | Reprocessing/audit |
-| **Sketch / Probabilistic (HLL)** | Approx unique counts | Cheap cardinality |
-| **Sharding / Partitioning (+ salting)** | Kafka + store partitioned by ad_id; salt hot keys | Scale + skew |
-| **Watermark** | Handle late/out-of-order events | Correct windows |
+
+| Pattern                                 | Where                                             | Why                           |
+| --------------------------------------- | ------------------------------------------------- | ----------------------------- |
+| **Producer-Consumer**                   | Ingest → Kafka → stream processors                | Absorb + parallelize firehose |
+| **Windowed Aggregation (stream)**       | Tumbling/sliding windows by event time            | Core rollup                   |
+| **Idempotency / Dedup**                 | `click_id` dedup in processor                     | No double-count               |
+| **CQRS + Materialized View**            | Pre-aggregated rollups vs raw events              | Fast queries                  |
+| **Lambda / Kappa**                      | Batch+stream vs stream-only                       | Accuracy vs freshness         |
+| **Event Sourcing**                      | Raw event log as truth; replay to rebuild         | Reprocessing/audit            |
+| **Sketch / Probabilistic (HLL)**        | Approx unique counts                              | Cheap cardinality             |
+| **Sharding / Partitioning (+ salting)** | Kafka + store partitioned by ad_id; salt hot keys | Scale + skew                  |
+| **Watermark**                           | Handle late/out-of-order events                   | Correct windows               |
+
 
 ---
 
@@ -989,3 +1140,4 @@ Nightly batch over S3 raw events → recompute exact per-ad totals → compare w
 
 - [Apache Kafka](../concepts/kafka.md) — ingest backbone + exactly-once
 - [Video Streaming](video-streaming-system-design.md) (view counting) · [Leaderboard](leaderboard-system-design.md) · [Databases — Deep Dive](../concepts/databases-deep-dive.md) (OLAP/column stores)
+
