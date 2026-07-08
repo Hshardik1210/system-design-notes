@@ -2,7 +2,7 @@
 
 > **Core challenge:** match a **rider** to the best nearby **driver** in real time, track the trip live, price it (with **surge**), and settle payment — geospatially, at massive scale, with **seconds** of matching latency. Signature problems: **real-time geo-matching/dispatch**, a **location firehose**, **ETA/routing**, and **surge pricing**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (real-world Uber/Ola analogies, annotated example code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated example code, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -39,7 +39,7 @@ Rider requests → Matching finds the best nearby available driver → driver ac
 
 A two-sided real-time marketplace (**riders** + **drivers**) connected by a **dispatch/matching engine** over a **geospatial index** of live driver locations. (Same family as food-delivery dispatch, minus the restaurant prep leg.)
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
 Picture opening the Uber app. You tap "Where to?", see a few little car icons floating near you on the map, request a ride, and within seconds a driver's photo and car appear — "Ramesh is 3 minutes away." Then you watch his car crawl toward you on the map in real time. That entire experience is the system.
 
@@ -51,9 +51,9 @@ Break it into the jobs it has to do:
 4. **Track the trip live.** Stream the driver's GPS to your phone so the map animates.
 5. **Price and charge.** Compute the fare (higher when demand is hot = **surge**) and settle payment at the end.
 
-So it's really **"Google Maps + a super-fast matchmaker + a payment system,"** all running in real time. Everything else in this doc is a detail of one of those five jobs.
+So it's really **"Google Maps + a real-time matching engine + a payment system,"** all running in real time. Everything else in this doc is a detail of one of those five jobs.
 
-### Plain-English: why is this genuinely hard?
+### Why is this genuinely hard?
 
 The scary part isn't any single feature — it's the **combination of real-time + geographic + huge scale**:
 
@@ -77,7 +77,7 @@ Keep this split in mind — it explains almost every technology choice below (Re
 - **Low matching latency** (seconds), **real-time** location, **high availability**, huge scale, **geo-accuracy**.
 - **Strong consistency** for trips/payments; **eventual** for location/discovery.
 
-### Plain-English: "functional vs non-functional," and the one line that matters most
+### "Functional vs non-functional," and the one line that matters most
 
 - **Functional** = *what buttons exist* — the features a rider/driver can actually do (request, accept, track, pay, rate).
 - **Non-functional** = *how well it must behave* — fast, always-up, correct, huge scale. No button, but if it's missing the product fails.
@@ -119,7 +119,7 @@ Storage:
 
 > Two cost centers: the **location firehose** (250k writes/sec) → Redis + stream, and **matching latency** → an in-memory geo index. The trip/payment DB is small but must be strongly consistent.
 
-### Plain-English: where do these numbers come from, and why do they matter?
+### Where do these numbers come from, and why do they matter?
 
 Capacity estimation = **back-of-the-envelope math to find what will break first.** You're not being precise; you're finding the *monster*. Here the monster jumps out immediately.
 
@@ -177,7 +177,7 @@ GET  /v1/drivers/{id}/earnings
 
 > `estimate` returns a **quoteId** locking the surge/fare; `rides` is **idempotent** (a retried request tap doesn't create two rides). Offers/tracking use **WebSocket** for real-time push.
 
-### Plain-English: reading these endpoints like app taps
+### Reading these endpoints as app taps
 
 Every line above maps to something you literally do in the app:
 
@@ -212,7 +212,7 @@ public Ride requestRide(@RequestHeader("Idempotency-Key") String key,
 }
 ```
 
-Analogy: like a "reference number" on a bank transfer — send it twice with the same reference and the bank knows it's one transfer, not two.
+Repeats carrying the same key resolve to the single original ride, never a new one.
 
 #### Q: What's a `quoteId`, and why lock the price?
 
@@ -224,7 +224,7 @@ estimate  → { fare: 240, surge: 1.2, quoteId: "q_abc", expiresIn: 120s }   # p
 POST /rides { quoteId: "q_abc" }  → charged 240, NOT whatever surge is now
 ```
 
-Analogy: a flight-booking "price held for 10 minutes" timer.
+The quote simply has a short expiry window; within it, the fare you saw is the fare you pay.
 
 #### Q: Why WebSocket for offers and tracking instead of normal REST?
 
@@ -247,25 +247,23 @@ Rider/Driver apps → API Gateway / WebSocket gateways
               Kafka (RIDE_REQUESTED · DRIVER_ASSIGNED · TRIP_STARTED · TRIP_ENDED · location stream)
 ```
 
-### Plain-English: why chop it into all these services?
+### Why chop it into all these services?
 
-You *could* build one giant program that does everything. But its jobs have wildly different needs: matching must be lightning-fast and in-memory; trips must be rock-solid correct; the location firehose must absorb 250k writes/sec. Bundling them means one part's problem (a location spike) drowns the others (matching, payments). So we split into **specialists**, each scaled and tuned independently — this is **microservices**.
+You *could* build one giant program that does everything. But its jobs have wildly different needs: matching must be fast and in-memory; trips must be rock-solid correct; the location firehose must absorb 250k writes/sec. Bundling them means one part's problem (a location spike) drowns the others (matching, payments). So we split into **specialists**, each scaled and tuned independently — this is **microservices**.
 
-Think of it as an airport, each desk one service:
-
-| Service | Its one job | Analogy | Storage it likes |
-| --- | --- | --- | --- |
-| **Trip Service** | Own the ride's status (SEARCHING → … → COMPLETED) | The flight's official record | SQL (must be correct) |
-| **Matching / Dispatch** | Find + assign the best driver | The matchmaker | Redis GEO (in-memory, fast) |
-| **Location Service** | Swallow the GPS firehose | The radar tracking every plane | Redis + Kafka |
-| **Pricing Service** | Compute fare + surge | The fare board | Cache of surge zones |
-| **ETA / Routing** | "How long to drive there?" | Google Maps | Map graph + traffic |
-| **Payment Service** | Charge rider, pay driver | The cashier | SQL + ledger |
-| **Notification / Tracking** | Push updates to phones | The PA announcer | WebSocket connections |
+| Service | Its one job | Storage it likes |
+| --- | --- | --- |
+| **Trip Service** | Own the ride's status (SEARCHING → … → COMPLETED) | SQL (must be correct) |
+| **Matching / Dispatch** | Find + assign the best driver | Redis GEO (in-memory, fast) |
+| **Location Service** | Absorb the GPS firehose | Redis + Kafka |
+| **Pricing Service** | Compute fare + surge | Cache of surge zones |
+| **ETA / Routing** | "How long to drive there?" | Map graph + traffic |
+| **Payment Service** | Charge rider, pay driver | SQL + ledger |
+| **Notification / Tracking** | Push updates to phones | WebSocket connections |
 
 #### Q: What is Kafka doing in the middle, and why?
 
-Kafka is a **shared event log** — an append-only list of "things that happened" (`RIDE_REQUESTED`, `TRIP_ENDED`, …). When the Trip Service finishes a trip, it doesn't call the payment, analytics, and receipt services one by one (tight coupling, brittle). It just **shouts one event** onto Kafka; whoever cares subscribes.
+Kafka is a **shared event log** — an append-only list of "things that happened" (`RIDE_REQUESTED`, `TRIP_ENDED`, …). When the Trip Service finishes a trip, it doesn't call the payment, analytics, and receipt services one by one (tight coupling, brittle). It just **publishes one event** onto Kafka; whoever cares subscribes.
 
 ```
 Trip Service:  "TRIP_ENDED {trip 55, fare 240}"  ──►  Kafka
@@ -304,7 +302,7 @@ To answer "idle drivers within 3 km of pickup" fast, index driver locations by *
 candidates = GEOSEARCH drivers:online FROMLONLAT <lng> <lat> BYRADIUS 3 km ASC  filter status=idle
 ```
 
-### Plain-English: why "find nearby drivers" is secretly hard
+### Why "find nearby drivers" is secretly hard
 
 Naive idea: loop over every driver, compute distance to the rider, keep the close ones.
 
@@ -323,11 +321,9 @@ List<Driver> findNearby(double lat, double lng) {
 
 At 5,000 requests/sec that's 5,000 × 1,000,000 = **5 billion distance calculations per second.** Impossible. The problem: we check *everybody* even though 99.99% are in another part of the city.
 
-**The fix = a geospatial index.** Instead of one giant list, pre-sort drivers into **grid cells** (like neighborhoods). Then "nearby" becomes: figure out the rider's cell, look only in that cell + its neighbors. You touch a few hundred drivers, not a million.
+**The fix = a geospatial index.** Instead of one giant list, pre-sort drivers into **grid cells**. Then "nearby" becomes: figure out the rider's cell, look only in that cell + its neighbors. You touch a few hundred drivers, not a million — you never look at drivers in other parts of the city.
 
-Analogy: finding a friend in a stadium. You *don't* scan all 50,000 seats. They say "Section 118," you walk straight there and scan ~200 seats. **Sections = cells. The stadium map = the geo-index.**
-
-### Plain-English: geohash — turn a map into a grid of labeled boxes
+### Geohash — turn a map into a grid of labeled boxes
 
 A **geohash** chops the world into a grid and gives every cell a short string label. The magic property: **cells that are near each other share the same prefix.**
 
@@ -381,7 +377,7 @@ Because you might be standing at the **edge** of your box. The closest driver co
 └─────┴─────┴─────┘
 ```
 
-### Plain-English: quadtree — a grid that adapts to crowds
+### Quadtree — a grid that adapts to crowds
 
 Geohash cells are all the *same size*. Problem: downtown at rush hour has 5,000 drivers in one cell (too many to scan), while a rural cell has 2 (wastefully sparse). A **quadtree** fixes this by **splitting a cell into 4 only when it gets too crowded**:
 
@@ -402,7 +398,7 @@ Keep splitting the crowded ones. Leave empty countryside as big squares.
 
 Result: **dense areas → deep, tiny cells; sparse areas → shallow, big cells.** Every cell holds roughly the same manageable number of drivers. Trade-off: it's a tree you must rebalance as drivers move, more complex than a flat geohash grid.
 
-### Plain-English: S2 (Google) and H3 (Uber) — the pro versions
+### S2 (Google) and H3 (Uber) — the advanced versions
 
 - **S2** wraps the grid around the **globe as a sphere** (geohash's flat grid distorts near the poles and at the ±180° date line) and numbers cells along a space-filling **Hilbert curve** so nearby cells get nearby numbers — great for range queries.
 - **H3 (Uber's own)** uses **hexagons** instead of squares. Why hexagons? Every neighbor of a hexagon is the **same distance** away (a square has close edge-neighbors but farther corner-neighbors). That uniformity makes "supply vs demand *per cell*" — which drives **surge pricing** (§11) — clean and fair, and makes radius search tidy.
@@ -426,7 +422,7 @@ Hexagon grid: all 6 neighbors are equidistant  ⬡  ← why Uber picked it
 | H3 | Equal-distance neighbors | **Hexagon** | Via resolution |
 | Redis GEO | Ready-made `GEOSEARCH` | (geohash under the hood) | No, but *practical* |
 
-### Plain-English: Redis GEO — what you actually use in production
+### Redis GEO — what you actually use in production
 
 You rarely hand-code the above. **Redis GEO** gives you geospatial search out of the box (it uses geohashes internally). Two commands do almost everything:
 
@@ -445,7 +441,7 @@ Because it lives **in memory (RAM)**, not on disk. Redis just moves a point in a
 
 #### Q: Why "shard the geo-index by city/region"?
 
-A rider in Bangalore never needs a driver in Delhi. So keep a **separate index per city**. Benefits: each index is smaller (faster search), and a problem in one city's index doesn't touch another's (**isolation**). It's the stadium idea one level up: don't search the *country* for your friend, search their *stadium*.
+A rider in Bangalore never needs a driver in Delhi. So keep a **separate index per city**. Benefits: each index is smaller (faster search), and a problem in one city's index doesn't touch another's (**isolation**). It's the same locality principle one level up: don't search the whole country, only the relevant city.
 
 ---
 
@@ -488,9 +484,9 @@ Every 1–2 seconds, over a POOL of open requests + available drivers:
 
 > **Interview framing:** candidate generation via the **geo index** → **scoring** (ETA/rating/direction, often ML) → **offer/timeout/fallback loop** → **atomic claim**; batch-match in dense markets. Emphasize ETA-by-road, not straight-line.
 
-### Plain-English: matching is a 3-step funnel
+### Matching is a 3-step funnel
 
-Once §6 gives us "cars roughly nearby," matching narrows that to *one* driver. Think of it as a funnel:
+Once §6 gives us "cars roughly nearby," matching narrows that to *one* driver. It's a funnel:
 
 ```
 1. GENERATE candidates  →  geo-index gives ~20 nearby idle drivers   (the shortlist)
@@ -498,9 +494,9 @@ Once §6 gives us "cars roughly nearby," matching narrows that to *one* driver. 
 3. OFFER loop + CLAIM   →  ask #1; no? ask #2; on yes, LOCK the car   (the handoff)
 ```
 
-Analogy: booking a plumber. First find plumbers in your area (generate), then rank by rating/how-soon-they-can-come (score), then call the best — if they don't pick up, call the next (offer loop) — and once one says yes, mark them booked so nobody else grabs them (claim).
+Generate the shortlist from the geo-index, rank it by score, then offer to the best candidate; if they decline or time out, offer the next; once one accepts, lock them so no other ride can grab them.
 
-#### Step 2 in plain code — "best" is NOT "closest in a straight line"
+#### Step 2 in code — "best" is NOT "closest in a straight line"
 
 The nearest car *as the crow flies* might be across a river with a 20-minute detour. So we score by **real driving time (ETA via routing)**, plus a few other factors:
 
@@ -560,7 +556,7 @@ Rider A: SET driver:42:lock A NX  → OK true   ✅ A gets the driver
 Rider B: SET driver:42:lock B NX  → nil false ❌ B is told "taken", offers its next candidate
 ```
 
-Analogy: two people reaching for the last item in a shop — the till (Redis) rings up whoever's hand lands first; the other is told "sold out," no argument.
+Redis guarantees only the first `SET NX` succeeds; the second is rejected, so exactly one rider wins the driver and the other moves on.
 
 #### Q: Greedy vs batch matching — when and why?
 
@@ -603,9 +599,9 @@ REQUESTED ─match→ DRIVER_ASSIGNED ─arrive→ DRIVER_ARRIVED ─start→ IN
 
 Trip Service **owns** the state machine; every transition writes `trip_status_history` and emits a Kafka event (tracking/pricing/notifications/analytics).
 
-### Plain-English: a trip is a board game piece moving through squares
+### The trip state machine
 
-A **state machine** just means: a trip is always in exactly **one** named state, and it can only move along **allowed arrows** to the next state. Like a board-game token: from "GO" you can only move to the next square — you can't teleport to "COMPLETED" without passing through the ones between.
+A **state machine** just means: a trip is always in exactly **one** named state, and it can only move along **allowed transitions** to the next state. A trip can't jump to "COMPLETED" without passing through the states between.
 
 The states map to what you *see* in the app:
 
@@ -656,7 +652,7 @@ This is **optimistic concurrency**: don't lock up front; instead let the `WHERE 
 
 #### Q: Why write `trip_status_history` and fire a Kafka event on *every* transition?
 
-- **History** = a receipt/black-box of the ride (`REQUESTED at 8:00, ASSIGNED at 8:01…`). Priceless for disputes ("driver started the meter before I got in"), support, and analytics.
+- **History** = a full timestamped record of the ride (`REQUESTED at 8:00, ASSIGNED at 8:01…`). Priceless for disputes ("driver started the meter before I got in"), support, and analytics.
 - **Kafka event** = the announcement so *other* services react without the Trip Service calling each one: `TRIP_ENDED` → Payment charges, Notification sends a receipt, Analytics updates dashboards (the Pub-Sub fan-out from §5).
 
 ---
@@ -676,7 +672,7 @@ Driver app ──GPS every ~4s──► Location Service
 - **Adaptive ping rate** (faster near pickup, slower when far) saves battery/bandwidth.
 - WebSocket gateways manage rider/driver connections (same connection-registry idea as the chat system).
 
-### Plain-English: what happens to one GPS ping?
+### What happens to one GPS ping?
 
 Every ~4 seconds each driver's phone sends "I'm at (lat, lng)." Follow **one** ping through the system and notice it does **three cheap things and never touches the SQL DB**:
 
@@ -692,7 +688,7 @@ Driver phone: "driver 42 is at (12.9716, 77.5946)"  ──►  Location Service
       └─(4, only if driver 42 is ON a trip)─►  push over WebSocket to that rider's phone → map animates
 ```
 
-Analogy: air-traffic control radar. Every plane constantly reports its position; the radar screen just **overwrites** the plane's dot to the new spot. It doesn't keep a fresh log entry for every blip on an accountant's ledger — that would be insane. Same here: we overwrite the driver's dot; we don't `INSERT` a database row per ping.
+Each ping just **overwrites** the driver's latest position (`GEOADD` and `SET` both replace the existing value). We don't `INSERT` a database row per ping — that would accumulate 250k throwaway rows per second for data we only need the newest value of.
 
 #### Q: Why can these 250k pings/sec NOT go into the trips database?
 
@@ -741,7 +737,7 @@ Millions of phones hold an **open connection** (so the server can push instantly
 - Real maps use **contraction hierarchies** (precomputed shortcuts) — not live Dijkstra continent-wide (see the Maps note).
 - ETA is often **ML-adjusted** from historical trips (time of day, weather); treat as a black box, emphasize inputs + continuous refinement + push updates.
 
-### Plain-English: "how many minutes away?" is a road problem, not a ruler problem
+### "How many minutes away?" is a road problem, not a ruler problem
 
 ETA = estimated time of arrival. The naive version measures the **straight-line** distance between two points and divides by an average speed. That's wrong for cities:
 
@@ -752,7 +748,7 @@ Reality: a river is between you; the only bridge is 3 km away → actually 12 mi
 
 So we compute ETA over the **road network** — a graph where intersections are nodes and roads are edges weighted by how long they take to drive (with **live traffic** making some edges "heavier"). Finding the fastest path is a shortest-path search.
 
-Analogy: it's literally what Google Maps does when it says "13 min, fastest route." Ride-hailing calls the same kind of engine (OSRM / Google Maps / Valhalla) for two things: **ETA-to-pickup** (used to *score* drivers in §7) and **trip duration/distance** (used to *price* the fare in §11).
+This is what Google Maps does when it says "13 min, fastest route." Ride-hailing calls the same kind of engine (OSRM / Google Maps / Valhalla) for two things: **ETA-to-pickup** (used to *score* drivers in §7) and **trip duration/distance** (used to *price* the fare in §11).
 
 ```java
 // Conceptual: shortest path over the road graph, edges weighted by live drive-time.
@@ -771,7 +767,7 @@ No — that would be far too slow. Real map engines **precompute shortcuts** so 
 - **Contraction hierarchies:** precompute fast "highway-like" shortcut edges between important nodes, so a live query hops via shortcuts instead of crawling every small street. (Details in the Maps note.)
 - **Cell-to-cell precomputation:** precompute typical travel times between geo-cells; use those for instant rough estimates, then refine the last leg with live data.
 
-Analogy: you don't re-plan a cross-country drive turn-by-turn every time — you know "take NH-44, ~6 hours" (the shortcut) and only think hard about the local streets at each end.
+The precomputed highway-like shortcuts handle the long haul ("take NH-44, ~6 hours"), so a live query only does detailed search over the local streets at each end instead of every small street along the way.
 
 #### Q: Why is ETA "ML-adjusted," and how should I talk about it in an interview?
 
@@ -794,7 +790,7 @@ fare = base_fare + per_km × distance + per_min × duration
 - Surge **sheds/shifts demand** (some riders wait) and **pulls drivers** toward hot cells (they see a heatmap).
 - **Lock the quote** at estimate time (idempotent `quoteId`) so the price doesn't jump between estimate and request.
 
-### Plain-English: surge is just "demand ÷ supply" per neighborhood
+### Surge is just "demand ÷ supply" per neighborhood
 
 When it's raining and everyone wants a ride but few drivers are around, prices go up. That's **surge**, and the formula is intuitive: **more people wanting rides than cars available → multiply the fare.**
 
@@ -832,7 +828,7 @@ It's a **self-balancing lever** pulling both sides toward equilibrium:
 - **Sheds demand:** at 2.5× some riders decide to wait or take the bus → fewer requests → the ones who really need a ride get a car.
 - **Pulls supply:** drivers see a **heatmap** of surging cells and *drive toward* the money → more cars show up where they're needed → surge naturally falls back to 1×.
 
-Analogy: airline/hotel prices rising on peak dates — high price nudges some travelers to shift plans and encourages more capacity, smoothing the crunch.
+It's the same dynamic as airline or hotel prices rising on peak dates: a higher price nudges some to shift plans and draws more supply, smoothing the crunch.
 
 #### Q: Why "lock the quote"? What's the bug it prevents?
 
@@ -855,7 +851,7 @@ This makes pricing **predictable and fair**: the number you agreed to is the num
 - **Refunds/adjustments** for disputes; **outbox** so a completed trip reliably triggers charge + payout.
 - **Upfront pricing** (charge the quoted fare) vs metered (compute from actual distance/time).
 
-### Plain-English: one fare splits into two pockets
+### One fare splits two ways
 
 When your trip ends and you pay ₹240, that money doesn't all go to the driver. It **splits**: the driver gets a payout, the platform keeps a commission.
 
@@ -895,7 +891,7 @@ void completeTrip(Trip trip) {
 }                                                      // crash after this? the event is safely stored → relay sends it later
 ```
 
-Analogy: instead of *hoping* you remember to post a letter after doing a task, you drop the letter in your **outbox tray** as part of the task itself; the mail carrier (relay) is guaranteed to pick it up, even if you faint right after.
+Because the trip write and the outbox write share one transaction, the event can't be lost even if the service crashes right after committing — a separate relay ships the stored outbox rows later.
 
 #### Q: Why an "idempotent charge"? And upfront vs metered?
 
@@ -938,20 +934,20 @@ CREATE TABLE outbox ( id BIGINT PRIMARY KEY, event_type VARCHAR(50), payload JSO
 
 > Live driver positions = **Redis GEO** (`drivers:online`) + `loc:driver:{id}`, **not a table**. Surge = a small hot table/cache updated by a stream job.
 
-### Plain-English: reading the schema as the story of a ride
+### Reading the schema
 
-Each table is a noun in the ride story. Group them by job:
+Each table maps to one part of a ride. Group them by job:
 
-| Table(s) | What it holds | Story role |
+| Table(s) | What it holds | Role |
 | --- | --- | --- |
-| `riders`, `drivers`, `vehicles` | The people and cars | The cast |
-| `trips` | The ride itself + its current `status` | The main plot (state machine, §8) |
-| `trip_status_history` | Every state change, timestamped | The ride's black-box recorder |
-| `ride_offers` | Who was offered, did they accept? | The matchmaking attempts (§7) |
-| `payments`, `driver_earnings` | Money in, money out | The cashier's books (§12) |
-| `surge_zones` | Multiplier per cell right now | The live fare board (§11) |
-| `reviews` | Ratings both ways | The after-trip feedback |
-| `outbox` | Pending "things to announce" | The guaranteed-delivery mail tray (§12) |
+| `riders`, `drivers`, `vehicles` | The people and cars | Core entities |
+| `trips` | The ride itself + its current `status` | The main record (state machine, §8) |
+| `trip_status_history` | Every state change, timestamped | Audit trail of the ride |
+| `ride_offers` | Who was offered, did they accept? | Matchmaking attempts (§7) |
+| `payments`, `driver_earnings` | Money in, money out | Payment records (§12) |
+| `surge_zones` | Multiplier per cell right now | Live pricing state (§11) |
+| `reviews` | Ratings both ways | After-trip feedback |
+| `outbox` | Pending events to publish | Reliable event delivery (§12) |
 
 #### Q: The `trips` table has an `idempotency_key UNIQUE` — what's that doing?
 
@@ -967,7 +963,7 @@ At Uber scale, trips are created on **many servers at once**, so a single auto-i
 
 #### Q: Why is there an index `idx_trips_rider ON trips(rider_id, requested_at DESC)`?
 
-Because the app constantly asks "show me *my* recent trips, newest first" (your ride history screen). Without an index the DB scans every trip ever; with it, the DB jumps straight to that rider's rows already in newest-first order. An **index** is like a book's index — go straight to the page instead of reading the whole book.
+Because the app constantly asks "show me *my* recent trips, newest first" (your ride history screen). Without an index the DB scans every trip ever; with it, the DB jumps straight to that rider's rows already in newest-first order, instead of scanning the whole table.
 
 #### Q: Why are driver locations deliberately **not** a table here?
 
@@ -1002,9 +998,9 @@ cancel(trip):  if status in [DRIVER_ASSIGNED, DRIVER_ARRIVED] → maybe cancella
                trip = CANCELLED; release driver lock; re-offer driver to pool; notify both
 ```
 
-### Plain-English: the whole ride as one connected story
+### The whole ride as one connected flow
 
-The sequence diagram looks busy, but it's just the earlier sections happening **in order**. Read it as a play, tapping through the app:
+The sequence diagram looks busy, but it's just the earlier sections happening **in order**. Read it top to bottom, tapping through the app:
 
 ```
 1. You tap Confirm            → Trip Service creates trip = REQUESTED, shouts RIDE_REQUESTED on Kafka   (§4, §8)
@@ -1038,7 +1034,7 @@ If you cancel after a driver was assigned, that driver is still holding your ato
 | Trip state races (multi-actor) | State machine + `UPDATE ... WHERE status = <expected>` |
 | Driver on 2 trips | Claim lock + `drivers.status=ON_TRIP` guard |
 
-### Plain-English: this table is a "what could go wrong?" checklist
+### A "what could go wrong?" checklist
 
 Every row is a **real-world thing that would break** and the guard that stops it. They're not new ideas — they're the safety mechanisms from earlier sections, gathered in one place. The mental pattern: *for each place two things happen at once or a message could be lost, name the guard.*
 

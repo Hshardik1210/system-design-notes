@@ -2,7 +2,7 @@
 
 > **Core challenge:** download billions of web pages **at scale**, following links, **without re-crawling duplicates**, **respecting politeness** (don't hammer a site / obey robots.txt), staying **fresh**, and being **fault-tolerant**. The heart is the **URL frontier** (what to crawl next) + **dedup** + **politeness**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated code and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -35,23 +35,23 @@ Seed URLs → fetch page → parse links → filter/dedup new URLs → add to fr
 
 A giant BFS/priority traversal of the web graph, distributed across many crawler workers, coordinated by a **URL frontier** that balances **priority** and **politeness**.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
-Imagine a **robot librarian** let loose in the biggest library on Earth (the web). You hand it a few starting books (**seed URLs**). Its job:
+A web crawler starts from a few **seed URLs** and repeats a simple loop:
 
-1. Open a book (**fetch a page**).
-2. Copy it into the archive (**store the content** so search can index it later).
-3. Write down every reference it mentions (**extract links**) so it can visit those too.
-4. Go to the next book on its to-do list and repeat — **forever**, because new books keep appearing.
+1. **Fetch a page.**
+2. **Store the content** so search can index it later.
+3. **Extract links** so it can visit those pages too.
+4. Move to the next URL on its to-do list and repeat — **forever**, because new pages keep appearing.
 
-Two rules keep the robot sane and welcome:
+Two rules keep it scalable and well-behaved:
 
-- **Never read the same book twice** — the library has *billions* of books, many are copies, and re-reading wastes months of effort. (This is **dedup**.)
-- **Be a polite guest** — don't yank 500 books off one shelf per second and collapse it; take a few, wait, take a few more. (This is **politeness** / rate-limiting per site.)
+- **Never fetch the same page twice** — the web has *billions* of pages, many are duplicates, and re-fetching wastes enormous effort. (This is **dedup**.)
+- **Be polite** — don't send hundreds of requests per second to one site and overload it; space requests out. (This is **politeness** / rate-limiting per site.)
 
-That's the whole system. Everything else is just *"how does one robot become 10,000 robots that never trip over each other, never re-read a book, and never anger a librarian?"*
+That's the whole system. Everything else is just *"how does one crawler become 10,000 workers that never trip over each other, never re-fetch a page, and never overload a site?"*
 
-### Plain-English: why not just a simple recursive function?
+### Why not just a simple recursive function?
 
 First instinct: write `crawl(url)` that downloads a page, then calls itself on every link it finds.
 
@@ -127,11 +127,9 @@ DNS: one lookup per new host → cache aggressively (millions of hosts)
 - **Stateless fetcher/parser workers** scale horizontally; the **frontier** + **seen-URL store** hold the coordination state.
 - Stages decoupled by queues (Producer-Consumer) so fetch, parse, and index scale independently.
 
-### Plain-English: the crawl loop as a worker
+### The crawl loop as a worker
 
-**Analogy: a room full of identical robot librarians sharing one to-do clipboard.**
-
-The clipboard is the **frontier** (the to-do list of URLs). Each robot (a **worker**) does the same tiny loop over and over: grab the next URL off the clipboard, go fetch it, jot down any new links it finds, drop those back on the clipboard, repeat. Because every robot is identical and carries **no memory of its own** (all shared state lives on the clipboard + the "already-seen" ledger), you can add 10 or 10,000 robots and they just... help. That's what **"stateless workers scale horizontally"** means.
+All workers share one **frontier** (the to-do list of URLs). Each **worker** runs the same small loop over and over: pull the next URL from the frontier, fetch it, extract any new links, add those back to the frontier, repeat. Because every worker is identical and holds **no state of its own** (all shared state lives in the frontier + the "already-seen" set), you can add 10 or 10,000 workers and they all contribute. That's what **"stateless workers scale horizontally"** means.
 
 ```java
 // Every fetcher worker runs this exact same loop, forever.
@@ -151,7 +149,7 @@ void workerLoop() {
             for (String raw : extractLinks(html)) {
                 String norm = normalize(raw);        // §7 — canonical form
                 if (seen.isNew(norm)) {              // §7 — Bloom filter + KV check
-                    frontier.add(norm);              // brand-new URL → onto the clipboard
+                    frontier.add(norm);              // brand-new URL → add to the frontier
                 }
                 // else: already seen → drop it (this is what prevents infinite loops)
             }
@@ -210,21 +208,19 @@ fetch loop: pop the host with the earliest nextFetchTime from the heap
 
 > The two-level split cleanly separates **"what's important" (front)** from **"who can I politely fetch now" (back)**.
 
-### Plain-English: the frontier is just a smart to-do list
+### The frontier is a smart to-do list
 
-**Analogy: a delivery dispatcher with two whiteboards.**
-
-Our robot librarian has a to-do list of URLs. A dumb version is a single FIFO queue: *fetch them in the order I found them.* Two things go wrong:
+The crawler has a to-do list of URLs. A naive version is a single FIFO queue: *fetch them in the order I found them.* Two things go wrong:
 
 1. **Priority is ignored.** The CNN homepage and some random abandoned blog get equal treatment. You'd rather crawl important/fresh pages first.
 2. **Politeness is impossible.** If 5,000 URLs from `wikipedia.org` happen to sit next to each other in the queue, your workers fetch them all back-to-back and hammer Wikipedia.
 
-Mercator's fix is **two whiteboards**:
+Mercator's fix is **two levels of queues**:
 
-- **Front whiteboard = "how important?"** Incoming URLs get sorted into priority lanes (F1..Fn). Important sites (high PageRank, changes often, shallow depth) go in the fast lane.
-- **Back whiteboard = "who can I fetch right now without being rude?"** Each back queue holds URLs for **exactly one host**, and there's a timer (a min-heap) saying *"host X is next allowed at 12:00:03."*
+- **Front queues = "how important?"** Incoming URLs get sorted into priority lanes (F1..Fn). Important sites (high PageRank, changes often, shallow depth) go in the fast lane.
+- **Back queues = "who can I fetch right now without overloading a host?"** Each back queue holds URLs for **exactly one host**, and there's a timer (a min-heap) saying *"host X is next allowed at 12:00:03."*
 
-So the flow is: a URL comes in → front board decides *importance* → gets routed to its host's back queue → a worker always pulls **the host whose timer is up soonest**. Priority and politeness, cleanly separated.
+So the flow is: a URL comes in → front queues decide *importance* → it's routed to its host's back queue → a worker always pulls **the host whose timer is up soonest**. Priority and politeness, cleanly separated.
 
 ```java
 // THE FRONTIER = priority-in, politeness-out.
@@ -277,15 +273,15 @@ Politeness means *"don't fetch from the same site too fast."* By funneling **all
 - **Cache DNS results** aggressively (respect TTL); run a local caching resolver; pre-resolve popular hosts.
 - DNS can be slow/blocking → use async resolution + a resolver pool.
 
-### Plain-English: DNS is the phone book (and it's slow)
+### DNS resolution and why it's a bottleneck
 
-**Analogy: looking up a phone number before every call.** A URL says `www.wikipedia.org`, but the network can only connect to a **number** (an IP like `198.35.26.96`). DNS is the phone book that converts name → number. The catch: each lookup is a **network round-trip to a DNS server** — often 20–100 ms. That's tiny for a human, but our robot makes **hundreds of fetches per second**, and doing a fresh lookup every time would make DNS the slowest part of the whole crawler.
+A URL says `www.wikipedia.org`, but the network can only connect to an **IP address** (like `198.35.26.96`). DNS converts hostname → IP. The catch: each lookup is a **network round-trip to a DNS server** — often 20–100 ms. That's negligible once, but the crawler makes **hundreds of fetches per second**, and doing a fresh lookup every time would make DNS the slowest part of the whole crawler.
 
-The fix is the same as memorizing your friends' numbers: **cache** the answer and reuse it.
+The fix: **cache** the answer and reuse it.
 
 ```java
 class CachingResolver {
-    // host -> (ip, expiry). A friend's number you've memorized.
+    // host -> (ip, expiry). Cached so repeat lookups skip the network.
     private final Map<String, DnsEntry> cache = new ConcurrentHashMap<>();
 
     String resolve(String host) {
@@ -332,9 +328,9 @@ else:                                       # maybe seen → verify in KV (avoid
 
 - **URL normalization:** lowercase host, strip fragments (`#...`), sort query params, resolve relative → absolute, drop tracking params, canonicalize (`http`↔`https`, trailing slash).
 
-### Plain-English: two kinds of "we already have this"
+### Two kinds of "we already have this"
 
-The robot librarian must avoid duplicate work at **two** different moments, and beginners mix them up:
+The crawler must avoid duplicate work at **two** different moments, and they're easy to mix up:
 
 | Kind | Question | When | Tool |
 | --- | --- | --- | --- |
@@ -359,11 +355,9 @@ String normalize(String raw, String pageUrl) {
 }
 ```
 
-#### Plain-English: the Bloom filter (URL dedup at 10B scale)
+#### The Bloom filter (URL dedup at 10B scale)
 
-**Analogy: a hand-stamp at a club entrance.** You want to know *"has this person already been let in?"* without keeping a giant guest list of every name. So you stamp each entrant's hand. To check someone, you look for the stamp — fast, tiny.
-
-We have **10 billion+** URLs. Keeping every full URL string in memory to check "seen it?" would need terabytes of RAM. A **Bloom filter** is a magical stamp: a small bit-array (a few GB) that answers "have I seen this?" using a handful of hash functions — no strings stored.
+We have **10 billion+** URLs. Keeping every full URL string in memory to check "seen it?" would need terabytes of RAM. A **Bloom filter** solves this: a small bit-array (a few GB) that answers "have I seen this?" using a handful of hash functions — no strings stored.
 
 Its one quirk: it can say **"maybe seen"** when it actually hasn't (a **false positive**), but it will **never** say "new" for something it has seen (**no false negatives**). We use that asymmetry:
 
@@ -391,7 +385,7 @@ boolean isNew(String normUrl) {
 
 > **Why not just the KV store?** You could — but that's a database lookup for *every* discovered link (hundreds of thousands/sec). The Bloom filter absorbs the overwhelming "yep, new" majority in memory, so the KV is only touched on the rare "maybe."
 
-#### Plain-English: content hashing (near-duplicate pages)
+#### Content hashing (near-duplicate pages)
 
 Even with perfect URL dedup, two *different* URLs can hold **identical or nearly-identical** content (mirror sites, "printer-friendly" versions, pages that differ only by an ad or a timestamp). Indexing all of them wastes storage and pollutes search results.
 
@@ -426,13 +420,13 @@ Because it's wrong in only the *safe* direction. A false positive costs one extr
 - Identify with a proper **User-Agent**; **back off** on 429/5xx (exponential); honor `Retry-After`.
 - Respect `nofollow`, meta-robots, and canonical tags.
 
-### Plain-English: being a polite guest
+### Politeness
 
-**Analogy: a considerate house guest.** A rude guest barges into every room, opens every drawer, and never reads the "Staff Only" signs. A polite guest (1) reads the posted rules at the door, (2) doesn't sprint through the house grabbing everything at once, and (3) leaves a note saying who they are. Web crawlers must be polite guests or sites will **block them** (and hammering a small server can even take it down).
+A crawler must be polite or sites will **block it** (and hammering a small server can even take it down). Politeness has three parts: (1) obey the site's published rules, (2) don't send many requests at once, and (3) identify yourself so site owners know who you are.
 
 #### Part A — Read the rules: `robots.txt`
 
-Every site can publish a file at `example.com/robots.txt` that says *which paths you may crawl* and *how slowly*. It's the "house rules" posted at the door. You fetch it **once per host**, cache it, and obey it.
+Every site can publish a file at `example.com/robots.txt` that says *which paths you may crawl* and *how slowly*. You fetch it **once per host**, cache it, and obey it.
 
 ```
 # example.com/robots.txt
@@ -501,9 +495,9 @@ You can be allowed everywhere but still be rude by fetching too fast; you can pa
 - **Spider traps** (infinite calendars, session-id URLs, faceted-filter explosions) → **depth limits, URL-pattern filters, per-host URL caps**, and detecting parameter explosions.
 - **Politeness vs freshness** trade-off: important, fast-changing sites get higher priority + shorter recrawl.
 
-### Plain-English: keeping the archive fresh (recrawl)
+### Keeping the archive fresh (recrawl)
 
-**Analogy: re-reading books that keep getting new editions.** A crawl isn't "done" — the web keeps changing. A news homepage rewrites itself hourly; a 2009 blog post never changes. So the robot must **revisit** pages, but revisiting *everything* on the same schedule is wasteful. The trick: **learn each page's change rate** and recrawl accordingly.
+A crawl isn't "done" — the web keeps changing. A news homepage rewrites itself hourly; a 2009 blog post never changes. So the crawler must **revisit** pages, but revisiting *everything* on the same schedule is wasteful. The trick: **learn each page's change rate** and recrawl accordingly.
 
 ```java
 // After crawling, decide when to come back based on how often this page changes.
@@ -522,9 +516,9 @@ long scheduleNextRecrawl(Url u, String newHash) {
 
 A separate **scheduler** just wakes up periodically and re-adds due pages to the frontier: `SELECT url WHERE next_recrawl <= now()`.
 
-### Plain-English: spider traps (infinite loops)
+### Spider traps (infinite loops)
 
-**Analogy: a hall of mirrors.** Some sites (accidentally or maliciously) generate **infinite** unique URLs, and a naive crawler will happily follow them forever, never finishing and never getting stuck on real content:
+Some sites (accidentally or maliciously) generate **infinite** unique URLs, and a naive crawler will follow them forever, never finishing and never reaching real content:
 
 - **Infinite calendar:** `/calendar?date=2026-07-08` → "next day" → `2026-07-09` → ... forever into the year 3000.
 - **Session-id URLs:** every visit appends a new `?sid=abc123`, so the *same* page looks like infinitely many new URLs.
@@ -584,9 +578,9 @@ CREATE TABLE robots_cache ( host VARCHAR(255) PRIMARY KEY, rules TEXT, crawl_del
 
 > **Stores to consider:** URL registry/seen-set (KV + Bloom filter), content blob store (S3, compressed), robots cache, durable frontier queue, link graph, extracted-text/search index, DNS cache.
 
-### Plain-English: why so many different stores?
+### Why so many different stores?
 
-**Analogy: a warehouse with the right shelf for each thing.** You don't keep frozen food, paperwork, and shipping crates in the same drawer. Each piece of crawler data has a different *shape* and *access pattern*, so each gets a store built for it:
+Each piece of crawler data has a different *shape* and *access pattern*, so each gets a store built for it:
 
 | What | Store | Why this store |
 | --- | --- | --- |
@@ -648,9 +642,9 @@ Scheduler: select urls WHERE next_recrawl <= now() → re-enqueue to frontier (p
 - **DNS caching** to avoid resolver bottlenecks; distribute crawlers across regions.
 - **Traps** handled via depth/pattern/host caps.
 
-### Plain-English: one robot becomes thousands (distributed crawling)
+### One crawler becomes thousands (distributed crawling)
 
-**Analogy: dividing the library by neighborhood.** One robot can't read billions of books. So you hire thousands — but if they wander randomly, two robots might read the same shelf (wasted work) *or* three might swarm one fragile shelf at once (rudeness). The fix: **give each robot ownership of specific *hosts*.**
+One machine can't crawl billions of pages. So you run thousands of workers — but if they pick URLs randomly, two workers might fetch the same page (wasted work) *or* several might hit one fragile site at once (overload). The fix: **give each worker ownership of specific *hosts*.**
 
 We **shard by host hash**: `owner = hash(host) % numberOfShards`. Every URL for `wikipedia.org` always routes to the same shard/node. This single rule quietly solves several problems at once:
 

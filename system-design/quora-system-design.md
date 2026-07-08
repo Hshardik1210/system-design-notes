@@ -2,7 +2,7 @@
 
 > **Core challenge:** users ask **questions**, others post **answers**, and the best answers are **ranked by quality** and surfaced in **topic + personalized feeds**. Read-heavy like Reddit, but organized around **question → many answers**, with two distinctive twists: **question dedup/semantic search** and **answer-quality ranking (author expertise matters)**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (real-world analogies, annotated Java/SQL, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java/SQL and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -42,7 +42,7 @@ Ask question → tag topics → many users answer → answers ranked by QUALITY
 
 The feed/voting/read-heavy machinery is similar; the twists are **answer ranking** and **question dedup/semantic search**.
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
 Picture a giant Q&A website. Someone types a question — *"How do I learn Python?"* — and tags it with topics like `Python` and `Programming`. Other people write **answers**. Everyone else **upvotes** the answers they like, **follows** topics and people they care about, and scrolls a **home feed** of interesting Q&A.
 
@@ -75,7 +75,7 @@ You can store them fine — the hard part is **serving reads fast at scale**. Bi
 **Non-functional**
 - Read-heavy (reads ≫ writes); **eventual consistency** ok; scale to billions of Q&A; **fast, semantic search**.
 
-### Plain-English: functional vs non-functional, and why "eventual consistency" is fine here
+### Functional vs non-functional, and why "eventual consistency" is fine here
 
 - **Functional** = *what the product does* (ask, answer, vote, follow, feed, search, dedup). If you removed one, a user would notice a missing button.
 - **Non-functional** = *how well it must behave* (fast, scalable, mostly-correct). No button for these, but the app feels broken without them.
@@ -84,7 +84,7 @@ You can store them fine — the hard part is **serving reads fast at scale**. Bi
 
 #### Q: "Eventual consistency ok" — doesn't that mean the site shows wrong data?
 
-It means *slightly stale is fine here because nobody's money or safety is on the line.* If you upvote an answer and its count shows **1,240** for a few seconds before ticking to **1,241**, no harm done. Compare that to a bank balance, which must be exact instantly (**strong** consistency). Quora deliberately trades a few seconds of staleness (in vote counts, rankings, feeds) for massive speed and scale. Analogy: a Q&A site is like a magazine's "most popular articles" list — it's okay if it refreshes every few minutes rather than the instant each reader clicks.
+It means *slightly stale is fine here because nobody's money or safety is on the line.* If you upvote an answer and its count shows **1,240** for a few seconds before ticking to **1,241**, no harm done. Compare that to a bank balance, which must be exact instantly (**strong** consistency). Quora deliberately trades a few seconds of staleness (in vote counts, rankings, feeds) for massive speed and scale. For example, a "most popular answers" list can refresh every few minutes rather than the instant each reader clicks.
 
 ---
 
@@ -97,7 +97,7 @@ Search/dedup on every ask + every search → ES + vector store must scale
 Storage: questions/answers grow forever → partition + archive; search index separate
 ```
 
-### Plain-English: reading the back-of-the-envelope numbers
+### Reading the back-of-the-envelope numbers
 
 These numbers exist to justify design choices, not to be exact. The story they tell:
 
@@ -135,24 +135,24 @@ Client → API Gateway
 
 - **CQRS:** precomputed ranked answer lists + feeds (read) vs question/answer/vote stores (write).
 
-### Plain-English: why chop it into services, and what each one does
+### Why split it into services, and what each one does
 
-**Analogy: a big library.** One person can't do everything, so the library has specialized desks: a *cataloging desk* (register new books), a *reference desk* (help you find things), a *recommendations shelf* (curated picks), a *membership desk* (who follows what). Each desk is a **microservice** — it owns one job and one slice of the data, so it can be scaled, deployed, and reasoned about on its own.
+Each service is a **microservice** — it owns one job and one slice of the data, so it can be scaled, deployed, and reasoned about on its own.
 
-| Service | Its one job | Analogy |
-| --- | --- | --- |
-| **Question Service** | Create questions, detect duplicates, merge them | Cataloging desk: shelve a new book, spot that it's a reprint of an existing one |
-| **Answer Service** | Post/edit answers, keep them ranked | Editor arranging responses best-first |
-| **Vote Service** | Record votes, aggregate counts asynchronously | Ballot box that's tallied later, not per-vote |
-| **Feed Service** | Build each user's personalized home feed | Recommendations shelf curated per member |
-| **Search Service** | Lexical + semantic search over questions | Reference desk that understands what you *mean* |
-| **Graph Service** | Who follows which topics/users | Membership desk tracking interests |
+| Service | Its one job |
+| --- | --- |
+| **Question Service** | Create questions, detect duplicates, merge them |
+| **Answer Service** | Post/edit answers, keep them ranked |
+| **Vote Service** | Record votes, aggregate counts asynchronously |
+| **Feed Service** | Build each user's personalized home feed |
+| **Search Service** | Lexical + semantic search over questions |
+| **Graph Service** | Who follows which topics/users |
 
 #### Q: What is Kafka doing in the middle of this diagram?
 
 When you post an answer, several things must happen: update rankings, refresh feeds, add it to the search index, notify followers. If the Answer Service did all of that *before* replying to you, posting would feel slow and one failing step (say, notifications) could break the whole action.
 
-Instead, the Answer Service just saves the answer and **announces an event** — `ANSWER_CREATED` — onto Kafka, then returns immediately. Kafka is a shared **announcement board**; other services *subscribe* and react on their own time: the ranking job re-ranks, the feed service fans it out, the indexer indexes it, notifications fire. This is the **Pub/Sub (Observer)** pattern: the writer doesn't know or wait for the reactors.
+Instead, the Answer Service just saves the answer and **publishes an event** — `ANSWER_CREATED` — onto Kafka, then returns immediately. Kafka is a shared **event log**; other services *subscribe* and react on their own time: the ranking job re-ranks, the feed service fans it out, the indexer indexes it, notifications fire. This is the **Pub/Sub (Observer)** pattern: the writer doesn't know or wait for the reactors.
 
 ```
 POST answer ─► Answer Service ─► save to DB ─► publish ANSWER_CREATED ─► (return to user, fast)
@@ -166,7 +166,7 @@ POST answer ─► Answer Service ─► save to DB ─► publish ANSWER_CREATE
 
 #### Q: What does "CQRS" mean in one sentence?
 
-**Command Query Responsibility Segregation** = *separate the write path from the read path.* Writes (post an answer, cast a vote) go into normal databases. But reads don't run live queries against those — instead a background job precomputes the answers ("ranked answer list for question 42", "home feed for user 7") into a fast cache, and reads just fetch the finished result. Write side and read side have different shapes, optimized separately. It's the software version of a restaurant prepping ingredients before the dinner rush so orders come out instantly.
+**Command Query Responsibility Segregation** = *separate the write path from the read path.* Writes (post an answer, cast a vote) go into normal databases. But reads don't run live queries against those — instead a background job precomputes the answers ("ranked answer list for question 42", "home feed for user 7") into a fast cache, and reads just fetch the finished result. Write side and read side have different shapes, optimized separately — the read path serves precomputed results so requests return instantly.
 
 ---
 
@@ -190,16 +190,16 @@ On ask:
 
 - **Why both?** Lexical misses paraphrases ("learn Python" vs "get started with Python programming"); semantic embeddings catch intent. (See the Vector DB section in Databases Deep Dive.)
 
-### Plain-English: catching duplicate questions two different ways
+### Catching duplicate questions two different ways
 
-**Analogy: a helpful librarian.** You walk up and say "I want a book about getting started with snake programming." A dumb search matches only the exact words "snake programming" and finds nothing. A *good* librarian understands you *mean* Python and hands you the Python shelf. Quora needs both kinds of matching:
+Consider searching for "getting started with snake programming." A keyword-only search matches just the literal words "snake programming" and finds nothing. A search that understands *meaning* recognizes this is really about Python. Quora needs both kinds of matching:
 
 - **Lexical search (Elasticsearch)** = the word-matcher. Fast, great when people use the same keywords ("Python", "learn"). Blind to synonyms and rephrasing.
 - **Semantic search (embeddings + vector DB)** = the meaning-matcher. It turns each question into a list of numbers (an **embedding**) that captures *meaning*, so two questions with different words but the same intent end up as *nearby* number-lists.
 
 #### Q: What on earth is an "embedding" / "vector"?
 
-An **embedding** is a question boiled down to a long list of numbers (e.g. 768 of them) by an ML model, positioned so that *similar meanings sit close together in space*. Think of pinning every question onto a giant map: "How do I learn Python?" and "Best way to start Python programming?" land right next to each other even though they share almost no words. To find duplicates, we just look for the **nearest neighbors** on that map. A **vector DB** (using an index like HNSW) is a database built to answer "which stored vectors are closest to this one?" extremely fast — that's called **ANN, Approximate Nearest Neighbor** search.
+An **embedding** is a question boiled down to a long list of numbers (e.g. 768 of them) by an ML model, positioned so that *similar meanings sit close together in space*. In that space, "How do I learn Python?" and "Best way to start Python programming?" land right next to each other even though they share almost no words. To find duplicates, we just look for the **nearest neighbors**. A **vector DB** (using an index like HNSW) is a database built to answer "which stored vectors are closest to this one?" extremely fast — that's called **ANN, Approximate Nearest Neighbor** search.
 
 ```java
 // The dedup check that runs when someone asks a new question
@@ -266,9 +266,9 @@ answer_rank_score = f( upvotes/downvotes (Wilson lower bound),
 - **Precompute per-question ranked answer lists**, cache; recompute periodically as votes/edits arrive (not per request).
 - Often an ML model; treat as a black box — emphasize the **signals + precompute-and-cache** approach.
 
-### Plain-English: why the *best* answer, not the *newest*
+### Why the *best* answer, not the *newest*
 
-**Analogy: asking a question in a room full of people.** A random person shouts an answer first — but then a recognized doctor gives a careful, well-sourced answer. You want the *doctor's* answer on top, even though it came later and maybe has similar applause. That's the whole point of answer ranking: **quality wins over recency.** This is the biggest difference from a plain comment section (which is usually newest-first or a simple vote count).
+The goal of answer ranking is that **quality wins over recency**: a careful, well-sourced answer from a credible author should sit above an earlier, low-quality one, even if both have similar vote counts. This is the biggest difference from a plain comment section (which is usually newest-first or a simple vote count).
 
 We compute a `rank_score` per answer from several **signals**:
 
@@ -355,17 +355,17 @@ Personalized home feed from **followed topics + followed users + engagement** �
 - **Candidate generation** = followed topics' top Q&A + followed users' new answers + recommendations → **ML rank** → cache the id list → hydrate.
 - See [Fan-Out / Fan-In](../concepts/fan-out-fan-in.md) for push/pull/hybrid trade-offs.
 
-### Plain-English: how your home feed gets built
+### How your home feed gets built
 
-**Analogy: a personalized magazine delivered to you.** It's assembled from the topics you follow (Python, Cooking), the people you follow (their new answers), and a few editor's picks the system thinks you'll like — then sorted best-first. Building that magazine involves two questions: (1) *what could go in it?* (candidate generation) and (2) *in what order?* (ranking).
+Your home feed is assembled from the topics you follow (Python, Cooking), the people you follow (their new answers), and a few recommendations the system thinks you'll like — then sorted best-first. Building it involves two questions: (1) *what could go in it?* (candidate generation) and (2) *in what order?* (ranking).
 
 The classic dilemma is **push vs pull** — do we build feeds ahead of time, or on demand?
 
-| Approach | What it does | Analogy | Downside |
-| --- | --- | --- | --- |
-| **Pull (fan-out on read)** | Build the feed when the user opens the app | You go to the newsstand and assemble your own magazine each visit | Slow at read time; recomputed every visit |
-| **Push (fan-out on write)** | When someone posts, push it into all followers' prebuilt feeds | The magazine is pre-printed and waiting in your mailbox | A user with millions of followers = millions of writes (the "celebrity" problem) |
-| **Hybrid** ✅ | Push for normal users; pull for celebrities/topics; ML-rank the merge | Pre-print most of it; slot in hot items when you open it | More moving parts |
+| Approach | What it does | Downside |
+| --- | --- | --- |
+| **Pull (fan-out on read)** | Build the feed when the user opens the app | Slow at read time; recomputed every visit |
+| **Push (fan-out on write)** | When someone posts, push it into all followers' prebuilt feeds | A user with millions of followers = millions of writes (the "celebrity" problem) |
+| **Hybrid** ✅ | Push for normal users; pull for celebrities/topics; ML-rank the merge | More moving parts |
 
 #### Q: Why can't we just always push (fan-out on write)?
 
@@ -403,7 +403,7 @@ class FeedService {
 
 #### Q: What does "hydrate the id list" mean?
 
-The cached feed is just a list of **IDs** — `[q_42, a_17, q_88, ...]` — tiny and cheap to store. When you actually open the app, we **hydrate**: look up each ID's full content (title, body, author, current vote count) to render the page. Storing IDs (not full posts) keeps caches small and means the *content* stays fresh even if the *ordering* was computed a while ago. It's like keeping a playlist of song titles rather than a copy of every song file.
+The cached feed is just a list of **IDs** — `[q_42, a_17, q_88, ...]` — tiny and cheap to store. When you actually open the app, we **hydrate**: look up each ID's full content (title, body, author, current vote count) to render the page. Storing IDs (not full posts) keeps caches small and means the *content* stays fresh even if the *ordering* was computed a while ago.
 
 ---
 
@@ -445,7 +445,7 @@ CREATE TABLE ask_to_answer ( question_id BIGINT, asked_user_id BIGINT, at TIMEST
 
 > **Tables to consider:** users, topics, questions, question_topics, answers, comments, votes, follows_topic, follows_user, question_follows, ask_to_answer, precomputed feeds/rankings, moderation, search index (ES) + vector store.
 
-### Plain-English: reading the schema like a map of the product
+### Reading the schema
 
 Every table maps to a real thing you can point at in the UI. Grouping them:
 
@@ -505,7 +505,7 @@ POST /v1/questions/{id}/ask-to-answer { userId }
 GET  /v1/search?q=           # lexical + semantic
 ```
 
-### Plain-English: how the buttons map to API calls
+### How the buttons map to API calls
 
 Each endpoint is just "what happens when you tap something." Reading them as user actions:
 
@@ -554,7 +554,7 @@ Ranking job (periodic): recompute rank_score per question (votes + expertise + s
 Read question → serve cached ranked answers → hydrate
 ```
 
-### Plain-English: walking through the two main flows
+### Walking through the two main flows
 
 **Flow 1 — Asking a question (with dedup):** The system tries to *stop* you from creating a duplicate before it happens.
 
@@ -601,7 +601,7 @@ Because ranking is done by a **periodic background job**, not synchronously when
 | Ranking staleness | Periodic recompute; slightly stale ranking acceptable (eventual) |
 | Deleted answer | Tombstone; skip on hydrate; recompute question rank |
 
-### Plain-English: vote counting at scale, and why "approximate" is okay
+### Vote counting at scale, and why "approximate" is okay
 
 #### Q: An answer gets 50,000 upvotes in a minute — why not just `UPDATE ... SET up_count = up_count + 1` each time?
 
@@ -663,11 +663,11 @@ Reads are served from caches (ranked answer lists, feeds) so the database is bar
 | **Facade** | Feed/search service | Simple API |
 | **Decorator** | Answer display (credentials, badges, sources) | Compose rendering |
 
-### Plain-English: the patterns in everyday words
+### The patterns in everyday words
 
 Patterns are just named solutions to recurring problems. The ones that matter most here:
 
-- **Strategy** — "swap the algorithm without changing the caller." Ranking answers, ranking feeds, and measuring question similarity are all *pluggable brains*: you can replace the ML model behind any of them and the surrounding code doesn't change. Like swapping a recipe while the kitchen stays the same.
+- **Strategy** — "swap the algorithm without changing the caller." Ranking answers, ranking feeds, and measuring question similarity are all *pluggable components*: you can replace the ML model behind any of them and the surrounding code doesn't change.
 - **Observer / Pub-Sub** — "announce an event; whoever cares reacts." A vote or new answer publishes an event to Kafka; the counter, feed, indexer, and notifier each react independently. The writer doesn't wait for or even know about them.
 - **CQRS + Materialized View** — "prepare read-optimized copies ahead of time." Ranked answer lists and feeds are precomputed and cached so reads are instant. A materialized view = a saved, ready-to-serve answer to an expensive query.
 - **Producer-Consumer** — "buffer bursty work and process it steadily." Votes pour in (producers); a background aggregator drains the queue in batches (consumer), so spikes don't overwhelm the database.
@@ -688,7 +688,7 @@ No. Interviewers care that you can *justify structure*, not recite a catalog. Le
 - **Ranking jobs** recompute per question/feed periodically.
 - Partition questions/answers; archive cold content; eventual consistency acceptable.
 
-### Plain-English: how this survives scale and things breaking
+### How this survives scale and things breaking
 
 Every bullet above is one of two moves: **serve reads from cheap copies**, and **do heavy work in the background**.
 

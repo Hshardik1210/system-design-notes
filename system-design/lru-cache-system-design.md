@@ -2,7 +2,7 @@
 
 > A staple **coding + LLD** question: an in-memory cache with a fixed capacity that evicts the **Least Recently Used** entry when full — with **O(1)** `get` and `put`. The trick is the **HashMap + Doubly Linked List** combo.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (a small-desk analogy, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -25,18 +25,16 @@
 - Both operations in **O(1)** time.
 - Optional: TTL/expiry, thread-safety, size by bytes.
 
-### Plain-English: what is an LRU cache, really?
+### What is an LRU cache, really?
 
-**Analogy — a small desk that holds only N items.**
+An LRU cache holds a fixed number of entries in a defined recency order. Take a cache with capacity **3**. The most-recently-used entry sits at one end and the least-recently-used at the other. On every access an entry is moved to the most-recently-used end. When a **4th** entry is inserted and the cache is full, the entry that hasn't been touched the longest (the least-recently-used one) is evicted to make space.
 
-Imagine your desk has room for exactly **3 books**. You keep the book you're using **right in front of you**, and shove the others toward the back. When you grab a book, you pull it to the front. When a **4th** book arrives and the desk is full, you toss the book you **haven't touched the longest** (the one shoved all the way to the back) to make space.
+The moving parts:
 
-That desk is an LRU cache:
-
-- **Desk = the cache** (fixed capacity — here 3).
-- **A book = a cached entry** (`key → value`).
-- **Pulling a book to the front = "recently used"** — happens on every `get` *and* every `put`.
-- **Tossing the back book = eviction** of the **Least Recently Used** entry.
+- **Cache** — fixed capacity (here 3).
+- **Entry** — a cached `key → value` pair.
+- **Marking "recently used"** — moving an entry to the most-recently-used end; happens on every `get` *and* every `put`.
+- **Eviction** — removing the **Least Recently Used** entry when the cache is full.
 
 Why a cache at all? Fetching data from the real source (a database, disk, or a slow API) is expensive. A cache keeps a small set of "hot" items in fast memory so repeat requests are instant. But memory is limited, so you can't keep everything — you keep the stuff most likely to be used again. "Recently used → likely to be used again" is the bet LRU makes.
 
@@ -70,14 +68,14 @@ evict → remove the node at the tail (LRU)
 
 - Doubly linked (not singly) so you can **remove/move a node in O(1)** given a pointer to it.
 
-### Plain-English: why *two* data structures glued together?
+### Why *two* data structures glued together?
 
-Back to the desk. Two things happen constantly, and **no single structure does both fast**:
+Two things happen constantly, and **no single structure does both fast**:
 
-1. **"Do I already have this book, and where is it?"** — you need to find any book instantly by its title. That's a **HashMap** (`key → the book`). A HashMap finds anything in O(1), but it has **no sense of order** — it can't tell you which book you touched longest ago.
-2. **"Which book have I not touched the longest, and can I move a book to the front instantly?"** — you need to keep the books in **recency order** and reorder cheaply. That's the **Doubly Linked List**: front = most-recently-used (MRU), back = least-recently-used (LRU).
+1. **"Do I already have this key, and where is it?"** — you need to find any entry instantly by its key. That's a **HashMap** (`key → entry`). A HashMap finds anything in O(1), but it has **no sense of order** — it can't tell you which entry you touched longest ago.
+2. **"Which entry have I not touched the longest, and can I move an entry to the front instantly?"** — you need to keep entries in **recency order** and reorder cheaply. That's the **Doubly Linked List**: front = most-recently-used (MRU), back = least-recently-used (LRU).
 
-So we **combine** them: the HashMap answers *"where is this key?"*, and it doesn't store a copy of the value off to the side — it stores a **pointer to the exact node inside the linked list**. That pointer is the magic: once you have the node, you can unhook it and move it to the front in O(1), no searching required.
+So we **combine** them: the HashMap answers *"where is this key?"*, and it doesn't store a copy of the value off to the side — it stores a **pointer to the exact node inside the linked list**. That pointer is what makes it work: once you have the node, you can unhook it and move it to the front in O(1), no searching required.
 
 ```
 Most-recently-used ↔ ... ↔ Least-recently-used
@@ -153,47 +151,47 @@ class LRUCache {
 - `get`, `put`, evict are all **O(1)**.
 - In practice: Java's `LinkedHashMap(accessOrder=true)` implements this; Redis uses **approximate LRU** (sampling) to save memory.
 
-### Plain-English: the same code, fully annotated
+### The same code, fully annotated
 
-Here's the identical logic with a comment on every meaningful line, so you can see the desk analogy playing out:
+Here's the identical logic with a comment on every meaningful line:
 
 ```java
 class LRUCache {
-    // one book on the desk: its title (key), its contents (val),
+    // one cache entry: its key, its value (val),
     // and links to the neighbours in front (prev) and behind (next).
     class Node { int key, val; Node prev, next; }
 
-    private final int capacity;                                  // how many books fit on the desk
-    private final Map<Integer, Node> map = new HashMap<>();      // title -> the actual book (node)
-    private final Node head, tail;                               // fake "bookends" (sentinels)
+    private final int capacity;                                  // how many entries fit in the cache
+    private final Map<Integer, Node> map = new HashMap<>();      // key -> the entry's node
+    private final Node head, tail;                               // sentinels (fixed boundary nodes)
 
     LRUCache(int capacity) {
         this.capacity = capacity;
         head = new Node(); tail = new Node();
-        head.next = tail; tail.prev = head;   // empty desk: the two bookends touch
+        head.next = tail; tail.prev = head;   // empty cache: the two sentinels point at each other
     }
 
     int get(int key) {
-        Node n = map.get(key);                // O(1): is this book on the desk?
+        Node n = map.get(key);                // O(1): is this key in the cache?
         if (n == null) return -1;             // not here -> cache miss
-        moveToFront(n);                        // I just used it -> pull it to the front (MRU)
+        moveToFront(n);                        // just used it -> move to the front (MRU)
         return n.val;
     }
 
     void put(int key, int val) {
         Node n = map.get(key);
-        if (n != null) {                      // already have this title:
-            n.val = val;                      //   update its contents
+        if (n != null) {                      // key already present:
+            n.val = val;                      //   update its value
             moveToFront(n);                   //   and mark it most-recently-used
             return;
         }
-        if (map.size() == capacity) {         // desk is FULL -> must evict the LRU
-            Node lru = tail.prev;             // the book just in front of the back bookend
+        if (map.size() == capacity) {         // cache is FULL -> must evict the LRU
+            Node lru = tail.prev;             // the last real node before the tail sentinel
             remove(lru);                      //   unhook it from the list  (O(1))
-            map.remove(lru.key);              //   and forget its title in the map
+            map.remove(lru.key);              //   and drop its key from the map
         }
         Node fresh = new Node(); fresh.key = key; fresh.val = val;
-        map.put(key, fresh);                  // remember where the new book is
+        map.put(key, fresh);                  // record where the new node is
         addFront(fresh);                      // place it right at the front (MRU)
     }
 
@@ -223,15 +221,15 @@ class LRUCache {
 
 #### Q: What are the sentinel `head`/`tail` nodes for?
 
-They are **fake, permanent bookends** that hold no real data. Without them, inserting into an empty list or removing the last remaining node means "the neighbor might be `null`" — so every helper needs `if (n.prev == null) ...` special cases. With sentinels there is **always** a node on both sides of every real node, so `n.prev.next = n.next` never touches `null`. Fewer edge cases, fewer bugs — a classic linked-list trick.
+They are **fake, permanent boundary nodes** that hold no real data. Without them, inserting into an empty list or removing the last remaining node means "the neighbor might be `null`" — so every helper needs `if (n.prev == null) ...` special cases. With sentinels there is **always** a node on both sides of every real node, so `n.prev.next = n.next` never touches `null`. Fewer edge cases, fewer bugs — a classic linked-list trick.
 
 #### Q: Walk me through evicting the tail — which node exactly gets removed?
 
-`tail` itself is a sentinel (fake), so the real least-recently-used entry is **`tail.prev`** — the last real book before the back bookend. We `remove(lru)` to unhook it from the list, then `map.remove(lru.key)` so the HashMap forgets it too. **Both** structures must be updated together, or the map would keep pointing at a node that's no longer in the list (a leak / stale reference).
+`tail` itself is a sentinel (fake), so the real least-recently-used entry is **`tail.prev`** — the last real node before the tail sentinel. We `remove(lru)` to unhook it from the list, then `map.remove(lru.key)` so the HashMap forgets it too. **Both** structures must be updated together, or the map would keep pointing at a node that's no longer in the list (a leak / stale reference).
 
 #### Q: Why does `get` also reorder the list? Isn't a read supposed to be read-only?
 
-For an LRU cache, **reading an item counts as "using" it** — that's the entire point. A book you keep opening should stay near the front and never be evicted. So `get` is *not* side-effect-free: on a hit it moves the node to the head. This is exactly why a plain `HashMap` can't be an LRU cache on its own — it has no notion of "I just touched this."
+For an LRU cache, **reading an item counts as "using" it** — that's the entire point. An entry you keep reading should stay near the front and never be evicted. So `get` is *not* side-effect-free: on a hit it moves the node to the head. This is exactly why a plain `HashMap` can't be an LRU cache on its own — it has no notion of "I just touched this."
 
 #### Q: Where does the O(1) actually come from, step by step?
 
@@ -250,11 +248,11 @@ Trace a `get` hit: (1) `map.get(key)` → O(1) hash lookup gives the node direct
 | **Size by bytes** | Track total bytes; evict until under limit |
 | **Distributed** | Shard by key (consistent hashing) → many LRU nodes = a distributed cache |
 
-### Plain-English: thread-safety (two people sharing one desk)
+### Thread-safety
 
-The code above assumes **one person at the desk**. In a real server, **many threads** call `get`/`put` on the same cache at once. Trouble: while thread A is halfway through rewiring the `prev`/`next` pointers, thread B jumps in and reads them mid-rewire → the linked list gets corrupted (a node lost, a cycle, or a crash). This is a **race condition**.
+The code above assumes a **single thread**. In a real server, **many threads** call `get`/`put` on the same cache at once. Trouble: while thread A is halfway through rewiring the `prev`/`next` pointers, thread B jumps in and reads them mid-rewire → the linked list gets corrupted (a node lost, a cycle, or a crash). This is a **race condition**.
 
-**Simplest fix — one lock around every operation** (only one thread on the desk at a time):
+**Simplest fix — one lock around every operation** (only one thread mutating the cache at a time):
 
 ```java
 class ThreadSafeLRUCache {
@@ -264,7 +262,7 @@ class ThreadSafeLRUCache {
     ThreadSafeLRUCache(int capacity) { this.cache = new LRUCache(capacity); }
 
     int get(int key) {
-        lock.lock();                 // grab the desk; others wait
+        lock.lock();                 // acquire the lock; others wait
         try { return cache.get(key); }
         finally { lock.unlock(); }   // ALWAYS release, even if something throws
     }
@@ -301,8 +299,8 @@ It's exactly the HashMap-plus-doubly-linked-list design, done for you internally
 
 #### Q: LRU vs LFU — what's the difference?
 
-- **LRU (Least Recently Used)** evicts by **how long ago** an item was last touched → *"you haven't opened this book in a while, out it goes."*
-- **LFU (Least Frequently Used)** evicts by **how often** an item is used → *"this book has only ever been opened twice; that one's been opened 500 times — toss the rarely-used one."*
+- **LRU (Least Recently Used)** evicts by **how long ago** an item was last touched → the entry untouched the longest is removed.
+- **LFU (Least Frequently Used)** evicts by **how often** an item is used → an entry accessed only twice is evicted before one accessed 500 times.
 
 LFU keeps a **usage count** per entry (plus frequency buckets to still hit O(1)), so it's more complex. Neither is universally better: LRU adapts fast to changing patterns but can be fooled by a one-off scan that sweeps hot items out; LFU protects long-term favorites but can cling to items that *used* to be popular. Real caches (e.g. Redis, Caffeine) offer both, and some use hybrids (like "LRU-K" or Caffeine's frequency-aware **TinyLFU**).
 

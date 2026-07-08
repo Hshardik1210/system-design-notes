@@ -4,7 +4,7 @@
 >
 > Builds on **Database Fundamentals** (SQL vs NoSQL, ACID/BASE, CAP) and **Database Indexing** (B-Tree internals).
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (real-world analogies, annotated code/SQL, and the exact confusions that trip beginners up — OLTP vs OLAP, row vs column, B-Tree vs LSM, replication, sharding, consistency, indexes). Skim the summaries for revision; read the Plain-English parts to actually *get* it.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated code/SQL, and the exact confusions that trip beginners up — OLTP vs OLAP, row vs column, B-Tree vs LSM, replication, sharding, consistency, indexes). Skim the summaries for revision; read the deep dives to actually *get* it.
 
 ---
 
@@ -45,14 +45,14 @@ Ask these, in order:
 
 > **Default advice:** start with a **relational DB (Postgres)** — it handles most workloads, gives ACID + flexible queries, and scales further than people think. Reach for NoSQL when you hit a **specific** need it solves (massive write scale, flexible schema, key-value latency, full-text search, similarity search).
 
-### Plain-English: picking a database is like picking a vehicle
+### Choosing a database by access pattern
 
-You don't ask "what's the best vehicle?" — you ask "what am I hauling, how far, how fast, how often?" A sports car, a moving truck, and a bicycle are all "best" for *different* jobs. Databases are the same: there's **no universally best database, only the best fit for your access pattern**.
+There's **no universally best database, only the best fit for your access pattern**. Each engine is optimized for a different kind of read/write workload:
 
-- Hauling one box across town → **bicycle** (Redis: tiny, instant, in-memory).
-- Family road trip with luggage and rules (seatbelts, insurance) → **sedan** (Postgres: safe, ACID, does most things well).
-- Moving an entire warehouse → **18-wheeler** (Cassandra: built to haul enormous write volume).
-- Reading the whole warehouse's inventory to total it up → **forklift + spreadsheet** (ClickHouse/OLAP: built to summarize).
+- Sub-millisecond key lookups → **Redis** (tiny, instant, in-memory).
+- General-purpose transactional workloads → **Postgres** (ACID, flexible queries, does most things well).
+- Enormous write volume → **Cassandra** (built for write-heavy scale).
+- Scanning huge datasets to summarize them → **ClickHouse/OLAP** (built for analytics).
 
 The single most useful question is **"what do my reads and writes actually look like?"** Everything else follows.
 
@@ -119,44 +119,44 @@ read → check MemTable + multiple SSTables (Bloom filters skip files that lack 
 
 > **B-Tree vs LSM in one line:** B-Tree = balanced read/write, in-place, great range queries (SQL default). **LSM = write-optimized**, append-only, needs compaction (Cassandra, RocksDB).
 
-### Plain-English: B-Tree vs LSM (the librarian vs the note-taker)
+### B-Tree vs LSM
 
 This is *the* storage-engine fork in the road. Two ways to keep data on disk:
 
-**B-Tree = a meticulous librarian who keeps shelves perfectly sorted.**
+**B-Tree — keeps data sorted in place.**
 
-Every time a new book arrives, the librarian walks to the exact right shelf and slots it in — possibly shuffling neighbors to make room. Finding any book later is fast (the shelves are always in order). But *inserting* is work: you go to a specific spot on disk, and if the "shelf" (page) is full you **split** it.
+Every insert goes to the exact right position in the sorted structure — possibly splitting a page to make room. Finding any key later is fast (the data is always in order). But *inserting* is work: you go to a specific spot on disk, and if the page is full you **split** it.
 
 ```
 INSERT key=55  →  find the page where 55 belongs  →  write it there in order
                   (page full? split it into two — extra random disk I/O)
 ```
 
-- Great when you **read a lot and want ranges in order** ("books 50–70, please").
-- Slower when writes come in a **firehose**, because each write hunts for its exact spot.
+- Great when you **read a lot and want ranges in order** ("keys 50–70").
+- Slower under a high write rate, because each write must seek its exact position.
 
-**LSM = a note-taker who just scribbles on a fresh sticky note and files it later.**
+**LSM — appends first, sorts later.**
 
-New data? Don't hunt for its home — **append it to the end** (fast!) and keep a sorted copy in memory. When memory fills, dump it to disk as one immutable sorted file (an **SSTable**). A background janitor (**compaction**) later merges the piles and throws away outdated notes.
+New data isn't placed in its final sorted position — it's **appended** (fast) and kept in a sorted in-memory table. When memory fills, it's flushed to disk as one immutable sorted file (an **SSTable**). A background process (**compaction**) later merges these files and discards outdated entries.
 
 ```
-WRITE key=55 →  append to log + drop into in-memory sorted table  →  done (no hunting!)
+WRITE key=55 →  append to log + insert into in-memory sorted table  →  done (no seek!)
    later:       memory full → flush to a new immutable file
    background:  compaction merges files, discards overwritten/deleted keys
 READ key=55  →  check memory, then a few files (Bloom filters skip files that lack it)
 ```
 
-- **Writes are blazing** (just appending), so LSM powers write-heavy stores (Cassandra: logs, feeds, time-series).
+- **Writes are very fast** (just appending), so LSM powers write-heavy stores (Cassandra: logs, feeds, time-series).
 - **Reads can be slower** — the key might be in memory or in any of several files — so LSM uses **Bloom filters** (a quick "is this key *definitely not* in this file?" check) to avoid opening files needlessly.
 
 ```
-Firehose of writes (logs, metrics, feeds)?  → LSM  (Cassandra, RocksDB)
-Balanced reads/writes + lots of range scans? → B-Tree (Postgres, MySQL, Mongo)
+High write rate (logs, metrics, feeds)?       → LSM  (Cassandra, RocksDB)
+Balanced reads/writes + lots of range scans?  → B-Tree (Postgres, MySQL, Mongo)
 ```
 
 #### Q: Why is appending faster than updating in place?
 
-Because **spinning/solid disks love sequential writes and hate random jumps.** Appending to the end is one smooth motion. A B-Tree's "go to this exact page and maybe split it" scatters little writes all over the disk (random I/O), which is much slower at high volume. LSM trades that away: it always writes sequentially now, and pays the cleanup cost *later*, in the background, off the hot path.
+Because disks handle **sequential writes** far faster than **random writes**. Appending to the end is sequential. A B-Tree's "go to this exact page and maybe split it" scatters small writes across the disk (random I/O), which is much slower at high volume. LSM trades that away: it always writes sequentially now, and pays the cleanup cost *later*, in the background, off the hot path.
 
 #### Q: What is a "tombstone" in LSM?
 
@@ -173,14 +173,14 @@ Since files are immutable, you can't erase a row in place. To delete, LSM writes
 
 > Analytics query like `SUM(revenue) GROUP BY day` reads only 2 columns → column stores read far less data. Don't run heavy analytics on your OLTP DB; ship to a warehouse.
 
-### Plain-English: OLTP vs OLAP, and row vs column stores
+### OLTP vs OLAP, and row vs column stores
 
 Two acronyms people constantly mix up. They describe **two different jobs**, and the row-vs-column layout is *how* each job is done efficiently.
 
-- **OLTP = Online Transaction Processing** = the day-to-day app database. Lots of tiny operations on **individual rows**: "log user 123 in", "place this order", "update this cart". Think: a **bank teller** handling one customer's account at a time.
-- **OLAP = Online Analytical Processing** = the reporting/analytics database. A few **huge summarizing** queries over millions of rows: "total revenue per country per month". Think: a **financial analyst** who ignores individual customers and just sums up columns.
+- **OLTP = Online Transaction Processing** = the day-to-day app database. Lots of small operations on **individual rows**: "log user 123 in", "place this order", "update this cart".
+- **OLAP = Online Analytical Processing** = the reporting/analytics database. A few **large summarizing** queries over millions of rows: "total revenue per country per month".
 
-**Now the storage layout — a spreadsheet analogy.** Imagine a table with columns `id, name, city, revenue`. Disk is 1-dimensional, so you must choose an order to write the cells:
+**Now the storage layout.** Take a table with columns `id, name, city, revenue`. Disk is 1-dimensional, so you must choose an order to write the cells:
 
 ```
 ROW store (OLTP):    keeps each ROW's cells together
@@ -253,9 +253,9 @@ WHERE u.city = 'BLR' AND o.total > 1000;
 **Strengths:** ACID, joins, ad-hoc queries, strong consistency, mature tooling.
 **Weakness:** horizontal write scaling is harder (single primary for writes) → sharding is manual (until NewSQL).
 
-### Plain-English: tables, joins, ACID and indexes
+### Tables, joins, ACID and indexes
 
-**Analogy: a relational database is a set of strict, cross-referenced spreadsheets.** Each table is a spreadsheet with fixed columns (a **schema** — every row must have the same shape). Instead of copying a customer's details into every order, you store customers once and orders point back to them by `id` (a **foreign key**). A **join** re-stitches them at query time.
+A relational database stores data in tables with fixed columns (a **schema** — every row has the same shape). Instead of copying a customer's details into every order, you store customers once and orders point back to them by `id` (a **foreign key**). A **join** re-combines them at query time.
 
 ```sql
 -- Two tidy tables. Orders don't repeat the user's name/city — they just hold user_id.
@@ -288,7 +288,7 @@ COMMIT;   -- both applied together. If anything fails before COMMIT → ROLLBACK
 
 #### Q: What is an index and why does it make queries fast?
 
-An **index is like the index at the back of a textbook.** Without it, finding every page that mentions "mitochondria" means reading the *entire book* (a **full table scan**). With it, you flip to the alphabetical index, jump straight to the listed pages — done. A database index is a separate **sorted structure** (usually a B-Tree, see §2.1) that maps a column's values to the rows that have them.
+An **index is a separate sorted structure** (usually a B-Tree, see §2.1) that maps a column's values to the rows that contain them. Without it, finding every row where `city = 'BLR'` requires scanning the *entire table* (a **full table scan**, O(n)). With it, the database walks the small sorted structure and jumps straight to the matching rows (O(log n)).
 
 ```sql
 -- Without this index, "WHERE city = 'BLR'" scans EVERY row.
@@ -331,12 +331,12 @@ Both are excellent relational DBs. Differences that matter:
 
 > **Interview answer:** "Both use a single write primary, so raw MySQL/Postgres scale reads via replicas and writes via **sharding (Vitess for MySQL, Citus for Postgres)** or **partitioning**. For built-in horizontal scale with SQL semantics, I'd reach for CockroachDB/Spanner. I default to Postgres for its feature set."
 
-### Plain-English: two great cars, different personalities
+### MySQL vs PostgreSQL
 
-Both MySQL and Postgres are excellent relational databases — this isn't good vs bad. Think **a reliable, simple sedan (MySQL)** vs **a feature-loaded Swiss-army SUV (Postgres)**:
+Both MySQL and Postgres are excellent relational databases — this isn't good vs bad, just different strengths:
 
 - **MySQL** — simple, extremely fast at straightforward reads, huge ecosystem. The go-to for classic high-read web apps. Its table *is* the primary-key tree (a **clustered index**), so looking up by primary key is especially quick.
-- **PostgreSQL** — richer toolbox: JSONB (store JSON documents *and* query them), arrays, geospatial (PostGIS), full-text search, window functions, and extensions like Citus (sharding), pgvector (vector search). If you want one database that can bend to many needs, it's Postgres.
+- **PostgreSQL** — richer feature set: JSONB (store JSON documents *and* query them), arrays, geospatial (PostGIS), full-text search, window functions, and extensions like Citus (sharding), pgvector (vector search). If you want one database that can adapt to many needs, it's Postgres.
 
 #### Q: The table says "clustered index" vs "heap" — what's the practical difference?
 
@@ -366,11 +366,11 @@ Give you **SQL + ACID + horizontal scale** by sharding automatically under the h
 
 > **How they scale writes:** data is split into **ranges/shards**, each replicated via **consensus (Raft/Paxos)**; different shards have different leaders on different nodes → writes parallelize across the cluster while keeping ACID.
 
-### Plain-English: "have your cake and eat it" SQL
+### NewSQL: SQL semantics with horizontal scale
 
-Classic SQL gives you ACID + joins but chokes on write scale (one write primary). Classic NoSQL scales writes but drops joins/transactions. **NewSQL says: why not both?** It keeps the familiar SQL + ACID interface, then quietly **splits your tables into chunks and spreads them across many machines** for you — no manual sharding.
+Classic SQL gives you ACID + joins but chokes on write scale (one write primary). Classic NoSQL scales writes but drops joins/transactions. **NewSQL aims for both.** It keeps the familiar SQL + ACID interface, then automatically **splits your tables into chunks and spreads them across many machines** — no manual sharding.
 
-**Analogy: one giant restaurant with one head chef (classic SQL) vs a franchise chain (NewSQL).** In the franchise, each branch (shard) has its *own* head chef (leader) handling its *own* orders, so many orders cook in parallel — yet corporate rules (ACID) are enforced everywhere, so it still feels like one consistent brand.
+Each shard has its *own* leader handling its *own* writes, so writes go in parallel across the cluster — yet ACID rules are enforced everywhere, so it still behaves like one consistent database.
 
 ```
 Your table  ─►  split into ranges/shards  ─►  shard 1 (leader on node A)
@@ -406,17 +406,17 @@ It's more operationally complex, can have higher per-query latency (writes wait 
 
 > **Key trade-off:** NoSQL scales by **denormalizing + partitioning** and dropping cross-shard joins/transactions. You **model for your queries** up front (query-first design), unlike SQL's flexible ad-hoc queries.
 
-### Plain-English: "NoSQL" is a family of tools, not one thing
+### "NoSQL" is a family of tools, not one thing
 
-Beginners hear "NoSQL" and picture a single alternative to SQL. It's really an **umbrella term** for several very different databases whose only shared trait is "not the classic relational table + join model." Comparing Redis to Neo4j is like comparing a stapler to a chainsaw — both "not a hammer," but wildly different jobs.
+Beginners hear "NoSQL" and picture a single alternative to SQL. It's really an **umbrella term** for several very different databases whose only shared trait is "not the classic relational table + join model." Redis and Neo4j are both "NoSQL" but solve completely different problems.
 
 ```
-Key-Value    (Redis)         → a giant dictionary: key → value. Instant lookups.
-Document     (MongoDB)       → a folder of JSON files, each self-contained.
-Wide-Column  (Cassandra)     → massive spreadsheets split across many machines, write-optimized.
-Search       (Elasticsearch) → the book-index engine for text.
-Graph        (Neo4j)         → dots and lines: people and who-knows-whom.
-Vector       (Pinecone)      → "find things similar in meaning" by math.
+Key-Value    (Redis)         → key → value store; instant lookups.
+Document     (MongoDB)       → stores self-contained JSON/BSON documents.
+Wide-Column  (Cassandra)     → rows with dynamic columns, split across machines, write-optimized.
+Search       (Elasticsearch) → full-text search via an inverted index.
+Graph        (Neo4j)         → nodes and edges; relationships between entities.
+Vector       (Pinecone)      → finds items similar in meaning via vector distance.
 ```
 
 #### Q: What does "query-first design" / "denormalize" mean?
@@ -484,12 +484,12 @@ Components:
 
 > **Shard key choice is critical:** high cardinality + even distribution + present in common queries. A bad key (e.g. monotonically increasing) creates a **hot shard**.
 
-### Plain-English: documents, and how Mongo finds your data
+### Documents, and how Mongo finds your data
 
-**A document database is a folder of self-contained files.** Instead of splitting a user across a `users` table and an `orders` table, you store one JSON-ish "file" that holds the user *and* their orders together. Reading a user's orders is then a single grab — no join.
+A document database stores self-contained documents. Instead of splitting a user across a `users` table and an `orders` table, you store one document that holds the user *and* their orders together. Reading a user's orders is then a single read — no join.
 
 ```javascript
-// One self-contained document = one "file" in the folder. Related data is EMBEDDED.
+// One self-contained document. Related data is EMBEDDED.
 { _id: 123, name: "Hardik", city: "BLR",
   orders: [ { id: 789, total: 1500 }, { id: 790, total: 200 } ] }
 // Reading everything about user 123 = read this one document. No join across tables.
@@ -499,19 +499,19 @@ Documents in the same collection can even have **different shapes** (one has a `
 
 #### Q: How does Mongo know which machine holds a given document? (sharding, in plain words)
 
-Picture a **library so big it needs several buildings**. You need three things to find a book fast:
+Three components let Mongo find the right node:
 
-- **Shards** = the buildings, each holding a *slice* of the books.
-- **Config servers** = the central directory that records "authors A–F are in Building 1, G–M in Building 2…" (the map of **shard-key range → shard**).
-- **`mongos`** = the front-desk clerk (router). You ask it; it checks the directory and points you to the right building.
+- **Shards** — each holds a *subset* of the data.
+- **Config servers** — store the metadata: which **shard-key range** lives on which shard.
+- **`mongos`** — the query router. The client asks it; it checks the config servers and routes the request to the right shard.
 
 ```
-You (client) → mongos (clerk) → checks config servers (the directory) → routes to the right shard
+You (client) → mongos (router) → checks config servers (metadata) → routes to the right shard
 ```
 
-- You choose a **shard key** (say `user_id`). Mongo chops the key range into **chunks** and assigns each chunk to a shard; config servers remember which chunk lives where.
-- **Query includes the shard key** → the clerk sends you straight to the *one* building. Fast (**targeted**). ✅
-- **Query lacks the shard key** → the clerk has to ask *every* building and merge answers (**scatter-gather**). Slower. ⚠️ → pick a shard key that appears in your common queries.
+- You choose a **shard key** (say `user_id`). Mongo splits the key range into **chunks** and assigns each chunk to a shard; config servers record which chunk lives where.
+- **Query includes the shard key** → the router sends it straight to the *one* shard. Fast (**targeted**). ✅
+- **Query lacks the shard key** → the router must ask *every* shard and merge answers (**scatter-gather**). Slower. ⚠️ → pick a shard key that appears in your common queries.
 
 #### Q: Why is a bad shard key so dangerous ("hot shard")?
 
@@ -556,11 +556,11 @@ Every node knows the ring (gossip protocol). Any node can be the COORDINATOR for
 
 > **Cassandra vs Mongo scaling:** Cassandra is **masterless** (consistent-hashing ring, any node coordinates); Mongo has a **primary per shard** + a router (`mongos`) + config servers.
 
-### Plain-English: the "no boss" database and its ring
+### Cassandra's masterless ring
 
-Mongo has a boss per shard (a primary). **Cassandra has no boss at all — every node is equal (masterless).** Analogy: a **round table of equals** instead of a manager-and-workers setup. Any node can take your request and act as the **coordinator** that forwards it to whoever holds the data. Why do that? No single point of failure, and it scales writes brilliantly.
+Mongo has a primary per shard. **Cassandra has no primary at all — every node is equal (masterless).** Any node can take a request and act as the **coordinator**, forwarding it to whichever nodes hold the data. The benefit: no single point of failure, and excellent write scalability.
 
-**How does an equal node know who holds a key? The token ring.** Imagine the nodes arranged in a **circle (ring)**, and each is responsible for a slice of it (like hours on a clock face). To place a key, you **hash it into a number (a token)**; whichever node owns that number's slice stores it.
+**How does a node know which node holds a key? The token ring.** The nodes are arranged on a **ring**, and each is responsible for a range of it (a slice of the clock face). To place a key, you **hash it into a number (a token)**; whichever node owns that token's range stores it.
 
 ```
         hash("chat_42") = token 7500
@@ -604,13 +604,13 @@ GEOADD drivers 77.6 12.9 driver:1                   # geospatial
 - **Eviction** when memory full: LRU/LFU (approximate — see Distributed Cache note).
 - **Uses:** cache, sessions, rate limiting, leaderboards (sorted sets), queues, pub/sub, distributed locks, geo.
 
-### Plain-English: Redis is a super-fast whiteboard next to your desk
+### Redis: an in-memory key-value store
 
-Your real database (Postgres) is like **filing cabinets in the basement** — everything's safely stored, but every trip down there costs time (disk). Redis is a **whiteboard on your desk**: everything's in **RAM**, so reading/writing is microseconds — but if the office loses power, the whiteboard can be wiped (RAM is volatile). That's why Redis is usually a **cache in front of the real database**, not the source of truth.
+Your primary database (Postgres) stores everything durably on disk, but each access costs disk time. Redis keeps data in **RAM**, so reads/writes take microseconds — but RAM is volatile, so the data can be lost on power loss. That's why Redis is usually a **cache in front of the primary database**, not the source of truth.
 
 ```
-GET user:123   →  hit the whiteboard (RAM)   → answer in microseconds
-   (miss?)     →  go to the basement (Postgres) → copy the answer onto the whiteboard for next time
+GET user:123   →  hit Redis (RAM)   → answer in microseconds
+   (miss?)     →  read from Postgres (disk) → copy the answer into Redis for next time
 ```
 
 - It's not just strings — Redis offers ready-made structures (lists, hashes, **sorted sets** for leaderboards, counters, geo), which is why one line does what'd be a whole subsystem elsewhere.
@@ -743,9 +743,9 @@ POST /products/_search
 
 > **One-liner:** "Elasticsearch is fast because of the **inverted index** — it maps each term to a sorted list of matching documents, so a search is a term lookup + list intersection instead of a full scan — plus in-memory term dictionaries, immutable cacheable segments, cached filter bitsets, and parallel sharded search."
 
-### Plain-English: it's the index at the back of a book
+### When to use Elasticsearch (and its traps)
 
-You already saw the mechanics; here's the intuition and the traps. To find every page mentioning "fox" in a book, you don't read the whole book — you flip to the **index at the back**: "fox → pages 1, 9, 42". Elasticsearch builds exactly that for your data: **word → list of documents containing it**. A search becomes a quick index lookup, never a full scan.
+You already saw the mechanics; here are the practical traps. The inverted index maps **each term → a sorted list of documents containing it**, so a search is a quick term lookup rather than a full scan. That makes Elasticsearch ideal for text search — but it's not a general-purpose database, as the questions below explain.
 
 #### Q: My SQL database can do `WHERE name LIKE '%fox%'` — why do I need Elasticsearch?
 
@@ -781,11 +781,11 @@ SELECT id FROM docs ORDER BY embedding <=> '[...]' LIMIT 5;   -- <=> = cosine di
 - **Use when:** "find similar" by meaning (not keywords) — semantic search, recommendations, dedup, RAG.
 - **Scaling:** shard vectors across nodes; ANN index per shard; scatter-gather + merge top-k. Trade **recall vs latency** via index params.
 
-### Plain-English: searching by *meaning*, not by words
+### Searching by meaning, not by words
 
 Elasticsearch finds documents that contain your **exact words**. A vector DB finds things that are **similar in meaning**, even with zero words in common. Search "cheap flights" and it can surface "budget airfare deals."
 
-**How?** An ML model turns any text/image into a long list of numbers (an **embedding** or **vector**) that captures its *meaning*. Similar meanings → vectors that sit **close together in space**. So "find similar" becomes "find the nearest points."
+**How?** An ML model turns any text/image into a list of numbers (an **embedding** or **vector**) that captures its *meaning*. Similar meanings → vectors that sit **close together in vector space**. So "find similar" becomes "find the nearest vectors."
 
 ```
 "budget airfare"   → [0.11, -0.4, 0.9, ...]   ┐  these two vectors are
@@ -793,7 +793,7 @@ Elasticsearch finds documents that contain your **exact words**. A vector DB fin
 "grilled salmon"   → [-0.7, 0.2, 0.05, ...]      far away → unrelated
 ```
 
-**Analogy: a giant star map.** Every document is a star placed by meaning; your query is a point in the sky; you want the nearest stars. Checking distance to *every* star (exact search) is too slow over millions, so vector DBs use **ANN (Approximate Nearest Neighbor)** — clever indexes (**HNSW** = a navigable graph of "who's near whom") that hop to the neighborhood fast, trading a tiny bit of accuracy (**recall**) for huge speed.
+Computing the distance to *every* stored vector (exact search) is too slow over millions of items, so vector DBs use **ANN (Approximate Nearest Neighbor)** indexes (**HNSW** = a navigable graph connecting nearby vectors) that jump to the right neighborhood fast, trading a tiny bit of accuracy (**recall**) for large speed gains.
 
 #### Q: Where does this actually get used?
 
@@ -857,12 +857,12 @@ Two orthogonal techniques; almost every scalable DB combines both.
 - **Common thread:** a **partition key is hashed** to locate the owning node(s). The differences are *who* computes it (client vs router vs any node) and *how topology is tracked* (client cache, config servers, gossip ring).
 - **Rebalancing on add/remove:** consistent-hashing systems (Cassandra, Redis slots, Dynamo) move only a fraction of data; naive `hash % N` would move almost everything.
 
-### Plain-English: replication vs sharding (copying vs splitting)
+### Replication vs sharding (copying vs splitting)
 
 These two words get mixed up constantly, but they solve **different problems** and are usually used **together**.
 
-- **Replication = making COPIES of the same data.** Like **photocopying a document** so several people can read it at once, and so you don't lose it if one copy burns. Gives you **high availability** (a node dies, a copy takes over) and **read scaling** (spread reads across copies). It does **not** help write scaling — every copy must eventually hold *all* the writes.
-- **Sharding (partitioning) = SPLITTING the data into pieces.** Like **splitting one giant phone book into A–M and N–Z volumes**, each on a different shelf. Now two people can write to two volumes at once → **write + storage scaling**. But a single volume no longer has "everything."
+- **Replication = making COPIES of the same data** on multiple nodes. Gives you **high availability** (a node dies, a copy takes over) and **read scaling** (spread reads across copies). It does **not** help write scaling — every copy must eventually hold *all* the writes.
+- **Sharding (partitioning) = SPLITTING the data into pieces**, each on a different node (e.g. keys A–M on one, N–Z on another). Now two nodes can accept writes at once → **write + storage scaling**. But a single node no longer has "everything."
 
 ```
 Replication (copies):            Sharding (splits):
@@ -881,11 +881,11 @@ Because a write has to reach **every** copy (or they'd disagree). Copies share t
 
 Who's allowed to accept a write:
 
-| Model | Plain meaning | Analogy |
+| Model | Plain meaning | Examples |
 | --- | --- | --- |
-| **Leader–follower** | One node takes all writes, copies to read-only followers | One author writes the doc; others get read-only copies (Postgres, Mongo shard) |
-| **Multi-leader** | Several nodes accept writes, then reconcile conflicts | Two editors edit offline, then merge — conflicts possible (multi-region) |
-| **Leaderless** | Any replica takes writes; correctness via quorum voting | No boss; a majority must agree (Cassandra, DynamoDB) |
+| **Leader–follower** | One node takes all writes, copies to read-only followers | Postgres, Mongo shard |
+| **Multi-leader** | Several nodes accept writes, then reconcile conflicts | multi-region setups |
+| **Leaderless** | Any replica takes writes; correctness via quorum voting | Cassandra, DynamoDB |
 
 #### Q: Consistency models — strong vs eventual, and the `R + W > N` trick?
 

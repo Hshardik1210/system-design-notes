@@ -2,7 +2,7 @@
 
 > A classic **OOD/LLD** problem: model a bank of elevators serving floor requests efficiently. Interviewers grade your **class model, the scheduling/dispatch strategy, and state handling**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (a real-building analogy, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -30,9 +30,9 @@
 
 > **Clarify:** number of elevators/floors; optimize for wait time or energy; express/service elevators?
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
-**Analogy used throughout: the elevator bank in a real office tower.** Picture a 20-floor building with **4 elevator cars** side by side in the lobby. There are two completely different kinds of buttons, and mixing them up is the #1 beginner confusion:
+Take a 20-floor building with **4 elevator cars** side by side in the lobby. There are two completely different kinds of buttons, and mixing them up is the #1 beginner confusion:
 
 - **Hall call (external):** the **up/down buttons on the wall of each floor.** You're standing on floor 7, you want to go down, you press **▼**. You are *not* telling the system which car to send or where you're going — just "someone on floor 7 wants to go down, send me a car."
 - **Car call (internal):** the **panel of floor numbers inside the car.** Once you step in, you press **"12"** — now you're telling *that specific car* your destination.
@@ -75,9 +75,9 @@ A hall call first goes through dispatch ("car #2, you take it"), then car #2 fol
 | `Direction` / `ElevatorState` | UP/DOWN/IDLE; MOVING/STOPPED/DOORS_OPEN |
 | `Door`, `Button`, `Display` | Peripherals |
 
-### Plain-English: who's who in the building
+### Who's who in the building
 
-Map each class onto a real thing you can point at in the office tower:
+Map each class onto a real thing in the office tower:
 
 | Class | Real-world thing | One-line job |
 | --- | --- | --- |
@@ -150,7 +150,7 @@ class ElevatorSystem {
 }
 ```
 
-### Plain-English: the classes, fully annotated
+### The classes, fully annotated
 
 The summary above is the skeleton. Here is the same design **spelled out** so you can see exactly what each field does. Nothing new conceptually — just the blanks filled in.
 
@@ -276,9 +276,9 @@ pick the minimum-cost elevator   # NearestCar / "collective control"
 
 - Swap strategies (nearest-car, energy-optimized, zoned/express) via **Strategy**.
 
-### Plain-English: how ONE car decides its route (SCAN / LOOK)
+### How ONE car decides its route (SCAN / LOOK)
 
-**Analogy: a floor cleaner mopping a corridor.** You don't zig-zag randomly — you sweep from one end to the other cleaning every marked spot, then turn around and sweep back. An elevator does the same with floors: **keep going in the current direction, stopping at every requested floor along the way, and only reverse when there's nothing left ahead.** That's the **SCAN / LOOK "elevator algorithm."**
+The **SCAN / LOOK "elevator algorithm":** **keep going in the current direction, stopping at every requested floor along the way, and only reverse when there's nothing left ahead.** The car doesn't jump back and forth across floors to serve requests in arrival order — it sweeps in one direction, then the other.
 
 Why not just serve requests in the order they were pressed (**FCFS**)? Because it's horrible:
 
@@ -333,7 +333,7 @@ step ... → arrive 10 → doors open → upStops {}  → direction IDLE
 Served 5 BEFORE 10 automatically, even though 10 was pressed first. That's SCAN/LOOK.
 ```
 
-### Plain-English: how the BANK decides which car (dispatch cost function)
+### How the BANK decides which car (dispatch cost function)
 
 That was one car. Now the fleet: a hall call comes in on floor 7 going down — **which of the 4 cars answers?** The `Dispatcher` scores every car with a **cost function** and picks the cheapest. Lower cost = "this car can serve you soonest with least detour."
 
@@ -404,7 +404,7 @@ In simple designs, **no** — the floor is added to that car's stop list and it'
 
 > **Interview lead:** Strategy (dispatch + SCAN movement), State (elevator lifecycle), Command (requests), Observer (displays), Singleton (system).
 
-### Plain-English: the patterns as building parts
+### The patterns as building parts
 
 Patterns sound abstract; here's each one as a thing in the tower, and the *smell* that tells you to reach for it:
 

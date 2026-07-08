@@ -2,7 +2,7 @@
 
 > **Core challenge:** store users' files durably and **sync them across all their devices** efficiently — uploading only what changed (**chunking + dedup**), resolving concurrent edits, and sharing. The signature ideas are **content-addressed chunking**, **delta sync**, a **metadata service separate from the block store**, and a **change journal** devices sync against.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java/SQL, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java/SQL, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -37,7 +37,7 @@ Devices sync against a CHANGE JOURNAL (cursor) → download only NEW chunks they
 
 Two subsystems: a **metadata service** (small, transactional: files, versions, chunk lists, journal) and a **block store** (big, dumb: chunk bytes). Efficiency = only move **changed chunks**.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
 Imagine you install **Dropbox** (or Google Drive / iCloud) on your laptop, your phone, and your work desktop. You drop a 2 GB video into the Dropbox folder on your laptop, and a few minutes later it just... **appears** on your phone and desktop. Later you fix one typo in a 50-page Word doc, and within seconds the corrected copy shows up everywhere — but it clearly didn't re-upload the whole document, because that would take forever every time. That "magic folder that stays identical on every device" is the whole product.
 
@@ -50,7 +50,7 @@ So the system has to answer four hard questions:
 
 Everything else in this doc is just the machinery to answer those four questions cheaply and at massive scale.
 
-### Plain-English: why not just "upload the whole file to a server"?
+### Why not just "upload the whole file to a server"?
 
 First instinct: keep a folder on a server, and whenever a file changes, upload the entire file and download it on the other devices. Why that falls apart fast:
 
@@ -70,7 +70,7 @@ New way:  file "report.docx"  →  [chunk#a1b2, chunk#c3d4, chunk#e5f6]   (a rec
           edit one paragraph  →  only chunk#c3d4 changes → upload just that ONE chunk
 ```
 
-That "files are recipes of content-fingerprinted chunks" idea is detailed in §5, and the split between the recipe-keeper (metadata) and the byte-warehouse (block store) is §6.
+That "files are recipes of content-fingerprinted chunks" idea is detailed in §5, and the split between the recipe-keeper (metadata) and the byte store (block store) is §6.
 
 ---
 
@@ -84,7 +84,7 @@ That "files are recipes of content-fingerprinted chunks" idea is detailed in §5
 **Non-functional**
 - **Durable** (never lose files), available, **bandwidth-efficient**, scalable to billions of files, works **offline** (sync later).
 
-### Plain-English: reading the requirements like a human
+### Reading the requirements
 
 Two lists show up in every system-design answer, and beginners mix them up:
 
@@ -115,7 +115,7 @@ Reads/writes: uploads modest; downloads (sync) higher; block store handles the b
 
 > **Dedup is the storage superpower** (same chunk across versions and users stored once). Metadata is the transactional brain; blocks are the bulk (S3).
 
-### Plain-English: what these back-of-envelope numbers mean
+### What these back-of-envelope numbers mean
 
 Capacity estimation is just sanity-checking "is this even physically possible, and where's the cost?" You don't need exact numbers — you need the *shape*.
 
@@ -165,25 +165,23 @@ SERVER:
 
 - Client talks to **metadata** to learn "what changed," then transfers **chunks directly** to/from the block store (pre-signed URLs).
 
-### Plain-English: the client is a real program, and here's what each piece does
+### The client is a real program — what each piece does
 
-**Analogy used throughout: your desktop app is a diligent personal assistant watching a shared filing cabinet.**
+Unlike most system-design problems where the "client" is just a browser, here the Dropbox desktop/mobile app is a genuine piece of software with jobs to do. Four components live inside it:
 
-Unlike most system-design problems where the "client" is just a browser, here the Dropbox desktop/mobile app is a genuine piece of software with jobs to do. Four little workers live inside it:
-
-| Worker | Its one job | Everyday analogy |
-| --- | --- | --- |
-| **Watcher** | Notice when a file in the folder changes on this device | The assistant who watches the filing cabinet and says "hey, someone touched folder X" |
-| **Chunker** | Cut a changed file into chunks and compute each chunk's hash (fingerprint) | Shredding a document into standard-size pages and stamping each page with a unique fingerprint |
-| **Indexer** | Keep a small **local database**: "this file = these chunk hashes," plus my sync **cursor** | The assistant's private notebook of what everything currently looks like |
-| **Syncer** | Talk to the server: ask what changed, upload/download the actual chunk bytes | The courier who drives things to and from the warehouse |
+| Component | Its one job |
+| --- | --- |
+| **Watcher** | Notice when a file in the folder changes on this device (filesystem events) |
+| **Chunker** | Cut a changed file into chunks and compute each chunk's hash (fingerprint) |
+| **Indexer** | Keep a small **local database**: "this file = these chunk hashes," plus my sync **cursor** |
+| **Syncer** | Talk to the server: ask what changed, upload/download the actual chunk bytes |
 
 And on the server side, three components with clean responsibilities:
 
 ```
-Metadata Service      → the brain: files, versions, chunk lists, permissions, the change journal
-Block Store (S3)      → the warehouse: raw chunk bytes, addressed by their content hash
-Notification Service  → the doorbell: "psst, your folder changed — go check"
+Metadata Service      → files, versions, chunk lists, permissions, the change journal
+Block Store (S3)      → raw chunk bytes, addressed by their content hash
+Notification Service  → signals "your folder changed" so the device knows to sync
 ```
 
 #### Q: Why does the client talk to metadata FIRST, then transfer chunks separately?
@@ -240,7 +238,7 @@ Benefits:
 | **Fixed-size** (e.g. 4MB) | Simple; **but a byte inserted early shifts all boundaries** → every chunk hash changes → poor dedup |
 | **Content-defined (rolling hash, e.g. Rabin)** ✅ | Boundaries are chosen by content patterns → an insert only affects nearby chunks → **stable dedup under edits** |
 
-### Plain-English: what "content-addressed" actually means
+### What "content-addressed" actually means
 
 This is the heart of the whole system, so let's go slow.
 
@@ -255,9 +253,7 @@ chunk bytes ── SHA-256 ──►  "a1b2c3...e5f6"   (64 hex characters — t
 1. **Identical bytes → identical name, always and everywhere.** If you and I both have a chunk containing the exact same bytes, we compute the exact same hash — so it's literally the *same* entry in the store. That's how **dedup** happens automatically: same content can only be stored under one name.
 2. **Different bytes → different name (practically guaranteed).** Change a single byte and the hash comes out completely different. So a name change signals "the content changed," which is exactly what lets us detect which chunks are new.
 
-**Analogy:** it's like naming every page in the world's libraries by a fingerprint of the words on it. Any two pages with identical text get the same fingerprint, so you only ever need to physically store one copy — everyone else just holds a slip of paper with the fingerprint on it.
-
-### Plain-English: a file is a *recipe*, not a blob
+### A file is a *recipe* (ordered list of chunk hashes)
 
 Once chunks are fingerprinted, a **file version is just an ordered list of chunk fingerprints** — a recipe:
 
@@ -302,7 +298,7 @@ List<String> syncFile(byte[] fileBytes) {
 
 The magic line is `if (!server.hasChunk(hash))`. Because the name is a fingerprint of the content, "have you seen these exact bytes before?" is answered by a single fast lookup — no comparing file contents byte-by-byte.
 
-### Plain-English: fixed-size vs content-defined chunking (the boundary-shift problem)
+### Fixed-size vs content-defined chunking (the boundary-shift problem)
 
 The table above is the single trickiest idea in the doc, so here's the concrete version.
 
@@ -345,7 +341,7 @@ List<byte[]> splitContentDefined(byte[] data) {
 }
 ```
 
-> **Analogy:** fixed-size chunking is cutting a paragraph into lines every 80 characters — add one word at the top and every line reflows, so nothing matches. Content-defined chunking is cutting at the end of every *sentence* — add a word to sentence 1 and only sentence 1 changes; sentences 2, 3, 4 are still cut in exactly the same places.
+> **Put differently:** fixed-size chunking cuts text every 80 characters — add one word at the top and every line reflows, so nothing matches. Content-defined chunking cuts at the end of every *sentence* — add a word to sentence 1 and only sentence 1 changes; sentences 2, 3, 4 are still cut in exactly the same places.
 
 #### Q: If two users have the same chunk, whose is it? Can one user see another's data?
 
@@ -370,14 +366,14 @@ Because offsets don't tell you whether the *content* is the same. Two files can 
 
 - **Why split?** Blocks are huge + immutable + dumb → cheap object storage. Metadata is small + transactional + queried constantly → a database. Each scales independently.
 
-### Plain-English: the warehouse vs the librarian
+### Block store vs metadata service
 
-**Analogy:** think of a giant book warehouse.
+The two subsystems have opposite jobs:
 
-- The **block store** is the **warehouse full of identical-looking boxes**. Each box has a fingerprint label (the content hash) and holds some bytes. The warehouse is enormous, cheap per box, and *dumb* — it doesn't know what any box means, who owns it, or which boxes go together. You hand it a fingerprint, it hands you back the box. That's S3.
-- The **metadata service** is the **librarian's catalog**. It's small but constantly consulted, and it's *smart*: it knows "the file `report.docx` version 7 is made of boxes [a1b2, c3d4, e5f6]," who's allowed to open it, what changed recently, and how far each device has caught up.
+- The **block store** stores raw bytes keyed by content hash. It's enormous, cheap per object, and *dumb* — it doesn't know what any chunk means, who owns it, or which chunks go together. You hand it a fingerprint, it hands back the bytes. That's S3.
+- The **metadata service** is small but constantly consulted, and it's *smart*: it knows "the file `report.docx` version 7 is made of chunks [a1b2, c3d4, e5f6]," who's allowed to open it, what changed recently, and how far each device has caught up.
 
-You don't reorganize the warehouse to rename a file — you just update the catalog. That single idea (move metadata, not bytes) is why rename/move/restore are near-instant.
+You don't touch the block store to rename a file — you just update the metadata. That single idea (move metadata, not bytes) is why rename/move/restore are near-instant.
 
 #### Q: Why not just keep everything in one big database?
 
@@ -403,10 +399,10 @@ Immutable = **a chunk, once written, is never modified in place.** If you edit a
 ```java
 // A tiny "metadata knows the recipe; block store knows the bytes" reassembly:
 byte[] downloadFile(long versionId) {
-    List<String> recipe = metadata.getChunkHashes(versionId);   // ask the librarian
+    List<String> recipe = metadata.getChunkHashes(versionId);   // ask the metadata service
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     for (String hash : recipe) {
-        out.write(blockStore.get(hash));   // fetch each box from the warehouse, in order
+        out.write(blockStore.get(hash));   // fetch each chunk from the block store, in order
     }
     return out.toByteArray();              // glue the chunks back into the original file
 }
@@ -433,12 +429,12 @@ Sync:
 - **Long-poll / WebSocket** notification avoids constant polling; the journal makes "what changed since I last synced" an O(delta) query.
 - **Offline:** queue local changes; on reconnect, upload deltas + pull journal → merge/resolve.
 
-### Plain-English: the change journal is a shared logbook
+### The change journal
 
-**Analogy:** imagine a shared apartment with a **logbook on the fridge**. Every time anyone does something to the shared space, they add a numbered line: "#41 – bought milk," "#42 – took out trash," "#43 – fixed the lamp." When you come home after a few days away, you don't inspect the entire apartment inch by inch. You just look at the logbook and read **only the lines after the last number you'd already seen**. That's the whole sync design.
+The core sync mechanism is an **append-only log** of changes. Every time anything in a namespace changes, a new numbered entry is appended: `seq 41`, `seq 42`, `seq 43`. To catch up, a device reads **only the entries after the last sequence number it already applied** — it never re-scans the whole folder.
 
-- The **change journal** is that logbook: an append-only list of "what changed," each line stamped with an ever-increasing sequence number (`seq`). One journal per **namespace** (a user's own folder, or a shared folder).
-- Your device's **cursor** is the bookmark: "I've read up to line #42." To catch up, you ask "give me everything after 42" and you get back exactly the new lines — nothing more.
+- The **change journal** is that log: an append-only list of "what changed," each entry stamped with an ever-increasing sequence number (`seq`). One journal per **namespace** (a user's own folder, or a shared folder).
+- Your device's **cursor** is the marker of progress: "I've applied up to seq 42." To catch up, it asks "give me everything after 42" and gets back exactly the new entries — nothing more.
 
 ```
 CHANGE JOURNAL for namespace "alice-home":
@@ -456,11 +452,11 @@ Why this beats the naive "compare every file":
 - **O(delta), not O(everything).** A user with 100,000 files who changed 2 of them produces 2 journal lines. The catching-up device does 2 units of work, not 100,000. Comparing every file every time would be brutal at scale.
 - **Ordered and resumable.** Because entries are numbered, a device that dies mid-sync just resumes from its last cursor. No "did I miss something?" ambiguity.
 
-### Plain-English: why notifications (don't just poll constantly)
+### Why notifications (don't just poll constantly)
 
-If every device asked the server "anything new?" every second, a billion devices would hammer the server pointlessly — 99.9% of those calls answer "nope." So instead the **Notification Service** works like a **doorbell**: the device opens a connection and *waits quietly*; the server rings it only when that namespace actually changes, and then the device does its `GET /delta`.
+If every device asked the server "anything new?" every second, a billion devices would hammer the server pointlessly — 99.9% of those calls answer "nope." So instead the **Notification Service** pushes: the device opens a connection and *waits*; the server notifies it only when that namespace actually changes, and then the device does its `GET /delta`.
 
-Two common ways to build that doorbell:
+Two common ways to build that push channel:
 
 | Mechanism | How it works | Trade-off |
 | --- | --- | --- |
@@ -470,7 +466,7 @@ Two common ways to build that doorbell:
 ```java
 // The sync loop from the device's point of view — fetch only what's after the cursor.
 void syncNamespace(long namespaceId) {
-    notificationService.waitForChange(namespaceId);        // doorbell: block until "you changed"
+    notificationService.waitForChange(namespaceId);        // block until "your namespace changed"
 
     long cursor = localDb.getCursor(namespaceId);          // "I'm caught up through here"
     List<JournalEntry> changes = server.getDelta(namespaceId, cursor);   // ONLY newer entries
@@ -500,7 +496,7 @@ Two steps, and this is the payoff of everything before it: (1) the journal entry
 
 #### Q: How does offline mode fit in?
 
-While offline, the device can't ring the doorbell or upload — so it just **queues its local changes** in its own little database (Watcher noticed them, Chunker chunked them). On reconnect it does both directions: **push** its queued deltas up (upload new chunks, commit new versions → new journal entries), and **pull** the journal from its cursor to learn what others did. If both sides touched the same file while it was offline, that's a conflict → §8.
+While offline, the device can't receive notifications or upload — so it just **queues its local changes** in its own little database (Watcher noticed them, Chunker chunked them). On reconnect it does both directions: **push** its queued deltas up (upload new chunks, commit new versions → new journal entries), and **pull** the journal from its cursor to learn what others did. If both sides touched the same file while it was offline, that's a conflict → §8.
 
 ---
 
@@ -510,7 +506,7 @@ While offline, the device can't ring the doorbell or upload — so it just **que
 - **Concurrent edits** to the same file from two devices → detected via **base-version mismatch** (both edited version N): keep **both** as a **"conflicted copy"** (`file (Device B's conflicted copy)`) rather than silently overwriting → **never lose data**.
 - **Version history** = the list of prior chunk-list snapshots; **restore** = point the file at an old version (chunks still exist).
 
-### Plain-English: what a "version" really is (it's cheap!)
+### What a "version" really is (it's cheap)
 
 A **version is just a saved recipe** — an ordered list of chunk hashes at a moment in time. Because chunks are immutable and shared, saving a new version is nearly free: you only store the *recipe* plus any genuinely new chunks. The old recipe still points at its old chunks, which still exist.
 
@@ -526,9 +522,9 @@ Restore v5  =  just point the file back at recipe [a1, b2, c3]. No downloads if 
 
 That's why "restore to last Tuesday" is instant: nothing is recomputed or re-uploaded — the metadata simply points the file at an older recipe whose chunks were never deleted.
 
-### Plain-English: the conflict problem, and why we keep both copies
+### The conflict problem, and why we keep both copies
 
-**Analogy:** you and a coworker both grab the *same* printed page (say, "version 5"), scribble different edits, and both try to file your page back as "the new version 5." Whose wins? If the system blindly kept the last one filed, the first person's edits vanish silently — the cardinal sin for a storage product ("**never lose data**").
+Two devices both read the *same* version (say version 5), make different edits, and both try to commit their result as the successor of version 5. Which wins? If the system blindly kept the last write, the first device's edits vanish silently — the cardinal sin for a storage product ("**never lose data**").
 
 How the system detects this: every edit records **which version it was based on** (its *base version*). When you upload, the server checks whether that base is still the current version.
 
@@ -573,11 +569,11 @@ No — thanks to dedup (§5), the conflicted copy **shares all the chunks it has
 - A **shared folder is its own namespace** with its own journal → all members' devices sync it.
 - Permission checks in the metadata service; revoking access stops sync + downloads.
 
-### Plain-English: a shared folder is its own logbook
+### A shared folder is its own namespace
 
 Recall from §7 that each **namespace** has its own change journal. Sharing is basically: **make the shared folder a namespace, and let multiple people's devices subscribe to its journal.**
 
-**Analogy:** your private Drive is your personal diary (only your devices read its logbook). A shared team folder is the fridge logbook in a shared apartment — *everyone who lives there* reads and writes the same numbered list. When Alice adds "#57 – updated the deck," Bob's and Carol's devices all see entry #57 and pull the change.
+Your private Drive is a namespace only your devices follow. A shared team folder is a *separate* namespace whose journal is followed by *every* member's devices. When Alice commits `seq 57` to the shared journal, Bob's and Carol's devices all see entry 57 and pull the change.
 
 ```
 alice-home  namespace → journal A   (only Alice's laptop + phone follow it)
@@ -655,18 +651,18 @@ CREATE TABLE shares ( namespace_id BIGINT, grantee_id BIGINT, role VARCHAR(10), 
 
 > **Tables to consider:** users, files (tree), file_versions, version_chunks, chunks (dedup registry + ref_count), **change_journal**, device_sync_state (cursor), shares/namespaces. Bytes → block store.
 
-### Plain-English: how the tables fit together
+### How the tables fit together
 
 Don't memorize the columns — understand the **shape**. Each table maps directly to one idea we've already met:
 
-| Table | Plain-English role | Ties back to |
+| Table | Role | Ties back to |
 | --- | --- | --- |
 | `users` | Who you are + your storage quota | §2 |
-| `files` | The folder tree: names, parent folders, which version is current, soft-delete flag | §1 (a file entry) |
+| `files` | The folder tree: names, parent folders, which version is current, soft-delete flag | §1 |
 | `file_versions` | One row per saved version of a file (the history) | §8 versioning |
 | `version_chunks` | **The recipe**: for a version, the ordered list of chunk hashes | §5 "file = recipe" |
 | `chunks` | The dedup registry: each unique chunk hash + how many recipes point at it (`ref_count`) | §5 dedup + §14 GC |
-| `change_journal` | The shared logbook of "what changed," numbered by `seq` | §7 journal |
+| `change_journal` | The append-only log of "what changed," numbered by `seq` | §7 journal |
 | `device_sync_state` | Each device's bookmark (`cursor`) into the journal | §7 cursor |
 | `shares` | Who has what role on which namespace | §9 sharing |
 
@@ -722,7 +718,7 @@ Device: GET /delta?cursor=N → journal entries after N
   for each changed file: get chunk list → download chunks it LACKS → reassemble → advance cursor
 ```
 
-### Plain-English: the two flows as a story
+### The two flows, step by step
 
 **Uploading an edit (device A):** you save a change → the *Watcher* notices → the *Chunker* re-chunks and hashes → the app asks the server "of these chunk hashes, which are **new**?" (`/has-chunks`) → it uploads **only the new ones** straight to S3 → it posts the new recipe → the server appends a line to the journal (`seq++`). Notice the pattern: *check what's needed, move only that, then record it.*
 
@@ -735,7 +731,7 @@ Client                              Server
   |                                   |-- append journal entry seq=44 → wake other devices
 ```
 
-**Syncing down (device B):** the doorbell rings ("namespace X changed") → device asks "what's after my cursor N?" → for each changed file it grabs the recipe and downloads only the chunks it's **missing** → reassembles → advances its cursor. Same pattern in reverse: *learn what changed, fetch only the missing bytes, record how far you got.*
+**Syncing down (device B):** the notification arrives ("namespace X changed") → device asks "what's after my cursor N?" → for each changed file it grabs the recipe and downloads only the chunks it's **missing** → reassembles → advances its cursor. Same pattern in reverse: *learn what changed, fetch only the missing bytes, record how far you got.*
 
 > **The symmetry to remember:** both directions are "compute the delta, move only the delta, then update a marker (journal seq on upload, cursor on download)." That's the entire sync engine in one sentence.
 
@@ -754,7 +750,7 @@ Client                              Server
 | Deleted file | Soft-delete (tombstone) + retain versions for restore window |
 | Move/rename | Metadata-only op (no chunk transfer) |
 
-### Plain-English: the edge cases that trip people up
+### The edge cases that trip people up
 
 Each row is a "but what if...?" — here they are in plain terms:
 
@@ -816,7 +812,7 @@ The fix is a **grace period**: don't delete a chunk the instant it hits 0; wait 
 - **GC**: chunks with `ref_count = 0` are garbage-collected (with a grace period to avoid races).
 - **Failure**: partial upload → missing chunks re-sent; metadata replicated; conflicts kept as copies (never lose data).
 
-### Plain-English: how each part scales (and survives failure)
+### How each part scales (and survives failure)
 
 The design scales well because its two halves scale in completely different, independent ways:
 
@@ -825,9 +821,9 @@ The design scales well because its two halves scale in completely different, ind
 | **Block store (S3)** | Just add more storage — S3 is effectively infinite and replicates each object across machines/datacenters | Bytes are immutable + content-addressed, so they cache and replicate trivially; **dedup + compression** shrink the raw exabytes dramatically |
 | **Metadata service** | **Shard by user/namespace** — split the billions of rows across many DB servers, each owning a slice | It's small per user and the **journal** makes sync O(delta), so no single server drowns |
 | **Sync bandwidth** | **Delta sync** — move only changed chunks; **resumable** so flaky networks don't restart transfers | The expensive work (moving bytes) is minimized to just what changed |
-| **Notifications** | Doorbell model instead of polling | A billion idle devices cost almost nothing until something actually changes |
+| **Notifications** | Server-push instead of polling | A billion idle devices cost almost nothing until something actually changes |
 
-**Analogy for sharding metadata:** one giant phone book for the whole planet is unusable. Instead, split it by region — "users A–F live on server 1, G–M on server 2…". Each server answers quickly for its slice, and you add servers as the population grows.
+**On sharding metadata:** a single database can't hold billions of rows for the whole user base. Split the keyspace by user/namespace — users A–F on server 1, G–M on server 2, and so on. Each server answers quickly for its slice, and you add servers as the population grows.
 
 #### Q: What actually protects me from losing a file?
 

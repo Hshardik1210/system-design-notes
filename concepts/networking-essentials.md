@@ -2,7 +2,7 @@
 
 > The network fundamentals that show up in system-design interviews: **DNS**, **TCP vs UDP**, **HTTP versions**, **TLS/HTTPS**, and where each matters. You rarely design these, but you must know how a request travels and the trade-offs.
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (analogies, annotated examples, and the exact confusions that trip beginners up). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated examples and the exact confusions that trip beginners up). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -29,25 +29,25 @@
 6. Browser renders; keeps connection alive (keep-alive) for more requests
 ```
 
-### Plain-English: sending a letter to a friend
+### The steps of loading a URL
 
-Think of visiting `example.com` like **posting a physical letter** to someone whose street address you don't know:
+Visiting `example.com` involves several distinct steps, each solving a different problem:
 
-1. **DNS = looking up the address.** You know the *name* ("example.com"), but the postal system needs a *street address* (an IP like `93.184.216.34`). DNS is the phone book that turns the name into the address.
-2. **TCP handshake = calling ahead to agree "we're connected."** Before shipping anything, both sides confirm they can hear each other (a quick "hello / hello back / got it").
-3. **TLS handshake = sealing the envelope + checking ID.** You verify the recipient really is who they claim (their ID card = certificate) and agree on a secret code so nobody can read the letter in transit.
-4. **HTTP request = the actual letter.** "Please send me your home page." The server writes back with the page (the HTTP response).
-5. **CDN / load balancer = the local sorting office.** Often you don't reach the far-away head office directly — a nearby branch (CDN) or a receptionist who routes you to a free clerk (load balancer) handles you first.
-6. **Keep-alive = staying on the line.** Rather than hang up and re-dial for every page, you keep the connection open to ask for more (images, scripts, next page).
+1. **DNS = resolving the name to an address.** You have the *name* (`example.com`), but the network needs an *IP address* (like `93.184.216.34`). DNS translates the name into the address.
+2. **TCP handshake = establishing the connection.** Before sending data, both sides confirm they can send and receive (SYN / SYN-ACK / ACK).
+3. **TLS handshake = authentication + encryption setup.** The client verifies the server's identity (its certificate) and both sides derive a shared secret key so the traffic can't be read in transit.
+4. **HTTP request = the actual request/response.** "Send me your home page." The server replies with the page (the HTTP response).
+5. **CDN / load balancer = intermediaries in front of the origin.** Often the request doesn't reach the origin directly — a nearby CDN edge, or a load balancer that forwards to a healthy backend, handles it first.
+6. **Keep-alive = reusing the connection.** Rather than open a new connection per request, the connection stays open to fetch more (images, scripts, next page).
 
 Everything below is just each of those steps in detail.
 
 #### Q: What's the difference between an IP address and a port?
 
-- **IP address = the building's street address** — *which machine* on the internet (e.g. `93.184.216.34`).
-- **Port = the apartment/room number** — *which program* on that machine (e.g. `443` for HTTPS, `80` for plain HTTP, `22` for SSH).
+- **IP address** identifies *which machine* on the internet (e.g. `93.184.216.34`).
+- **Port** identifies *which program/service* on that machine (e.g. `443` for HTTPS, `80` for plain HTTP, `22` for SSH).
 
-So `93.184.216.34:443` means "the HTTPS service, on that server." One machine runs many services, each listening on its own port — like one building with many offices behind one address.
+So `93.184.216.34:443` means "the HTTPS service, on that server." One machine runs many services, each listening on its own port.
 
 #### Q: Why so many steps just to load one page?
 
@@ -76,17 +76,17 @@ Browser cache → OS cache → Resolver (ISP) → Root → TLD (.com) → Author
 - **GeoDNS** returns different IPs by user location (route to nearest region).
 - **Anycast** — same IP announced from many locations; routed to the nearest (CDNs, DNS).
 
-### Plain-English: DNS is the internet's phone book
+### How DNS resolution works
 
-Computers don't talk to `google.com`; they talk to numbers like `142.250.183.14`. **DNS (Domain Name System) is the giant, distributed phone book** that turns the human name into the number.
+Computers don't connect to `google.com`; they connect to IP addresses like `142.250.183.14`. **DNS (Domain Name System) is the distributed system** that translates the human-readable name into the IP address.
 
-**Analogy — asking around for a phone number.** You want a friend's number:
+A lookup walks a chain, checking caches first and only going further when needed:
 
-1. **You check your own contacts first** (browser cache) — instant.
-2. **You ask your phone's saved list** (OS cache) — still fast.
-3. **You call directory assistance** (your ISP's *resolver*) — the helper who does the legwork.
-4. Directory assistance doesn't know it either, so it asks up the chain: **Root** ("who handles `.com`?") → **TLD** (the `.com` registry: "who's authoritative for `example.com`?") → **Authoritative name server** (the one that actually *knows* example.com's IP).
-5. The answer flows back and **everyone writes it down for a while** (caches it) so the next lookup is instant. How long they keep it = the **TTL** (time-to-live).
+1. **Browser cache** — if the name was resolved recently, answer instantly.
+2. **OS cache** — the operating system's cached entries, still fast.
+3. **Resolver** (your ISP's) — does the recursive lookup work when the caches miss.
+4. The resolver queries up the hierarchy: **Root** (which server handles `.com`?) → **TLD** (the `.com` registry: who's authoritative for `example.com`?) → **Authoritative name server** (which actually holds example.com's IP).
+5. The answer flows back and **each level caches it for a while** so the next lookup is instant. How long it's cached = the **TTL** (time-to-live).
 
 ```
 You type example.com
@@ -118,10 +118,10 @@ The `3600` is the TTL: for the next hour, resolvers reuse this answer instead of
 
 #### Q: What are the record types (A, CNAME, MX...) really for?
 
-Each DNS record is just a labelled entry in the phone book answering a *different* question about the domain:
+Each DNS record is a labelled entry answering a *different* question about the domain:
 
 - **A / AAAA** — "what's the IP?" (A = IPv4, AAAA = IPv6). The most common lookup.
-- **CNAME** — "this name is an alias for *that* name" (e.g. `www.example.com` really points to `example.com`). Like "for Bob, see Robert."
+- **CNAME** — "this name is an alias for *that* name" (e.g. `www.example.com` really points to `example.com`).
 - **MX** — "which servers receive *email* for this domain?"
 - **NS** — "which name servers are the authority for this domain?"
 - **TXT** — free-form text, used for verification/anti-spam (SPF, DKIM proving who may send mail as you).
@@ -136,7 +136,7 @@ TTL is "how long may everyone cache this answer before re-checking."
 #### Q: GeoDNS and anycast — how do they route me to the nearest server?
 
 - **GeoDNS**: the authoritative server looks at *where the question came from* and hands back a *different IP* — a user in India gets the Mumbai IP, a user in the US gets the Virginia IP. Same name, location-aware answer.
-- **Anycast**: many servers around the world announce the *same* IP, and internet routing naturally delivers you to the closest one. Used heavily by CDNs and public DNS (like `8.8.8.8`). Analogy: dialing a national hotline number that automatically connects you to your nearest branch.
+- **Anycast**: many servers around the world announce the *same* IP, and internet routing naturally delivers you to the closest one. Used heavily by CDNs and public DNS (like `8.8.8.8`).
 
 ---
 
@@ -151,27 +151,27 @@ TTL is "how long may everyone cache this answer before re-checking."
 
 > **Rule:** TCP when you can't lose data (most apps); UDP when **low latency > perfect delivery** (live streams, games, VoIP). HTTP/3 runs over **QUIC (UDP)** but adds reliability itself.
 
-### Plain-English: a phone call vs shouting across a room
+### TCP vs UDP in detail
 
-Both TCP and UDP carry your data as **packets** (little chunks) across the network. They differ in *how much they promise*.
+Both TCP and UDP carry your data as **packets** (chunks) across the network. They differ in *what guarantees they provide*.
 
-- **TCP = a phone call.** You first say "hello?" and wait for "hello!" before talking (the handshake). Then it's an ordered, reliable conversation: if the other person misses a word, they say "sorry, repeat that" (retransmit), and everything arrives *in order*. More polite overhead, but nothing is lost or scrambled.
-- **UDP = shouting a message across a noisy room.** You just yell it and move on. No "can you hear me?" first, no confirmation, no re-shouting if a word is missed. Faster and simpler, but some words may be lost or arrive out of order — and you won't even know.
+- **TCP is connection-oriented and reliable.** It first establishes a connection (the handshake), then delivers an ordered, reliable stream: lost packets are retransmitted and everything arrives *in order*. More overhead, but nothing is lost or reordered.
+- **UDP is connectionless and best-effort.** It just sends packets with no setup, no acknowledgement, and no retransmission. Faster and simpler, but packets may be lost or arrive out of order — and the sender isn't notified.
 
-#### The TCP handshake (the "hello / hello back / got it")
+#### The TCP handshake
 
 Before any data, TCP does a **three-way handshake** so both sides agree they can send and receive:
 
 ```
 Client                                Server
-  │  ── SYN ───────────────────────►   │   "Hi, I want to talk. (here's my starting number)"
-  │  ◄────────────── SYN-ACK ───────   │   "Hi back — I hear you, and I want to talk too."
-  │  ── ACK ───────────────────────►   │   "Great, I hear you too. Let's go."
+  │  ── SYN ───────────────────────►   │   open request + client's initial sequence number
+  │  ◄────────────── SYN-ACK ───────   │   acknowledges client, sends server's sequence number
+  │  ── ACK ───────────────────────►   │   acknowledges server; connection established
   │                                     │
   │  ==== now data flows both ways, reliably & in order ====
 ```
 
-- **SYN** = "synchronize" (let's start, here's my sequence number).
+- **SYN** = "synchronize" (open the connection, here's my sequence number).
 - **ACK** = "acknowledge" (I received yours).
 - After this, every chunk is numbered; the receiver ACKs what it got, and anything missing is resent. That's what "reliable, ordered" means — and why TCP has more overhead than UDP.
 
@@ -200,9 +200,9 @@ Ask: *"Is a lost or out-of-order piece a disaster, or just a tiny glitch?"*
 - **HTTP/2 multiplexing:** many concurrent requests over one TCP connection (no more 6-connection limit).
 - **HTTP/3/QUIC:** independent streams so one lost packet doesn't stall the others; 0-RTT resumption.
 
-### Plain-English: HTTP is the language; the versions are about *speed*
+### What differs between HTTP versions
 
-**HTTP is just the request/response language** the browser and server speak: "GET me `/index.html`" → "here it is, 200 OK." All three versions speak the same language — they differ in **how efficiently they move the messages** over the wire.
+**HTTP is the request/response protocol** the browser and server speak: "GET `/index.html`" → "here it is, 200 OK." All three versions use the same request/response model — they differ in **how efficiently they move the messages** over the wire.
 
 #### Annotated example: what one HTTP request/response looks like
 
@@ -222,15 +222,15 @@ Content-Length: 1256            # how many bytes
 
 That shape (method, headers, body) is the same across versions — the plumbing underneath changes.
 
-**Analogy — one lane vs many lanes on a road, then a better road.**
+The progression is about concurrency and head-of-line blocking:
 
-- **HTTP/1.1 = a single-lane road.** One car (request) at a time on a connection; the next waits until the first finishes. Browsers cheated by opening ~6 parallel roads (connections) to the same site. The problem: one slow car blocks everyone behind it (**head-of-line blocking**).
-- **HTTP/2 = one road with many lanes (multiplexing).** Many requests share *one* connection at the same time, interleaved, plus compressed headers. Much less overhead. But because it still rides on **TCP**, if one packet is lost, *TCP itself* stalls *all* lanes until it's resent — so a subtler head-of-line blocking remains at the transport layer.
-- **HTTP/3 = a smarter multi-lane road built on QUIC (UDP).** The lanes are truly independent: a lost packet only pauses *its own* lane, not the others. Plus faster setup (fewer round trips, even 0-RTT to resume a known server) — a big win on flaky mobile/Wi-Fi networks. It even survives you switching networks (Wi-Fi → cellular) without dropping the connection (**connection migration**).
+- **HTTP/1.1** — one request at a time per connection; the next waits until the first finishes. Browsers worked around this by opening ~6 parallel connections per site. The problem: one slow request blocks the ones behind it on that connection (**head-of-line blocking**).
+- **HTTP/2** — **multiplexing**: many requests share *one* connection at the same time, interleaved, plus compressed headers. Much less overhead. But because it still rides on **TCP**, if one packet is lost, *TCP itself* stalls *all* streams until it's retransmitted — so a subtler head-of-line blocking remains at the transport layer.
+- **HTTP/3** — built on **QUIC (UDP)**. Streams are truly independent: a lost packet only pauses *its own* stream, not the others. Plus faster setup (fewer round trips, even 0-RTT to resume a known server) — a big win on lossy mobile/Wi-Fi networks. It even survives a network switch (Wi-Fi → cellular) without dropping the connection (**connection migration**).
 
 #### Q: What is "head-of-line blocking" in plain terms?
 
-It's when **one stuck item blocks everything behind it**, like one slow shopper freezing the whole checkout queue.
+It's when **one stuck item blocks everything queued behind it**.
 
 - **HTTP/1.1**: one slow *request* blocks the next on that connection (application level).
 - **HTTP/2**: fixes that at the app level (many streams), but one lost *packet* on the shared TCP connection freezes all streams (transport level).
@@ -263,26 +263,26 @@ TLS handshake (simplified):
 | **mTLS** | Both sides present certs — service-to-service auth |
 | **1-RTT / 0-RTT** | TLS 1.3 speeds up the handshake |
 
-### Plain-English: locking the envelope and checking ID
+### What TLS provides
 
-Plain HTTP is a **postcard** — anyone handling it (your ISP, café Wi-Fi, a hacker on the network) can read it and even scribble on it. **HTTPS wraps HTTP in TLS**, which is like putting the letter in a **locked box** where:
+Plain HTTP is sent in the clear — anyone on the network path (your ISP, shared Wi-Fi, an attacker) can read and modify it. **HTTPS wraps HTTP in TLS**, which adds three guarantees:
 
-- **Only the two of you have the key** (encryption — nobody can read it),
-- **Nobody can tamper with it unnoticed** (integrity),
-- **You've verified the recipient is really who they claim** (authentication — you're not talking to an impostor).
+- **Confidentiality** (encryption) — only the two endpoints can read the traffic,
+- **Integrity** — tampering in transit is detected,
+- **Authentication** — the client verifies the server really is who it claims (not an impostor).
 
-**Analogy — meeting a stranger who claims to be your bank.** Before sharing secrets you'd (1) check their ID card, (2) confirm it was issued by an authority you trust, then (3) agree on a private code for the rest of the chat. TLS does exactly this.
+TLS achieves the last one by having the server present a certificate: the client (1) checks the certificate, (2) confirms it was issued by a CA it trusts, then (3) both sides derive a shared secret key for the rest of the session.
 
 #### The TLS handshake, step by step
 
 ```
 Client                                                 Server
-  │  ── Client Hello ──────────────────────────────►    │  "Hi, here are the encryption
-  │      (cipher suites I support, random number)        │   methods I can use."
+  │  ── Client Hello ──────────────────────────────►    │  cipher suites the client
+  │      (cipher suites I support, random number)        │  supports + a random number
   │                                                       │
-  │  ◄──────── Server Hello + Certificate ──────────     │  "Here's my ID (certificate),
-  │      (chosen cipher, cert with public key,            │   signed by a trusted CA."
-  │       server random number)                          │
+  │  ◄──────── Server Hello + Certificate ──────────     │  chosen cipher + certificate
+  │      (chosen cipher, cert with public key,            │  (public key), signed by a CA,
+  │       server random number)                          │  + a random number
   │                                                       │
   │  [Client verifies the certificate:                    │
   │     - is it signed by a CA my system trusts?          │
@@ -299,16 +299,16 @@ Client                                                 Server
 
 Two tools, each for what it's best at:
 
-- **Asymmetric (public/private key)** is great for **safely agreeing on a secret with a stranger** — but it's *slow*. So TLS uses it only briefly, during the handshake, to establish a shared key and verify identity.
-- **Symmetric (one shared key both sides use)** is **fast** — but needs both sides to already share the secret. Once the handshake has secretly established that shared key, all the *actual data* uses fast symmetric encryption.
+- **Asymmetric (public/private key)** can **establish a shared secret between two parties that have never met** and verify identity — but it's *slow*. So TLS uses it only briefly, during the handshake.
+- **Symmetric (one shared key both sides use)** is **fast** — but requires both sides to already share the secret. Once the handshake has established that shared key, all the *actual data* uses fast symmetric encryption.
 
-Analogy: use the slow, secure armored truck (asymmetric) *once* to deliver a shared padlock key; then both of you use that quick padlock (symmetric) for everything after.
+So asymmetric crypto is used *once* to securely agree on a symmetric key; then the fast symmetric key encrypts everything after.
 
 #### Q: What's a certificate and a CA, and why do I trust them?
 
-- A **certificate** is the server's ID card: "I am example.com, here's my public key," **digitally signed by a Certificate Authority (CA)**.
-- A **CA** (like Let's Encrypt, DigiCert) is a trusted notary. Your operating system/browser ships with a built-in list of CAs it trusts. If a cert is signed by one of them (and matches the domain, isn't expired, isn't revoked), you trust it — the **chain of trust** back to a **root CA**.
-- This stops an attacker from impersonating your bank: they can't produce a valid CA-signed certificate for your bank's domain.
+- A **certificate** is the server's identity document: "I am example.com, here's my public key," **digitally signed by a Certificate Authority (CA)**.
+- A **CA** (like Let's Encrypt, DigiCert) is a trusted third party. Your operating system/browser ships with a built-in list of CAs it trusts. If a cert is signed by one of them (and matches the domain, isn't expired, isn't revoked), you trust it — the **chain of trust** back to a **root CA**.
+- This stops an attacker from impersonating a site: they can't produce a valid CA-signed certificate for a domain they don't control.
 
 #### Q: What is TLS termination and mTLS?
 

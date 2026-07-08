@@ -2,7 +2,7 @@
 
 > **Core challenge:** Reliably deliver the **right message** to the **right user** on the **right channel** at the **right time** — without duplicates, without spam, and without blocking the source system. Used by Amazon (order updates), Swiggy (delivery tracking), BookMyShow (show reminders), LinkedIn (activity alerts), WhatsApp (messages).
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -71,13 +71,13 @@ event → preference check → template render → queue → worker → provider
 
 > Notifications are almost always **async**. The Order Service should not wait for FCM or Twilio to respond before confirming an order.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
-Imagine you run Swiggy. All day, things happen that a user should hear about: an order gets confirmed, a delivery agent is 5 minutes away, a payment fails, a flash sale starts. Each of those is an **event**. The notification system's whole job is: *"something happened → tell the right people, on the channel they prefer, once, and don't fall over when 10 million events land at dinner time."*
+On a service like Swiggy, things happen all day that a user should hear about: an order gets confirmed, a delivery agent is 5 minutes away, a payment fails, a flash sale starts. Each of those is an **event**. The notification system's whole job is: *"something happened → tell the right people, on the channel they prefer, once, and don't fall over when 10 million events land at dinner time."*
 
-Think of it like the **front desk of a big hotel**. Guests don't call the kitchen, laundry, and housekeeping directly — they leave a request at the front desk, and the front desk figures out *who* to route it to, *how* to reach them, and *retries* if the housekeeper didn't pick up. The Order Service is a guest; the notification system is the front desk; FCM/Twilio/SendGrid are the departments that actually do the work.
+The notification system sits between the source systems and the delivery providers: source services (Order, Payment, Chat) don't call FCM/Twilio/SendGrid directly — they hand the event to the notification system, which decides *who* to notify, *which channel* to reach them on, and *retries* on failure. The Order Service is a caller; the notification system routes and delivers; FCM/Twilio/SendGrid are the providers that do the actual sending.
 
-### Plain-English: why not just call FCM directly from the Order Service?
+### Why not just call FCM directly from the Order Service?
 
 First instinct: when an order is confirmed, the Order Service just calls FCM (Google's push service) itself. Why big systems don't:
 
@@ -151,14 +151,14 @@ One business event ("order confirmed") often produces **several** of these at on
 - Notification content moderation
 - Multi-region active-active (mention as follow-up)
 
-### Plain-English: reading the requirements table like a human
+### Reading the requirements table
 
 The two columns above (Functional vs Non-Functional) answer two different questions:
 
 - **Functional = "what can it do?"** — the features a user or product manager would list: *send to one person, send to a million, respect opt-outs, retry, schedule.*
 - **Non-Functional (NFR) = "how well must it do it?"** — the qualities that don't show up as buttons: *fast, reliable, no duplicates, survives a provider outage.*
 
-Analogy: for a **pizza delivery**, "deliver a pizza" is functional; "deliver it hot, in 30 min, to the right door, every time" is non-functional. The NFRs are usually what makes the system *hard* — anyone can send one push; sending 250M/day with no duplicates and OTPs in under a second is the real engineering.
+The NFRs are usually what makes the system *hard* — anyone can send one push; sending 250M/day with no duplicates and OTPs in under a second is the real engineering.
 
 #### Q: Which requirement is the "hardest" one and why?
 
@@ -207,9 +207,9 @@ Bulk campaign example:
 - **Fan-out is a different problem** than single-user notify — batch + campaign pipeline.
 - **Partition Kafka by `user_id`** — per-user ordering + even load.
 
-### Plain-English: where these numbers come from
+### Where these numbers come from
 
-You're not expected to *know* the traffic — you **estimate** it out loud so the interviewer sees your reasoning. It's like guessing how many meals a restaurant serves: *seats × turns × hours*. Here it's *users × notifications-per-user*.
+You're not expected to *know* the traffic — you **estimate** it out loud so the interviewer sees your reasoning. Here it's *users × notifications-per-user*.
 
 ```
 50,000,000 users  ×  5 notifications each per day  =  250,000,000 per day
@@ -303,9 +303,9 @@ GET  /v1/users/{userId}/notification-preferences
 PUT  /v1/users/{userId}/notification-preferences
 ```
 
-### Plain-English: what the API actually promises
+### What the API actually promises
 
-The important line is **"return `202 Accepted`, fire-and-forget."** The API is like a **post office counter**: you hand over a letter, they stamp it "accepted," and you leave. They do **not** wait for the letter to reach its destination before giving you the receipt. `202` literally means *"I've taken responsibility for this; I'll deliver it in the background."* (Contrast `200 OK` = "done" and `201 Created` = "made a thing.")
+The important line is **"return `202 Accepted`, fire-and-forget."** The API accepts the request, records it, and returns immediately — it does **not** wait for the message to actually reach the user. `202` literally means *"I've taken responsibility for this; I'll deliver it in the background."* (Contrast `200 OK` = "done" and `201 Created` = "made a thing.")
 
 ```java
 @PostMapping("/v1/notifications")
@@ -381,15 +381,15 @@ Notice the request has `type` and `data`, but no "title"/"body" string. That's d
 
 **Queue choices:** Kafka (high throughput, replay, partitioning), SQS (managed, DLQ built-in), RabbitMQ (routing flexibility). Kafka is the common interview answer at scale.
 
-### Plain-English: reading the box diagram top to bottom
+### Reading the box diagram top to bottom
 
-Follow one order-confirmation through the picture like a parcel through a courier network:
+Follow one order-confirmation through the picture top to bottom:
 
-1. **Source system** (Order Service) — the sender. Drops off a "please notify" event.
-2. **Notification API** — the sorting clerk. Checks the address (preferences), writes the label (template), logs the parcel (DB), and puts it on the right conveyor belt.
-3. **Kafka (the queue)** — the conveyor belt / holding area. Parcels wait here safely even if the delivery vans are busy. This is what absorbs a flash-sale surge.
-4. **Channel workers** — the delivery vans, one fleet per channel. Each picks parcels off its belt and drives them to the door.
-5. **Providers (FCM/SES/Twilio)** — the actual "last mile" — the doorbell, the mailbox, the phone.
+1. **Source system** (Order Service) — emits a "please notify" event.
+2. **Notification API** — checks preferences, renders the template, logs the notification to the DB, and publishes to the right topic.
+3. **Kafka (the queue)** — buffers messages, which wait here safely even if the workers are busy. This is what absorbs a flash-sale surge.
+4. **Channel workers** — one pool per channel; each consumes from its topic and delivers.
+5. **Providers (FCM/SES/Twilio)** — the last mile that actually reaches the device, inbox, or phone.
 
 The single most important idea in the whole diagram is that **the queue sits in the middle**, so the left half (accepting work) and the right half (delivering work) can run, fail, and scale **independently**.
 
@@ -486,19 +486,19 @@ Requested channels ∩ User prefs ∩ Legal/quiet hours = Final channels
 
 Maps `(type, channel, language)` → title/body templates with variable substitution.
 
-### Plain-English: each component is one job on an assembly line
+### Each component is one job
 
-Think of a **restaurant kitchen** processing one order ticket:
+Each component has exactly one job:
 
-| Component | Kitchen analogy | One-sentence job |
-| --- | --- | --- |
-| **API Service** | The head waiter who takes the ticket | Accept, validate, orchestrate — but cook nothing |
-| **Preference Service** | Checks dietary notes ("no SMS for this guest") | Decide *which channels are allowed* |
-| **Template Service** | The recipe card | Turn `type + data` into actual words |
-| **Message Queue** | The order rail cooks pull from | Buffer + decouple + absorb spikes |
-| **Channel Workers** | The cooks (one per station) | Actually deliver via the provider |
+| Component | One-sentence job |
+| --- | --- |
+| **API Service** | Accept, validate, orchestrate — but deliver nothing |
+| **Preference Service** | Decide *which channels are allowed* |
+| **Template Service** | Turn `type + data` into actual words |
+| **Message Queue** | Buffer + decouple + absorb spikes |
+| **Channel Workers** | Actually deliver via the provider |
 
-The golden rule for the API: **"orchestrate, not deliver."** It's the conductor, not a musician — it points at who does what, but it never picks up an instrument (never calls FCM itself).
+The golden rule for the API: **"orchestrate, not deliver."** It coordinates who does what, but it never calls a provider (FCM/Twilio) itself.
 
 ```java
 // The API's whole job is coordination — notice it delegates every real task:
@@ -520,7 +520,7 @@ class NotificationApiService {
 
 The API does two things that live in **two different systems**: (1) insert a DB row, (2) publish to Kafka. There's no single "do both or neither" button across a database *and* a message broker. So if the process dies *after* the insert but *before* the publish, you get a row stuck at `PENDING` forever — a notification that exists on paper but never gets delivered.
 
-Analogy: you write "shipped" in your ledger, then the courier no-shows. Your books say shipped; reality says no. The fix (**outbox** or a **reconciliation sweeper**) is covered in [§23](#23-failure-scenarios--mitigations) — for now just internalize *"two systems, one crash = trouble."*
+The fix (**outbox** or a **reconciliation sweeper**) is covered in [§23](#23-failure-scenarios--mitigations) — for now just internalize *"two systems, one crash = trouble."*
 
 #### Q: Why is the Preference Service separate from the workers?
 
@@ -587,14 +587,14 @@ Step 8: Update status
   Multi-channel: push SENT + email FAILED → PARTIALLY_SENT
 ```
 
-### Plain-English: the whole journey as one story
+### The whole journey, step by step
 
-Follow user 123's order confirmation as if you're narrating a package delivery:
+Follow user 123's order confirmation step by step:
 
-1. **Event fires** — "Order 789 confirmed for ₹1500." (Order Service shouts this into the room.)
+1. **Event fires** — "Order 789 confirmed for ₹1500." (Order Service emits this event.)
 2. **Notification service catches it** and asks three sanity questions: *Does this user exist? Is this a real notification type? Have I already handled this exact event?* (that last one = the idempotency key).
 3. **Preferences** — "User 123 wants push + email for orders, but not SMS." → final channels = push, email.
-4. **Render** — plug the facts into the recipe: *"Order confirmed! #789 for ₹1500."*
+4. **Render** — plug the facts into the template: *"Order confirmed! #789 for ₹1500."*
 5. **Write it down** — one `notifications` row, status `PENDING`. This is the audit trail.
 6. **Enqueue** — drop a tiny message on the push topic and the email topic. Note the payload is just `{ notificationId, channel }` — not the full text (see [§13](#13-idempotency--deduplication) on why small payloads).
 7. **Workers deliver** — push worker → FCM, email worker → SendGrid.
@@ -805,9 +805,9 @@ WHERE type = 'ORDER_CONFIRMED' AND channel = 'PUSH' AND language = 'en'
 
 The `notifications` row stores `template_type` + `template_version` (or a direct `template_id` FK — see [§15](#15-template-system)) **plus** the rendered `title`/`body` snapshot — so you always know exactly what was sent, even after v2 goes live.
 
-### Plain-English: why so many tables?
+### Why so many tables?
 
-Beginners see six tables and panic. But each one answers a different real-world question, like folders in a filing cabinet:
+Each table answers a different question:
 
 | Table | The question it answers |
 | --- | --- |
@@ -823,7 +823,7 @@ The **one distinction that matters most**: `notifications` vs `notification_atte
 > `notifications` = the **intent** ("we mean to tell user 123 their order is confirmed") — created **once** per event.
 > `notification_attempts` = the **delivery log** ("push try #1 to FCM failed, try #2 succeeded; email try #1 succeeded") — **many** rows, one per channel, updated on every retry.
 
-Analogy: a **courier company**. The `notifications` row is the *shipping order* ("deliver this parcel to this address"). The `notification_attempts` rows are the *delivery attempts* ("Tue 10am: nobody home; Wed 2pm: delivered"). One order, several attempts. You never re-create the order because a delivery failed — you just log another attempt against it.
+The `notifications` row is the *intent*, created once. The `notification_attempts` rows are the *per-channel delivery log* — one row per channel, updated on every retry. You never re-create the notification because a delivery failed — you just log another attempt against it.
 
 ```java
 // One "notifications" row = one intent, created once:
@@ -849,11 +849,11 @@ class NotificationAttempt {
 
 #### Q: Why not just use an auto-increment ID (1, 2, 3, ...)?
 
-Because a single auto-increment counter lives in **one** database. At ~15k inserts/sec that counter becomes a traffic jam, and worse — the moment you want to **shard** (split the table across many DBs), two shards would both hand out "id = 1000." **Snowflake / UUIDv7** IDs are generated by the app itself (no central counter), are still roughly time-ordered, and never collide across shards. It's the difference between one cashier stamping every ticket vs. every counter printing its own globally-unique ticket.
+Because a single auto-increment counter lives in **one** database. At ~15k inserts/sec that counter becomes a traffic jam, and worse — the moment you want to **shard** (split the table across many DBs), two shards would both hand out "id = 1000." **Snowflake / UUIDv7** IDs are generated by the app itself (no central counter), are still roughly time-ordered, and never collide across shards.
 
 #### Q: Why store the rendered `title`/`body` on the row if we have templates?
 
-Templates change. If a support agent asks *"what exact text did we send user 123 last March?"*, re-rendering today's template might give **different** words (the template was edited since). Snapshotting the final text on the `notifications` row freezes history — like keeping a photocopy of the letter you mailed, not just the letterhead. Compliance and debugging both depend on this.
+Templates change. If a support agent asks *"what exact text did we send user 123 last March?"*, re-rendering today's template might give **different** words (the template was edited since). Snapshotting the final text on the `notifications` row freezes history: you keep exactly what was sent, not just a pointer to a template that may have changed since. Compliance and debugging both depend on this.
 
 #### Q: Why the `UNIQUE (notification_id, channel)` on attempts?
 
@@ -892,9 +892,9 @@ CREATE INDEX idx_inapp_user_unread
 
 > The unread badge count should not be a `COUNT(*)` on every open — use a **Redis counter** (see [§26](#26-read-models-counters--digests)).
 
-### Plain-English: in-app is a mailbox, not a doorbell
+### In-app notifications: stored, not delivered
 
-A **push** is a doorbell — the OS rings it whether or not your app is open. An **in-app notification** is a **mailbox**: we drop a letter (a DB row) into user 123's box; nothing rings. When the user opens the app, it walks to the mailbox (`GET /notifications`) and reads what's there. The bell icon 🔔 just shows *"how many unread letters are in your box."*
+A **push** is delivered to the device by the OS whether or not your app is open. An **in-app notification** is just a **stored row**: we write a DB row for user 123; nothing is pushed. When the user opens the app, it fetches them (`GET /notifications`). The bell icon 🔔 shows the count of unread rows.
 
 That's why in-app is the **most reliable** channel: there's no Apple/Google in the middle who might reject a stale token. Writing a database row basically always works, so in-app is the natural **fallback** when a push token is dead.
 
@@ -903,7 +903,7 @@ That's why in-app is the **most reliable** channel: there's no Apple/Google in t
 public void deliverInApp(QueueMsg msg) {
     var n = repo.load(msg.notificationId());
 
-    // 1. Drop the "letter" into the user's mailbox (this is the real delivery)
+    // 1. Write the row for the user (this is the real delivery)
     inAppRepo.insert(new InAppRow(n.userId(), n.title(), n.body(), /*isRead*/ false));
 
     // 2. Bump the unread badge counter (O(1), see §26) — no COUNT(*) scan
@@ -917,7 +917,7 @@ public void deliverInApp(QueueMsg msg) {
 
 #### Q: If in-app is just a DB row, what's the WebSocket part for?
 
-Pure in-app works even with no live connection — the app sees the new letter *next time it opens or polls*. The WebSocket ([§18](#18-real-time-notifications-websocket--sse)) is an optional **"you've got mail" tap on the shoulder** so the bell icon updates the *instant* the row is written, without the user reopening the app. Delivery = the DB row; the WebSocket is just freshness.
+Pure in-app works even with no live connection — the app sees the new row *next time it opens or polls*. The WebSocket ([§18](#18-real-time-notifications-websocket--sse)) is an optional live nudge so the bell icon updates the *instant* the row is written, without the user reopening the app. Delivery = the DB row; the WebSocket is just freshness.
 
 #### Q: Why not `SELECT COUNT(*) WHERE is_read = false` for the badge?
 
@@ -953,13 +953,13 @@ Because the bell is checked on **every app open** by **every user** — that's a
 - Push fails with `InvalidRegistration` / `Unregistered` → mark `is_active = false`
 - Logout → delete or deactivate token
 
-### Plain-English: what a "device token" actually is
+### What a "device token" actually is
 
 You can't push to "user 123" — Apple and Google don't know who that is. You can only push to a **specific installed app on a specific device**, identified by a long random string called a **device token** (issued by FCM/APNS when the app first registers). So the flow is:
 
 > user_id → look up all their **active device tokens** → send the push to *each* token via FCM/APNS.
 
-Analogy: the token is a **PO box number**. "User 123" is a person; their tokens are the several PO boxes they own (iPhone, iPad, work Android). To reach them you drop a copy in **every** box, because you don't know which one they'll check.
+One user typically has several tokens (iPhone, iPad, work Android), and to reach them you send to **every** active token, because you don't know which device they're currently using.
 
 ```java
 @KafkaListener(topics = "notification-push-normal")
@@ -973,7 +973,7 @@ public void deliverPush(QueueMsg msg) {
         try {
             fcm.send(d.token(), n.title(), n.body());
         } catch (InvalidTokenException e) {
-            // the app was uninstalled / token expired → this "PO box" is dead
+            // the app was uninstalled / token expired → this token is dead
             deviceRepo.deactivate(d.deviceId());   // is_active = false, stop trying it
         }
     }
@@ -1027,11 +1027,11 @@ Push Workers           (scale horizontally, process in parallel)
 
 > **Key interview point:** Fan-out for 1M users is a **batch pipeline**, not a single API call. Same workers, different producer.
 
-### Plain-English: fan-out = one shout, a million ears
+### Fan-out: one event, many notifications
 
-**Fan-out** just means *one event turns into many notifications*. "Flash sale starts" (one event) → notify 1,000,000 users (a million notifications). The word "fan" is literal: one input spreads out into many outputs, like a hand-fan opening.
+**Fan-out** just means *one event turns into many notifications*. "Flash sale starts" (one event) → notify 1,000,000 users (a million notifications). One input spreads out into many outputs.
 
-The trap beginners fall into is trying to do it in **one giant request**. Imagine a teacher trying to hand out a million worksheets by carrying them all at once — they collapse. Instead you do it like a **printing press feeding an assembly line**: pull user IDs a chunk at a time, drop each chunk on the conveyor (Kafka), and let many workers grab batches in parallel.
+The trap beginners fall into is trying to do it in **one giant request**, which times out and blows up memory. Instead, stream user IDs a chunk at a time, publish each chunk to Kafka, and let many workers process batches in parallel.
 
 ```java
 // BAD — build a list of 1,000,000 in memory and loop → OOM, timeout, no retries
@@ -1117,11 +1117,11 @@ SendGrid fails → try AWS SES
 
 Log which provider succeeded in `notification_attempts`.
 
-### Plain-English: why wait longer each time (backoff)?
+### Why wait longer each time (backoff)?
 
 When a delivery fails, you retry — but **not instantly, and not at a fixed rhythm**. You wait a little, then more, then a lot: 1 min, 5 min, 30 min. This is **exponential backoff**.
 
-Analogy: calling a friend whose phone is off. You don't redial every half-second — you try, wait a bit, try again later, and eventually give up and text them. Redialing frantically just wastes your battery and won't make their phone turn on. Same with a down provider: hammering it while it's on the floor keeps it on the floor.
+The reason: hammering a down provider with instant retries just piles more load on it while it's already struggling, and wastes your own resources. Backing off with growing delays gives it room to recover before you try again.
 
 ```java
 long backoffMillis(int attempt) {
@@ -1145,11 +1145,11 @@ void handleFailure(Notification n, Channel ch, int attempt) {
 
 #### Q: What is "jitter" and why does fixed backoff cause a "thundering herd"?
 
-If a provider goes down, thousands of messages fail at once. With a *fixed* 1-minute retry, all of them retry at **exactly** the same second the minute later — a synchronized stampede that knocks the just-recovering provider straight back down. **Jitter** = adding a random wobble to each delay so retries **spread out** over time instead of firing in one spike. Like a crowd leaving a stadium through staggered exits instead of all through one door.
+If a provider goes down, thousands of messages fail at once. With a *fixed* 1-minute retry, all of them retry at **exactly** the same second the minute later — a synchronized stampede that knocks the just-recovering provider straight back down. **Jitter** = adding a random wobble to each delay so retries **spread out** over time instead of firing in one spike.
 
 #### Q: What is a Dead Letter Queue (DLQ), really?
 
-It's the **"undeliverable mail" bin**. After N failed attempts, you stop retrying and park the message in a separate queue where a human (or an alert) can look: *bad payload? provider permanently rejecting? bug?* You do **not** retry forever — an OTP from 30 minutes ago is worthless, so old messages should die, not loop. DLQ = "we couldn't deliver this; someone please look," not "we'll keep trying to infinity."
+It's a separate queue for messages that couldn't be delivered. After N failed attempts, you stop retrying and park the message there, where a human (or an alert) can look: *bad payload? provider permanently rejecting? bug?* You do **not** retry forever — an OTP from 30 minutes ago is worthless, so old messages should die, not loop. DLQ = "we couldn't deliver this; someone please look," not "we'll keep trying to infinity."
 
 #### Q: What's provider fallback vs retry?
 
@@ -1253,9 +1253,9 @@ Worker fetches notification + attempt from DB, then calls provider.
 
 **Worker-level dedup:** Before calling FCM, check if `notification_attempts.status == SENT` for this `(notification_id, channel)` — handles duplicate Kafka messages.
 
-### Plain-English: "idempotent" = doing it twice is harmless
+### "Idempotent" = doing it twice is harmless
 
-**Idempotent** is a scary word for a simple idea: *an operation you can repeat and the result is the same as doing it once.* Pressing a **floor button in an elevator** is idempotent — press "5" ten times, you still go to floor 5 once. Sending a push is **not** naturally idempotent (send it twice → user sees it twice), so we *make* it idempotent by remembering "already handled this event."
+**Idempotent** means: *an operation you can repeat and the result is the same as doing it once.* Sending a push is **not** naturally idempotent (send it twice → user sees it twice), so we *make* it idempotent by remembering "already handled this event."
 
 The remembering is done by the **idempotency key** = a fingerprint of the event:
 
@@ -1289,7 +1289,7 @@ Two *different* duplicate problems exist, and each needs its own guard:
 | **1. Creating the notification** | Same **event** consumed twice (Kafka is at-least-once) → two "order confirmed" rows | `notification_key` UNIQUE constraint → create **once** |
 | **2. Delivering the notification** | Same **queue message** processed twice, or a legit retry | Check `attempt.status == SENT` for this `(notification_id, channel)` → send **once** |
 
-Analogy: stage 1 is *"don't open two support tickets for the same complaint."* Stage 2 is *"even though we keep re-attempting delivery on the one ticket, don't actually double-ship the package."* The unique index guards **creation**; it does **not** block delivery retries — those happen on the existing row.
+Put simply: stage 1 prevents **duplicate notification records** for one event; stage 2 prevents **double-sending** even while retrying the one record. The unique index guards **creation**; it does **not** block delivery retries — those happen on the existing row.
 
 #### Q: Why does the queue message carry only `{notificationId, channel}` and not the full text?
 
@@ -1337,7 +1337,7 @@ if count >= limit → skip (log as RATE_LIMITED, don't send)
 | **Rate limits** | User opted in but system caps volume |
 | **Quiet hours** | Legal/compliance + UX |
 
-### Plain-English: preferences vs rate limits — two different "no"s
+### Preferences vs rate limits — two different "no"s
 
 These sound similar but say different things:
 
@@ -1345,7 +1345,7 @@ These sound similar but say different things:
 - **Rate limit** = *"I'm fine with this, but not 50 times a day."* The system **caps volume** even for things you *do* want, so it doesn't become spam.
 - **Quiet hours** = *"not while I'm asleep."* A time-based cap, often required by **law** for marketing.
 
-Analogy: a **doorman**. Preferences are the guest list ("this person isn't allowed in at all"). Rate limits are the capacity rule ("we already let 5 in from that group today, that's the cap"). Quiet hours are the closing time ("no entries after 10 PM"). All three can independently say "no."
+All three are independent gates: preferences can reject a type/channel outright, rate limits can reject once a per-period cap is hit, and quiet hours can reject based on the time of day. Any one of them can say "no."
 
 ```java
 boolean shouldSend(long userId, String type, Channel ch, Instant now) {
@@ -1495,9 +1495,9 @@ CREATE UNIQUE INDEX uniq_active_template
 
 Publishing a new version becomes a small transaction: flip the old row to `is_active = false`, insert the new row with `is_active = true`.
 
-### Plain-English: a template is a fill-in-the-blanks form
+### A template is a message with blanks to fill in
 
-A **template** is a message with **blanks** to fill in — like a **Mad Libs sheet** or a **wedding invitation printed with `<name>` to be handwritten later**:
+A **template** is a message with **blanks** to fill in:
 
 ```
 Hi {{name}}, your order {{orderId}} has been confirmed for ₹{{amount}}.
@@ -1528,7 +1528,7 @@ Template pick(String type, Channel ch, String lang) {
 
 #### Q: Why version templates instead of just editing the text?
 
-Because old notifications must still show what they *actually said*. If you overwrite v1's text and a customer disputes *"you told me ₹1500!"*, you've lost the evidence. So: **new copy = new version row**; the old one stays with `is_active = false` for audit. It's like keeping every printed edition of a form, not Tipp-Ex-ing over the master copy.
+Because old notifications must still show what they *actually said*. If you overwrite v1's text and a customer disputes *"you told me ₹1500!"*, you've lost the evidence. So: **new copy = new version row**; the old one stays with `is_active = false` for audit.
 
 #### Q: What does "exactly one active template" prevent?
 
@@ -1539,7 +1539,7 @@ If two rows for `(ORDER_CONFIRMED, PUSH, en)` were both `is_active = true`, the 
 - `type` (`ORDER_CONFIRMED`) = **why** the notification is sent. Stable forever — it's the business event.
 - `template_id` = **which exact wording row** produced the text. Changes every time copy changes.
 
-Think of `type` as the *reason* ("order confirmation") and `template_id` as the *specific printed card* you used this quarter. The reason never changes; the card gets redesigned.
+`type` is the *reason* the notification exists ("order confirmation") and never changes; `template_id` is the *specific wording row* used to render it, which changes each time the copy is updated.
 
 ---
 
@@ -1561,9 +1561,9 @@ notification-push-low      ← throttled, deprioritized under load
 
 Under backlog, **high-priority queue drains first**. Low-priority can be dropped or delayed (with product approval).
 
-### Plain-English: an OTP and a coupon are not equals
+### An OTP and a coupon are not equals
 
-Some notifications are **urgent** (OTP — useless in 2 minutes), some are **whenever** (a "recommended for you" nudge). If they share one line, a giant marketing blast can make your OTPs arrive late — a disaster. So we sort messages into **fast lanes and slow lanes**, like an **airport with priority boarding** or a **hospital ER doing triage**: the heart-attack patient (OTP) doesn't wait behind the sprained ankle (coupon).
+Some notifications are **urgent** (OTP — useless in 2 minutes), some can wait (a "recommended for you" nudge). If they share one queue, a giant marketing blast can make your OTPs arrive late — a disaster. So we separate messages into **priority lanes**: high-priority messages get their own topics and worker pools so they aren't stuck behind a flood of low-priority ones.
 
 Concretely: **separate topics per priority**, and give the high-priority topic **more workers**, so it always drains first.
 
@@ -1615,11 +1615,9 @@ Example: BookMyShow — "Your movie starts in 1 hour."
 
 **Cancellation:** User cancels booking → update `scheduled_notifications.status = CANCELLED`.
 
-### Plain-English: notifications with an alarm clock
+### Scheduled notifications
 
 A **scheduled notification** is just one you want sent **later**, not now: *"remind me 1 hour before the movie."* You can't hold it in memory for hours (the server might restart), so you **write it down with a due time** and have a job that wakes up regularly and asks *"anything due yet?"*
-
-Analogy: a **kitchen ticket rail with times on it**. The cook doesn't stand and stare at each ticket — every minute they glance at the rail and pull anything whose time has come.
 
 ```java
 // The saved intent: "send this at scheduled_at"
@@ -1684,14 +1682,14 @@ When in-app worker creates notification:
 
 > WebSocket service is **stateful** — sticky sessions or shared Redis for routing. Scale by user affinity.
 
-### Plain-English: an open phone line vs. mailing letters
+### WebSocket vs one-shot push/email
 
-Normal push/email is like **mailing a letter** — one-shot, you send and forget. A **WebSocket** is like keeping a **phone line open** between the app and the server: as long as the user is on the app, the server can speak instantly ("new message!") and the app hears it with zero delay. **SSE** is the same but one-way (server talks, client only listens) — simpler, good for live scores or a delivery map.
+Normal push/email is one-shot: you send and forget. A **WebSocket** keeps a connection open between the app and the server: as long as the user is on the app, the server can push instantly ("new message!") and the app receives it with zero delay. **SSE** is the same but one-way (server → client only) — simpler, good for live scores or a delivery map.
 
-The catch: to speak on that phone line, the server must **know which line the user is on**. With thousands of WebSocket servers, user 123's live connection lives on exactly one of them. So we keep a little phonebook in Redis: *"user 123 → connected to server `ws-node-2`."*
+The catch: to push over that connection, the server must **know which node holds the user's connection**. With thousands of WebSocket servers, user 123's live connection lives on exactly one of them. So we keep a mapping in Redis: *"user 123 → connected to server `ws-node-2`."*
 
 ```java
-// Phonebook entry, refreshed on heartbeat so dead connections expire:
+// Connection mapping, refreshed on heartbeat so dead connections expire:
 //   Redis:  ws:user:123  →  { connectionId: "abc", serverId: "ws-node-2" }
 
 void onInAppCreated(long userId, Notification n) {
@@ -1751,9 +1749,9 @@ In-app workers:  30 instances  (DB writes)
 | Templates | Redis or in-memory (rarely change) |
 | Device tokens | Redis for hot users, DB as source of truth |
 
-### Plain-English: scale each part where it actually hurts
+### Scale each part where it actually hurts
 
-"Scaling" isn't one knob — it's finding **which specific part is the bottleneck** and widening *that* pipe. Analogy: a **highway**. If traffic jams at the toll booths you add booths (more API servers); if it jams at one lane you add lanes (more Kafka partitions); if it jams at the exit you add exit ramps (more workers). Adding booths won't fix an exit jam.
+"Scaling" isn't one knob — it's finding **which specific part is the bottleneck** and widening *that* part. If the API layer is saturated, add API servers; if parallelism is capped, add Kafka partitions; if delivery is the bottleneck, add workers. Widening the wrong part won't help.
 
 The three independent dials:
 
@@ -1777,7 +1775,7 @@ Because **a Kafka partition is read by only one consumer in a group at a time.**
 
 #### Q: Why cache preferences and templates instead of hitting the DB?
 
-Because they're read **constantly** but change **rarely**. Every notification needs "what are user 123's prefs?" and "what's the ORDER_CONFIRMED template?" — reading those from the DB millions of times/day is wasteful. Cache them in Redis (prefs with a short TTL + invalidate on update; templates practically forever). It's like keeping the menu at the counter instead of walking to the print shop for every order.
+Because they're read **constantly** but change **rarely**. Every notification needs "what are user 123's prefs?" and "what's the ORDER_CONFIRMED template?" — reading those from the DB millions of times/day is wasteful. Cache them in Redis (prefs with a short TTL + invalidate on update; templates practically forever).
 
 #### Q: Stateless vs stateful — why does it matter for scaling?
 
@@ -1850,13 +1848,13 @@ If Order Service needs delivery status, prefer:
 
 Order Service says *"please notify user"*. Notification Service owns `PENDING → SENT → FAILED → RETRYING`.
 
-### Plain-English: "worker" is a role, not a place
+### "Worker" is a role, not a place
 
-Beginners picture the API and workers as one program. They're not — a **worker** is a **separate long-running process** whose only job is to pull messages off a queue and deliver them. The API is the **order-taker at the counter**; the workers are the **cooks in the back**. Same restaurant (service), different jobs, different rooms (processes/machines).
+Beginners picture the API and workers as one program. They're not — a **worker** is a **separate long-running process** whose only job is to pull messages off a queue and deliver them. The API accepts requests and enqueues them; the workers consume the queue and deliver. Same service, different processes (often on different machines).
 
 ```
-Same restaurant (Notification Service), different stations:
-  node api.js      → takes orders (HTTP), enqueues        → EC2-A / api pods
+Same service (Notification Service), different processes:
+  node api.js      → accepts requests (HTTP), enqueues    → EC2-A / api pods
   node pushWorker  → drains push topic, calls FCM         → EC2-B / push pods
   node emailWorker → drains email topic, calls SendGrid   → EC2-C / email pods
   ↑ all share the SAME notification_db (one ownership domain)
@@ -1941,11 +1939,11 @@ Order Service     →  notification-high  →  OTP/Push workers   (must stay low
 
 > "I'd monitor consumer lag and oldest-message age, scale consumers up to partition count, separate critical and marketing topics with dedicated worker pools, throttle campaign producers, batch worker DB writes, and DLQ poison messages."
 
-### Plain-English: lag = the queue growing faster than you drain it
+### Lag = the queue growing faster than you drain it
 
-**Kafka lag** is simply *how many messages are waiting that you haven't processed yet.* Producers are pouring water in faster than consumers are scooping it out, so the bucket fills.
+**Kafka lag** is simply *how many messages are waiting that you haven't processed yet.* Producers are adding messages faster than consumers remove them, so the backlog grows.
 
-Analogy: a **supermarket checkout**. Shoppers (messages) arrive faster than cashiers (workers) can ring them up → the line grows. Two numbers describe the pain: **how many people are in line** (lag count) and **how long the person at the front has waited** (oldest-message age). The second one is often what actually matters.
+Two numbers describe the pain: **how many messages are waiting** (lag count) and **how long the oldest waiting message has sat** (oldest-message age). The second one is often what actually matters.
 
 ```java
 long lag = latestOffset - consumerOffset;   // 100,000 - 95,000 = 5,000 waiting
@@ -2037,11 +2035,11 @@ Balance: **worker count ≤ what DB can sustain**. Kafka absorbs spikes; workers
 
 > "DB bottlenecks come from high write volume on notifications and attempts. I'd batch updates, use only necessary indexes, partition by time, archive old rows, drive retries via Kafka topics not DB polling, cache templates and prefs, use read replicas for history, and cap worker concurrency to match DB capacity."
 
-### Plain-English: fixing one jam can create the next
+### Fixing one bottleneck can create the next
 
-Here's the twist beginners miss: you add workers to clear Kafka lag ([§21](#21-kafka-lag)) — and now **100 workers all hammer the database at once**. You moved the traffic jam from the queue to the DB. It's like adding more cashiers, then realizing there's only **one bagging station** everyone funnels into.
+Here's the twist beginners miss: you add workers to clear Kafka lag ([§21](#21-kafka-lag)) — and now **100 workers all hammer the database at once**. You moved the bottleneck from the queue to the DB.
 
-Analogy: the DB is a **single busy printer**. If every worker sends its own one-page job, the printer thrashes. The fixes are all variations of *"send fewer, bigger jobs, and keep the printer's desk tidy."*
+The DB is now the shared bottleneck: if every worker issues its own tiny write, the DB is overwhelmed. The fixes are all variations of *"send fewer, bigger writes, and keep the working set small."*
 
 ```java
 // BAD — one DB round-trip per message → millions of tiny writes
@@ -2057,7 +2055,7 @@ var history = replicaDb.query("... WHERE user_id=? ORDER BY created_at DESC LIMI
 
 The main levers, in plain terms:
 
-- **Batch writes** — group many status updates into one statement (fewer trips to the printer).
+- **Batch writes** — group many status updates into one statement (fewer round-trips to the DB).
 - **Only the indexes you need** — every extra index is extra work on *every* insert. More isn't better.
 - **Partition by time** — keep "this month" small and hot; old months live in their own tables. Queries and backups touch less data.
 - **Archive** — move data older than 90 days to cheap storage (S3). The live table stays lean.
@@ -2110,16 +2108,14 @@ Because the whole pipeline is **at-least-once + idempotent**, re-enqueuing a row
 
 > See: [Outbox & Saga](../concepts/outbox-and-saga.md).
 
-### Plain-English: the "dual-write" problem in one picture
+### The "dual-write" problem
 
 The nastiest failure here is the **dual-write**: two things must both happen, but they live in **two systems** with no shared "all-or-nothing" switch:
 
 1. Insert the `notifications` row (in the database), **and**
 2. Publish the message to Kafka.
 
-If the process dies **between** step 1 and step 2, you've got a row that says `PENDING` but no queue message — a notification that will **never** be delivered, silently.
-
-Analogy: you **write "shipped" in your ledger**, then walk to hand the parcel to the courier — and trip on the way. Your books say shipped; the parcel is on the floor. The ledger and reality disagree.
+If the process dies **between** step 1 and step 2, you've got a row that says `PENDING` but no queue message — a notification that will **never** be delivered, silently. The DB commit succeeded but the publish didn't, so the two systems disagree.
 
 ```java
 // The trap — two systems, one crash gap:
@@ -2164,9 +2160,9 @@ The **outbox** *prevents* lost publishes (correct-by-construction, but more plum
 
 **Dashboards per channel** — SMS failure looks different from push failure.
 
-### Plain-English: you can't fix what you can't see
+### You can't fix what you can't see
 
-**Observability** = being able to answer *"is the system healthy, and if not, where's it broken?"* without SSH-ing into servers and guessing. Analogy: the **dashboard of a car** — speed, fuel, engine light. You don't want to pop the hood every time; the gauges tell you at a glance.
+**Observability** = being able to answer *"is the system healthy, and if not, where's it broken?"* without SSH-ing into servers and guessing — the metrics, logs, and traces tell you at a glance.
 
 Three kinds of signal, each answering a different question:
 
@@ -2231,15 +2227,13 @@ Notifications touch sensitive data (email, phone, device tokens) and legally-reg
 
 > **One-liner:** "Service-to-service auth via mTLS/signed tokens, encrypt PII (tokens, phone, email) at rest, never log message bodies, honor unsubscribe + quiet hours for promotional sends, and support GDPR delete via partitioned data + purge job."
 
-### Plain-English: notifications are full of secrets
+### Notifications are full of sensitive data
 
 Think about what flows through this system: **phone numbers, email addresses, device tokens, and message bodies** that may contain names, amounts, addresses. That's a goldmine for attackers — this is **PII** (Personally Identifiable Information). Three separate concerns:
 
 - **Auth** — *who is allowed to ask us to send?* Only internal services (via mTLS/signed tokens), not the public internet. A user can only read *their own* notifications.
 - **PII protection** — *if someone steals the data, is it useless to them?* Encrypt tokens/phone/email at rest; use TLS in transit; **never log the message body or raw token.**
 - **Compliance** — *are we obeying the law?* Unsubscribe links, quiet hours, GDPR "delete my data."
-
-Analogy: a **bank vault**. Only authorized staff get in (auth), the cash is in locked boxes even inside the vault (encryption), and there's a legal logbook of who touched what (compliance).
 
 ```java
 // Logging done RIGHT — identifiers only, never the sensitive content:
@@ -2296,11 +2290,11 @@ Implementation: a buffer keyed by `(user_id, type)` in Redis or a staging table;
 
 > **Trade-off:** batching reduces spam and cost but adds latency — only apply it to low-priority, high-frequency types.
 
-### Plain-English: pre-computing the answer, and merging pings
+### Pre-computing the count, and merging pings
 
 Two ideas here, both about *respecting the reader.*
 
-**1. The unread counter (a "read model").** The bell icon needs a number *fast*, on every app open. Counting matching rows each time (`COUNT(*) WHERE is_read=false`) is like **recounting your whole inbox every time you glance at it**. Instead keep a running tally in Redis and just adjust it: +1 on a new notification, −1 on read, 0 on "mark all read." O(n) scan → O(1) lookup.
+**1. The unread counter (a "read model").** The bell icon needs a number *fast*, on every app open. Running `COUNT(*) WHERE is_read=false` on every open is an expensive scan over a growing table. Instead keep a running tally in Redis and just adjust it: +1 on a new notification, −1 on read, 0 on "mark all read." O(n) scan → O(1) lookup.
 
 ```java
 void onNewInApp(long userId)      { redis.incr("unread:" + userId); }          // +1
@@ -2312,7 +2306,7 @@ long badge(long userId) {
 }
 ```
 
-**2. Digests (aggregation).** Nobody wants 20 separate "you have a new message" pings. **Coalesce** many events into one: *"You have 5 new messages"* instead of five buzzes. Analogy: a **daily newspaper** instead of a runner sprinting to your door for every headline.
+**2. Digests (aggregation).** Nobody wants 20 separate "you have a new message" pings. **Coalesce** many events into one: *"You have 5 new messages"* instead of five separate pushes.
 
 ```java
 // Buffer low-priority events per (user, type); a timer flushes them into ONE digest

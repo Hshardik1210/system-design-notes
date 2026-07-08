@@ -2,7 +2,7 @@
 
 > **Core challenge:** connect **three parties** — customers, restaurants, and delivery partners — to get **hot food delivered in ~30 minutes**. The hard, distinctive problems are **hyperlocal discovery** (what can reach me *right now*), **real-time delivery-partner dispatch** (assign the best rider), **live GPS tracking**, and **ETA prediction** — all under a tight, perishable SLA. The order-management core (cart → order → payment → state machine) is largely the **same as any e-commerce app**; the fulfillment layer is what's different.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (Swiggy/Zomato analogies, annotated Java/SQL, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java/SQL, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -66,17 +66,15 @@ browse restaurants near me → add to cart → pay → restaurant accepts & cook
 | **ETA** | Prep time + travel time + traffic, updated continuously |
 | **Perishability** | ~30-min SLA; a late order = cold food = refund; you can't "reship" |
 
-### Plain-English: it's a matchmaker for three groups of people
+### Three parties brought together
 
-Think about what happens when you open **Swiggy** and order a biryani. Three totally different groups of people have to be brought together, in the right order, within half an hour:
+When you open **Swiggy** and order a biryani, three different parties have to be coordinated, in the right order, within half an hour:
 
 - **You (the customer)** — hungry, want food *now*, want to watch it come to your door.
 - **The restaurant** — cooking dozens of orders at once, needs to know what to cook and when.
 - **The rider (delivery partner)** — on a bike somewhere in the city, needs to be told "go pick up order #9001 from Paradise Biryani and take it to this flat."
 
-The platform is the **matchmaker + traffic controller** sitting in the middle. It never cooks food and never rides a bike — it just makes sure the right message reaches the right person at the right moment.
-
-> **Analogy:** it's like a wedding planner. The planner doesn't cook the food or drive the guests — they *coordinate* the caterer, the transport, and the guests so everything lands together. Swiggy coordinates restaurant, rider, and customer.
+The platform is the coordinator sitting in the middle. It never cooks food and never rides a bike — it just makes sure the right message reaches the right party at the right moment, keeping restaurant, rider, and customer in sync.
 
 #### Q: Why is "30 minutes" such a big deal? Amazon takes 2 days and nobody complains.
 
@@ -144,11 +142,11 @@ Swiggy    = Catalog + Order + Payment + [ Hyperlocal Discovery + Real-time Dispa
 
 > **Interview line:** "The order-management core — cart, order service, state machine, payments, idempotency — is essentially the same as any e-commerce system like Flipkart. What makes food delivery unique is the **real-time, hyperlocal fulfillment layer**: geospatial discovery, live delivery-partner matching, GPS tracking, and ETA prediction under a perishable ~30-minute SLA. That's where I'd spend the design time."
 
-### Plain-English: "buying a phone" vs "ordering dinner"
+### "Buying a phone" vs "ordering dinner"
 
 Both start the *same way*: you browse, add to cart, pay. That first half is basically identical — that's why the summary says "50% is done" if you've built Flipkart. The **second half** (getting the thing to you) is where they split.
 
-> **Analogy:** ordering a phone from Flipkart is like **mailing a letter** — you drop it off, it travels through a slow, invisible system for days, and you get a rough tracking number. Ordering dinner from Swiggy is like **calling a taxi** — someone must be found *right now*, near you, and you watch them approach on a map in real time.
+Flipkart fulfillment is slow and asynchronous: the item travels through warehouses and couriers over days, with coarse shipment tracking. Food delivery fulfillment is real-time: a free rider must be found *right now*, near the restaurant, and the customer watches them approach on a live map.
 
 ```java
 // The part that's the SAME (reuse it)
@@ -209,7 +207,7 @@ Sort of, but with two twists: (1) it **cooks on demand** (nothing is pre-packed 
 - Grocery/instant-mart (Instamart) — similar but dark-store inventory model.
 - Fraud detection, loyalty programs — mention, defer.
 
-### Plain-English: what the three users each need
+### What the three users each need
 
 Requirements read like a dry checklist, but they're just "what does each person want to be able to do?" Picture the three apps:
 
@@ -261,14 +259,14 @@ Storage:
 - **Sharp peaks** (mealtimes) → autoscale, queue-based decoupling, surge handling.
 - **Orders/payments need strong consistency**; discovery/tracking can be eventually consistent.
 
-### Plain-English: the numbers, and why one of them is scary
+### The numbers, and why one of them dominates
 
-Capacity estimation is just back-of-the-envelope arithmetic to find **which pipe is the fattest**. Here the shock is not orders — it's **location pings**.
+Capacity estimation is just back-of-the-envelope arithmetic to find **which path carries the most traffic**. Here the surprise is not orders — it's **location pings**.
 
-- ~5M orders/day sounds huge, but spread over a day it's only ~58 orders/sec (a few hundred at peak). A normal database yawns at that.
-- Now the scary one: **300,000 riders**, each phone shouting its GPS location **every 4 seconds**. That's `300,000 ÷ 4 = 75,000` writes **every single second**, all day. That's ~1,300× more traffic than orders.
+- ~5M orders/day sounds huge, but spread over a day it's only ~58 orders/sec (a few hundred at peak). A normal database handles that easily.
+- The dominant one: **300,000 riders**, each phone sending its GPS location **every 4 seconds**. That's `300,000 ÷ 4 = 75,000` writes **every single second**, all day — ~1,300× more traffic than orders.
 
-> **Analogy:** orders are like people checking out at a store's cash registers — steady, manageable. Location pings are like every rider **live-streaming their location** simultaneously — a firehose. You would never pour a firehose into your accounting ledger (the order DB); you send it to a system built for high-speed throwaway data (**Redis + Kafka**).
+Orders are a steady, manageable trickle. Location pings are a firehose of high-frequency, disposable data. You'd never pour that into the transactional order DB; it goes to a store built for high-speed ephemeral data (**Redis + Kafka**).
 
 ```java
 // The single most important takeaway from the math:
@@ -341,7 +339,7 @@ POST /v1/orders/{id}/delivered
 
 > Order placement is **synchronous + idempotent** (user waits for confirmation). Location pings are **fire-and-forget high-frequency**. Tracking uses **WebSocket/SSE** for live push.
 
-### Plain-English: three *styles* of API for three *kinds* of action
+### Three *styles* of API for three *kinds* of action
 
 The APIs above look like a random list, but they split into **three communication styles**, each chosen for a reason:
 
@@ -349,9 +347,9 @@ The APIs above look like a random list, but they split into **three communicatio
 | --- | --- | --- |
 | **Request → wait for answer** (normal HTTP) | Placing an order | You *must* know "did it work? am I charged?" before moving on |
 | **Fire-and-forget** (send, don't wait) | Rider GPS pings | 75k/sec — you can't afford to wait, and a lost ping doesn't matter |
-| **Server pushes to you** (WebSocket) | Live tracking | The *server* has news (rider moved) and shoves it to your phone without you asking |
+| **Server pushes to you** (WebSocket) | Live tracking | The *server* has news (rider moved) and pushes it to your phone without you asking |
 
-> **Analogy:** placing an order is a **phone call** (you wait on the line for "yes, confirmed"). A rider ping is a **postcard** (drop it in the box, walk away). Tracking is a **live sports ticker** (the screen updates itself; you just watch).
+Placing an order blocks until it returns "confirmed." A rider ping is sent without waiting for any reply. Tracking is a stream the server pushes as the rider moves — the client just listens.
 
 ```java
 // 1) Synchronous + idempotent — you WAIT for the result
@@ -410,24 +408,22 @@ You *place* an order once and need an immediate yes/no — a normal request/resp
                     └──────────────────┘
 ```
 
-### Plain-English: reading the big scary diagram
+### Reading the architecture diagram
 
-Don't be intimidated — the diagram is just "a receptionist, a few specialist counters, and a loudspeaker."
+The diagram is a gateway, a set of independent services, an event log, and a push layer.
 
-- **API Gateway = the receptionist / front desk.** Every app (customer, restaurant, rider) talks here first. It checks who you are (auth), stops abuse (rate limit), and routes you to the right counter. No app talks to the internal services directly.
-- **The row of services = specialist counters.** Each does *one job*: Discovery finds restaurants, Order handles orders, Dispatch finds riders, Payment takes money. They don't step on each other.
-- **Each service has its own store.** Discovery uses a geo-index, Order uses a real database, Location uses Redis. Nobody shares a database (so one busy service can't slow another).
-- **Kafka = the office loudspeaker / PA system.** When something important happens ("order placed!"), the service *announces it once* to Kafka, and everyone who cares (notifications, dispatch, analytics) hears it — without the announcer needing to know who's listening.
-- **WebSocket Service = the live scoreboard** wired to the customer and rider phones for real-time updates.
-
-> **Analogy:** it's an airport. The gateway is check-in, each service is a different desk (baggage, boarding, security), Kafka is the PA announcing "flight 9001 now boarding," and the WebSocket is the departures board flipping in real time.
+- **API Gateway = the single entry point.** Every app (customer, restaurant, rider) talks here first. It authenticates the caller, rate-limits abuse, and routes to the right service. No app talks to the internal services directly.
+- **The row of services = independent specialists.** Each does *one job*: Discovery finds restaurants, Order handles orders, Dispatch finds riders, Payment takes money. They don't step on each other.
+- **Each service has its own store.** Discovery uses a geo-index, Order uses a relational DB, Location uses Redis. Nobody shares a database (so one busy service can't slow another).
+- **Kafka = the event backbone.** When something important happens ("order placed!"), the service *publishes it once* to Kafka, and every interested consumer (notifications, dispatch, analytics) reads it — without the publisher needing to know who's listening.
+- **WebSocket Service = the real-time push layer** connected to the customer and rider phones for live updates.
 
 ```java
 // A customer request's journey through the diagram
-gateway.authenticate(request);              // front desk checks your pass
-Restaurants list = discoveryService.near(lat, lng);   // sent to the right counter
-Order o = orderService.place(cart);         // a different counter
-kafka.publish(new OrderPlaced(o.id));       // announce on the loudspeaker — ONCE
+gateway.authenticate(request);              // gateway verifies the caller
+Restaurants list = discoveryService.near(lat, lng);   // routed to the Discovery service
+Order o = orderService.place(cart);         // routed to the Order service
+kafka.publish(new OrderPlaced(o.id));       // publish the event — ONCE
 // dispatch, notification, analytics each react on their own, independently
 ```
 
@@ -458,27 +454,27 @@ It means services **don't call each other directly** for after-the-fact news. In
 
 > **Order Service orchestrates**; specialized services (dispatch, location, payment) own their domains. Kafka is the **event backbone** connecting them.
 
-### Plain-English: who does what (the restaurant-staff analogy)
+### Who does what
 
-Each service is like a **member of restaurant staff with one clear job**. "Orchestrates" just means the Order Service is the **head waiter** who takes your order and coordinates everyone else — but doesn't cook or drive.
+Each service has one clear responsibility. "Orchestrates" just means the Order Service owns the order and coordinates the other services — but doesn't cook or drive.
 
-| Service | Restaurant-staff analogy |
+| Service | Responsibility |
 | --- | --- |
-| **Discovery/Search** | The host who says "here are places that'll serve you tonight" |
-| **Cart** | The notepad where your order is jotted before it's final |
-| **Order Service** | The **head waiter** — owns your order, coordinates the rest |
-| **Payment** | The cashier |
-| **Dispatch** | The dispatcher radioing "who's free to deliver?" |
-| **Location** | The GPS tracker on each delivery bike |
-| **Notification** | The person texting you "your food is on the way" |
+| **Discovery/Search** | Returns restaurants that can deliver to the user right now |
+| **Cart** | Holds the pre-checkout order |
+| **Order Service** | Owns the order and its state machine; coordinates the rest |
+| **Payment** | Charges, refunds, wallet |
+| **Dispatch** | Finds and assigns a free rider |
+| **Location** | Ingests each rider's GPS position |
+| **Notification** | Sends "your food is on the way" updates |
 
 ```java
 // "Orchestrates" = the Order Service tells others what to do, but doesn't do their jobs
 class OrderService {
     Order place(Cart cart) {
         Order o = createOrder(cart);          // its OWN job: own the order
-        payment.charge(o);                    // ask the cashier (another service)
-        kafka.publish(new OrderPlaced(o.id));  // announce; dispatch & notify react
+        payment.charge(o);                    // call the Payment service
+        kafka.publish(new OrderPlaced(o.id));  // publish event; dispatch & notify react
         return o;                             // it never picks a rider or sends SMS itself
     }
 }
@@ -575,21 +571,20 @@ Historical track (time-series / archived for analytics only)
 
 > **Key modeling decision:** high-frequency location data does **not** go in the transactional DB. It lives in **Redis (GEO + latest value)** and optionally a time-series store — otherwise 75k writes/sec crushes the order DB.
 
-### Plain-English: what each table is really storing
+### What each table stores
 
-The tables map cleanly onto real-world paper you'd keep:
+What each table holds:
 
-- **`orders`** = the **receipt/bill** for one order — who, which restaurant, how much, current status, which rider.
-- **`order_items`** = the **line items** on that receipt ("2× biryani, 1× coke"). Note the prices are **snapshotted** — copied at order time — so if the restaurant raises prices tomorrow, *your* bill doesn't change.
-- **`order_status_history`** = the **tracking log** — every status change stamped with who did it. This is the audit trail you see as "Order accepted 7:02, Out for delivery 7:19."
-- **`restaurants` / `menu_items`** = the **catalog** — like a menu card, plus location and open/closed flags.
-- **Rider location (Redis)** = the **live GPS dot**, deliberately *not* in the database.
+- **`orders`** = the **receipt** for one order — who, which restaurant, how much, current status, which rider.
+- **`order_items`** = the **line items** on that order ("2× biryani, 1× coke"). Note the prices are **snapshotted** — copied at order time — so if the restaurant raises prices tomorrow, *this* order's total doesn't change.
+- **`order_status_history`** = the **audit log** — every status change stamped with who did it. This powers the timeline you see as "Order accepted 7:02, Out for delivery 7:19."
+- **`restaurants` / `menu_items`** = the **catalog** — menu entries plus location and open/closed flags.
+- **Rider location (Redis)** = the **live GPS position**, deliberately *not* in the database.
 
 ```java
 // Why prices are snapshotted onto the order (not looked up live)
 orderItem.price = menuItem.price;   // COPY the price NOW, at order time
-// If the restaurant edits menuItem.price later, this order's bill is frozen & correct.
-// (Same reason a paper receipt keeps working after the shop changes its prices.)
+// If the restaurant edits menuItem.price later, this order's total is frozen & correct.
 ```
 
 ```sql
@@ -647,11 +642,11 @@ rank by: ETA, rating, sponsored, personalization
 
 > **Consistency:** discovery is **eventually consistent** — a menu edit taking a few seconds to appear is fine. Orders are not.
 
-### Plain-English: "restaurants near me" is a maps problem, not a text-search problem
+### "Restaurants near me" is a maps problem, not a text-search problem
 
 When you open Swiggy, the home screen isn't "all restaurants" — it's "restaurants that can reach **my** flat, **right now**." That's a **geography** question. The naive approach — check every restaurant in the country and compute distance — is hopeless at scale. So we chop the map into **cells** and only look at the cells near you.
 
-> **Analogy:** finding a nearby restaurant is like finding a nearby friend on a map. You don't scan the whole world; you look at *your neighbourhood square* and the squares touching it. **Geohash / S2 cells** are exactly those map squares, given short codes so "same neighbourhood" = "same code prefix."
+You don't scan every restaurant on earth; you only look at the map cell you're in and the cells touching it. **Geohash / S2 cells** are those map squares, given short codes so "same area" = "same code prefix."
 
 ```java
 // Naive & doomed: measure distance to EVERY restaurant (millions)
@@ -719,11 +714,9 @@ ORDER_PLACED (Kafka) → Restaurant Service (notify restaurant to accept)
                      → Notification Service (confirm to customer)
 ```
 
-### Plain-English: the checkout, step by step
+### The checkout, step by step
 
-The cart is your **scratch pad** — it lives in Redis, is cheap, and can be thrown away (you might never check out). The moment you hit **Place Order**, things get serious and careful.
-
-> **Analogy:** the cart is like items in your hand while shopping. Checkout is the **cashier counter** — that's where money changes hands, so it's done slowly and exactly once, with a receipt.
+The cart is a scratch pad — it lives in Redis, is cheap, and can be thrown away (you might never check out). The moment you hit **Place Order**, the flow becomes careful and exact: money changes hands, so it must happen exactly once and produce a durable record.
 
 ```java
 Order placeOrder(PlaceOrderRequest req) {
@@ -801,11 +794,11 @@ PENDING_PAYMENT ──────► PLACED ──────► ACCEPTED / RE
 
 > **Dispatch runs in parallel with prep:** you assign a rider while food cooks so the rider arrives near pickup-ready time — critical for the 30-min SLA.
 
-### Plain-English: an order is a package moving through labelled boxes
+### The order state machine
 
-A **state machine** is just the fixed set of "stages" an order can be in, plus the **only legal moves** between them. Your order can't teleport from `PLACED` straight to `DELIVERED` — it must pass through each stage in order, and each move is triggered by a *specific actor*.
+A **state machine** is the fixed set of "stages" an order can be in, plus the **only legal moves** between them. An order can't jump from `PLACED` straight to `DELIVERED` — it must pass through each stage in order, and each move is triggered by a *specific actor*.
 
-> **Analogy:** it's exactly the "Order Accepted → Preparing → Out for Delivery → Delivered" bar you watch in the Swiggy app. Each filled step is a state; each new step lights up when a different person does something.
+This is exactly the "Order Accepted → Preparing → Out for Delivery → Delivered" progress bar you watch in the app. Each filled step is a state; each new step lights up when a different actor does something.
 
 ```java
 enum OrderStatus {
@@ -896,11 +889,11 @@ Claim rider atomically (Redis):  SET rider:{id}:lock orderId NX EX 30
   → prevents two dispatch workers assigning the same rider to two orders
 ```
 
-### Plain-English: finding the right bike for the job
+### Finding the right rider for the job
 
 This is the crown-jewel problem. When your order is placed, the platform must pick **one** rider out of thousands — ideally the one who gets your food to you fastest and cheapest, without leaving other riders idle.
 
-> **Analogy:** it's a **taxi dispatcher**. A call comes in; the dispatcher looks at the map, sees who's free and close, radios the best one, and if they say no, moves to the next. Swiggy does this automatically, thousands of times a minute.
+Dispatch is an automated loop: an order comes in, the system looks at which riders are free and close, offers to the best one, and if they decline, moves to the next — running thousands of times a minute.
 
 ```java
 Rider dispatch(Order order) {
@@ -982,11 +975,11 @@ Rider App ──(GPS ping every ~4s)──► Location Service
 
 > Location is **ephemeral, eventually consistent** — a dropped ping is fine, the next one corrects it. This is the opposite of the order/payment path.
 
-### Plain-English: the moving dot on your map
+### The moving dot on your map
 
-Once your food is out, you obsessively watch the little bike icon crawl toward you. That icon is powered by the rider's phone shouting its GPS every few seconds, and the platform relaying it to *your* phone — fast, cheaply, and without ever touching the precious order database.
+Once your food is out, you watch the little bike icon move toward you. That icon is powered by the rider's phone sending its GPS every few seconds, and the platform relaying it to *your* phone — fast, cheaply, and without ever touching the order database.
 
-> **Analogy:** it's live location sharing on WhatsApp. The rider's phone is the sender; your map is the viewer; the platform is the relay that connects "this rider" to "the customers watching this order."
+It's a live location relay: the rider's phone is the sender, your map is the viewer, and the platform connects "this rider" to "the customers watching this order."
 
 ```java
 // On the rider's phone: fire a ping every ~4 seconds, don't wait for a reply
@@ -1041,11 +1034,9 @@ ETA ≈ time_to_accept
 - Recompute and **push updates** to the customer when a stage completes or the rider deviates.
 - Often an **ML model** trained on historical deliveries (features: hour, weather, restaurant load, distance). Treat as a black box in an interview; emphasize the **inputs, continuous refinement, and push updates**.
 
-### Plain-English: where the "32 min" comes from
+### Where the "32 min" comes from
 
-The ETA isn't magic — it's a **sum of guesses about each leg of the journey**, refined as real events happen. When you place the order it's a rough estimate; by the time the rider's near you, it's sharp.
-
-> **Analogy:** it's like estimating a road trip: "10 min to pack + 20 min to the highway + 40 min of driving." You give a rough total up front, then update it as you actually hit traffic.
+The ETA is a **sum of estimates for each leg of the journey**, refined as real events happen. When you place the order it's a rough estimate; by the time the rider's near you, it's sharp. You give a rough total up front (accept + prep + travel legs) and update it as each stage completes and traffic changes.
 
 ```java
 int estimateEta(Order o) {
@@ -1087,11 +1078,11 @@ Same pattern as any e-commerce/BookMyShow flow:
 
 > Reuse the payment design from BookMyShow / Notification notes — this is genuinely the "same as Flipkart" part.
 
-### Plain-English: taking money without double-charging
+### Taking money without double-charging
 
 Payments are the classic "money must be exactly right" problem, and food delivery solves it the same way every e-commerce app does: hold the order in a **waiting** state, charge, and only advance when the payment gateway confirms.
 
-> **Analogy:** it's like a restaurant taking your card. They swipe (initiate), the bank approves (webhook), and only *then* do they hand you the food (advance the order). If the bank declines, nothing proceeds.
+The flow: initiate the charge, wait for the gateway to confirm via webhook, and only *then* advance the order. If the gateway declines, nothing proceeds.
 
 ```java
 Order pay(Order o) {
@@ -1125,11 +1116,11 @@ Scary scenario: payment succeeds, but the server crashes **before** it records "
 - Writes go to a reviews store; **aggregate rating** updated async (Kafka consumer → recompute avg) — don't update the hot restaurant row synchronously on every review.
 - Ratings feed back into **discovery ranking** and **dispatch scoring**.
 
-### Plain-English: don't recompute the average on the hot row
+### Don't recompute the average on the hot row
 
 After delivery you rate the food, the restaurant, and the rider separately. The tricky bit isn't storing your stars — it's **updating the restaurant's average rating** without hammering a super-popular row.
 
-> **Analogy:** imagine a famous restaurant getting 10,000 reviews a day. If every single review paused to recompute and rewrite the restaurant's average, that one row becomes a traffic jam (a "hot row"). Instead, we drop reviews in a box and let a background worker tally them up.
+A very popular restaurant might get 10,000 reviews a day. If every review synchronously recomputed and rewrote the restaurant's average, that single row becomes a contention bottleneck (a "hot row"). Instead, store each review and let a background worker recompute the average.
 
 ```java
 // WRONG — every review locks & rewrites the hot restaurant row (contention)
@@ -1180,11 +1171,9 @@ Because they're different jobs and both feed back into the system: restaurant ra
 ### Geo-sharding
 - Partition by **city/region** — a food marketplace is inherently local; a Bangalore order never needs Delhi's riders → shard by geography for locality + isolation.
 
-### Plain-English: growing without falling over
+### Growing without falling over
 
-Scaling just means "handle 100× the users without melting." Each part of the system grows in the way that fits its traffic shape — you already met these shapes in the capacity math (§4).
-
-> **Analogy:** it's like a restaurant chain expanding. You don't build one mega-kitchen for the whole country — you open a **branch per city** (geo-sharding), hire extra staff only at mealtimes (autoscale), and keep a whiteboard of daily specials that everyone reads instead of asking the chef (caches).
+Scaling just means "handle 100× the users without falling over." Each part of the system grows in the way that fits its traffic shape — you already met these shapes in the capacity math (§4). Partition orders by city (geo-sharding), add stateless service instances only at mealtimes (autoscale), and cache hot read data instead of recomputing it.
 
 ```java
 // The four scaling moves, matched to the four kinds of traffic:
@@ -1222,11 +1211,9 @@ A **stateless** service (like discovery or the API gateway) holds no data of its
 | **Discovery index stale** | Short TTL + CDC updates; availability re-checked at checkout |
 | **Peak overload** | Autoscale, Kafka buffering, surge, load-shed non-critical (recommendations) |
 
-### Plain-English: things WILL go wrong — plan the graceful recovery
+### Things WILL go wrong — plan the graceful recovery
 
-Real life is messy: no riders free, the restaurant ignores the tablet, a rider bails mid-trip, the network drops your tap twice. Good design isn't "prevent all failure" — it's **"when X breaks, degrade gracefully instead of losing money or an order."**
-
-> **Analogy:** it's like a restaurant's backup plans — if the fryer dies, they push another dish; if a waiter calls in sick, others cover. The kitchen keeps running.
+Real life is messy: no riders free, the restaurant ignores the tablet, a rider bails mid-trip, the network drops your tap twice. Good design isn't "prevent all failure" — it's **"when X breaks, degrade gracefully instead of losing money or an order."** Every failure gets a pre-planned response so the core path keeps running.
 
 ```java
 // Each failure has a pre-planned response, not a crash:
@@ -1263,11 +1250,9 @@ When the system is drowning, it **temporarily switches off nice-to-haves** (pers
 
 > **Headline metric:** **order-to-delivery time** vs promised ETA — the whole business is judged on it.
 
-### Plain-English: the dashboards that tell you if you're winning
+### The dashboards that tell you if you're healthy
 
-Observability = **the gauges on the dashboard** that let you notice trouble *before* customers scream. You don't just watch servers ("is CPU high?"); you watch the **business** ("are orders arriving late?").
-
-> **Analogy:** it's the health monitor in a hospital — heart rate, blood pressure, oxygen. For Swiggy the vital signs are: how long orders take, how often "no rider" happens, and how many payments fail. If a vital drops, an alarm fires.
+Observability = the metrics and alerts that let you notice trouble *before* customers complain. You don't just watch servers ("is CPU high?"); you watch the **business** ("are orders arriving late?"). The vital signs are: how long orders take, how often "no rider" happens, and how many payments fail. If one drops, an alert fires.
 
 ```java
 // The one metric that matters most:
@@ -1287,7 +1272,7 @@ Because servers can look perfectly healthy while customers are miserable — e.g
 
 #### Q: What's "Kafka consumer lag" and why alert on it?
 
-Kafka is the loudspeaker announcing events; a **consumer** (like the notification or dispatch service) reads them. "Lag" = how far *behind* the consumer is. Rising lag means events are piling up faster than they're processed → notifications and dispatch start arriving late. It's an early warning that a downstream service is overwhelmed, often before users notice.
+Kafka carries the published events; a **consumer** (like the notification or dispatch service) reads them. "Lag" = how far *behind* the consumer is. Rising lag means events are piling up faster than they're processed → notifications and dispatch start arriving late. It's an early warning that a downstream service is overwhelmed, often before users notice.
 
 ---
 
@@ -1316,11 +1301,9 @@ Kafka is the loudspeaker announcing events; a **consumer** (like the notificatio
 | Batching orders | Cheaper deliveries vs per-order SLA risk |
 | Geo-sharding by city | Locality + isolation vs cross-region complexity |
 
-### Plain-English: how to actually talk in the interview
+### How to actually talk in the interview
 
-The single most important move: **say the framing sentence early** — "order core = same as e-commerce; the hard, unique parts are hyperlocal discovery, real-time dispatch, and live tracking." This instantly shows you know *where the real difficulty is* and stops you wasting 15 minutes designing a cart everyone already understands.
-
-> **Analogy:** it's like a tour guide. Don't drag people through every room equally — say up front "the kitchen is standard, but the *rooftop garden* is what makes this place special" and spend your time there. The fulfillment layer is the rooftop garden.
+The single most important move: **say the framing sentence early** — "order core = same as e-commerce; the hard, unique parts are hyperlocal discovery, real-time dispatch, and live tracking." This instantly shows you know *where the real difficulty is* and stops you wasting 15 minutes designing a cart everyone already understands. Don't spend equal time on every part: call out that the order core is standard and the fulfillment layer is what's special, then spend your time there.
 
 ```java
 // A rough script for the 35 minutes:
@@ -1393,20 +1376,20 @@ Drive it yourself using the phases above: **clarify → frame → estimate → H
 | **Circuit Breaker** | Payment/maps calls | Resilience |
 | **CQRS** | Discovery (ES read model) vs order (RDBMS write) | Optimized reads |
 
-### Plain-English: the patterns in everyday words
+### The patterns in plain words
 
 These design patterns sound academic, but each is just a **named solution to a problem you already met** in this doc. Here are the headline ones translated:
 
 | Pattern | In plain words (Swiggy context) |
 | --- | --- |
-| **Saga / Orchestration** | A multi-step deal (pay → accept → dispatch → deliver) where, if a later step fails, you **undo** earlier ones (refund). Like a wedding: if the caterer cancels, you unwind the bookings. |
+| **Saga / Orchestration** | A multi-step process (pay → accept → dispatch → deliver) where, if a later step fails, you **undo** earlier ones (refund). |
 | **State** | The order can only move through legal stages (§11). The "you can't skip to Delivered" rule. |
-| **Strategy** | Swappable algorithms — greedy *or* batch dispatch, normal *or* surge pricing — chosen at runtime. Like picking a different route app depending on traffic. |
-| **Observer / Pub-Sub** | Kafka's loudspeaker: announce "order placed" once, everyone interested reacts. |
+| **Strategy** | Swappable algorithms — greedy *or* batch dispatch, normal *or* surge pricing — chosen at runtime. |
+| **Observer / Pub-Sub** | Publish "order placed" once to Kafka; every interested consumer reacts independently. |
 | **Outbox** | The "never charge without an order" safety net (§15) — write the event in the same transaction as the data. |
 | **Idempotency Key** | The "one tap = one order" tag (§10) that ignores duplicate requests. |
 | **CQRS** | Keep a **separate fast read copy** (Elasticsearch for search) apart from the **write copy** (orders in SQL). Reading and writing have different needs. |
-| **Circuit Breaker** | If the payment/maps provider is down, **stop hammering it** and fail fast, so one sick dependency doesn't drag everything down. |
+| **Circuit Breaker** | If the payment/maps provider is down, **stop calling it** and fail fast, so one failing dependency doesn't drag everything down. |
 
 ```java
 // Example: Strategy — swap the dispatch algorithm without touching the rest

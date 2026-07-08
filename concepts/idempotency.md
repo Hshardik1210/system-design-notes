@@ -2,7 +2,7 @@
 
 > **Definition:** Idempotency means doing the same operation multiple times has the same effect as doing it once.
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (a concrete "press pay twice, charged once" analogy, annotated example code, and the exact confusions that trip up beginners). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated example code, and the exact confusions that trip up beginners). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -77,9 +77,9 @@ Server → "I've already processed this request"
 | Bad UX | 😡 Lost trust |
 | Reconciliation logic | 🔁 Engineering overhead |
 
-### Plain-English: the "press pay twice, charged once" idea
+### The "press pay twice, charged once" idea
 
-**Analogy — tapping "Pay" twice at checkout.** You're buying sneakers online. You tap **"Pay ₹5,000"**, the screen spins... nothing happens. Did it go through? You tap **"Pay"** again. Behind the scenes *two* pay requests may have reached the server. What you want is obvious: **charged once, one order** — no matter how many times you (or your flaky phone) hit the button.
+Consider tapping **"Pay ₹5,000"** at checkout. The screen spins and nothing happens — did it go through? You tap **"Pay"** again. Behind the scenes *two* pay requests may have reached the server. What you want is obvious: **charged once, one order** — no matter how many times you (or a flaky network) hit the button.
 
 That is exactly what idempotency guarantees: the operation can *arrive* many times, but its *effect* happens only once.
 
@@ -111,7 +111,7 @@ No — retries are **normal and desirable** (they're how systems survive flaky n
 - **Booking systems** — tickets, hotels
 - **Any API** with retries / unreliable networks
 
-### Plain-English: spot the pattern
+### Spot the pattern
 
 The common thread: **an action that costs something real and must happen exactly once**, running over an **unreliable network** where retries are inevitable. If re-running the action would move money, ship a box, or reserve a seat *again*, it needs idempotency.
 
@@ -144,14 +144,14 @@ The common thread: **an action that costs something real and must happen exactly
 
 > ⚠️ Idempotent is about **server state**, not the **response**. A second `DELETE` may return `404` instead of `204` — the *state* is identical, which is what matters.
 
-### Plain-English: idempotent methods, with a light switch analogy
+### HTTP methods and idempotency
 
-Think of each HTTP method as a physical action:
+What each method does when repeated:
 
-- **`GET` = reading a sign.** Look at it 10 times, nothing about the world changes. (Safe *and* idempotent.)
-- **`PUT` = setting a light switch to "ON".** Flip it to ON, then flip it to ON again — still just ON. The *end state* is the same however many times you do it. (Idempotent.)
-- **`DELETE` = throwing the trash out.** Throw it out; try to throw it out again — it's already gone. Same end state. (Idempotent.)
-- **`POST` = adding a new sticky note to a wall.** Do it twice and you have *two* notes. Each call creates a new thing. (**Not** idempotent → duplicates.)
+- **`GET`** = read-only. Call it 10 times and nothing on the server changes. (Safe *and* idempotent.)
+- **`PUT`** = set the resource to a given state. Send it once or five times, the end state is identical. (Idempotent.)
+- **`DELETE`** = remove the resource. Delete it, then delete it again — it's already gone, same end state. (Idempotent.)
+- **`POST`** = create a new resource. Call it twice and you get *two* resources. Each call creates a new thing. (**Not** idempotent → duplicates.)
 
 ```java
 // PUT — you send the WHOLE desired state, so repeats converge to the same thing
@@ -197,9 +197,9 @@ counter++                   ❌ NOT idempotent
 
 > **Rule of thumb:** prefer **declarative** operations ("make it look like X") over **imperative** deltas ("change it by X"). Declarative is naturally idempotent.
 
-### Plain-English: "set it", don't "nudge it"
+### "Set it", don't "nudge it"
 
-**Analogy — GPS vs turn-by-turn.** Telling a system *"set the balance to 100"* is like giving a GPS coordinate: run it 10 times, you end up in the same place. Telling it *"add 100"* is like saying "drive 100 meters north" — do it 10 times and you've overshot by 900 meters. **Absolute = safe to repeat. Relative = dangerous to repeat.**
+Setting an **absolute** value (*"set the balance to 100"*) converges to the same result no matter how many times it runs. A **relative** delta (*"add 100"*) stacks up on every retry — run it 10 times and you've added 1000. **Absolute = safe to repeat. Relative = dangerous to repeat.**
 
 ```java
 // ❌ Relative / imperative — every retry stacks up
@@ -247,9 +247,9 @@ Same key      = same operation
 Different key  = new operation
 ```
 
-### Plain-English: the key is a coat-check ticket
+### The idempotency key identifies a request
 
-**Analogy — the coat check.** When you hand over your coat, you get a numbered ticket. Come back with **the same ticket** → you get **your same coat** (not a second coat). Come with a **different ticket** → different coat. The idempotency key is that ticket: it lets the server recognise *"oh, this is that same request from before"* and hand back the same result instead of doing the work again.
+The idempotency key is a token attached to a request. When the server sees **the same key** again, it recognises *"this is the same request from before"* and hands back the same result instead of doing the work again. A **different key** means a different operation.
 
 ```java
 // Client makes ONE key for ONE user action ("Place Order"), and reuses it on every retry
@@ -279,9 +279,9 @@ Either works, but the **HTTP header** (`Idempotency-Key: <uuid>`) is the convent
    - **Key not found** → process the request
    - **Key exists** → return the stored response
 
-### Plain-English: the bouncer with a guest list
+### The request flow
 
-**Analogy — a bouncer checking a list.** Every request walks up to the door. The bouncer (the idempotency layer) checks the guest list (the idempotency store): **name not on the list?** → let them in and *write their name down*. **Name already on the list?** → "you're already inside" → hand back what we gave them last time, don't let a duplicate in.
+Every request passes through the idempotency layer, which checks the idempotency store for the key: **key not present?** → process the request and record the key. **Key already present?** → don't reprocess; return the result stored from the first time.
 
 ```java
 // The whole flow in ~10 lines of pseudo-Java
@@ -389,17 +389,17 @@ SET idempotency:123:abc123 "<updated_json>" XX
 - `XX` → only update if key **already** exists
 - `EX 86400` → expires in 24 hours
 
-### Plain-English: what each stored field is *for*
+### What each stored field is *for*
 
-**Analogy — a receipt drawer.** For every request you keep a little receipt. Later, if the same request comes back, you fish out the receipt and reply with what it says — instead of ringing up the sale again. Each field on the receipt earns its place:
+For every request you keep a stored record. If the same request comes back, you read the record and reply with what it says instead of doing the work again. Each field earns its place:
 
-| Field | Plain-English "why" |
+| Field | Why it's stored |
 | --- | --- |
-| `idempotency_key` | The ticket number — how we find this receipt again. |
-| `request_hash` | A fingerprint of *what was asked*, so we can catch "same ticket, different order" (see §8). |
-| `status` | Which stage we're at: still cooking (`IN_PROGRESS`), done (`SUCCESS`), or flopped (`FAILED`). |
+| `idempotency_key` | The identifier used to look up this record. |
+| `request_hash` | A fingerprint of *what was asked*, so we can catch "same key, different payload" (see §8). |
+| `status` | Which stage we're at: `IN_PROGRESS`, `SUCCESS`, or `FAILED`. |
 | `response_body` + `http_status` | The exact reply to replay on a retry, so the client sees identical bytes. |
-| `order_id` | A pointer to the real thing we created, for crash recovery (see §10). |
+| `order_id` | A pointer to the record we created, for crash recovery (see §10). |
 | `created_at` | When to auto-delete it (see §11 TTL). |
 
 The two-step write in code — reserve first, fill in the answer later:
@@ -450,7 +450,7 @@ First **compare the hash** (`incoming_hash != stored_hash` → `400 Bad Request`
 - **After the DB insertion succeeds** → update `status = SUCCESS`, `response`, `order_id`, `http_status` — **all together**, not just the response.
   *(Meaning: "here is the result of that request.")*
 
-### Plain-English: the three answers the server can give
+### The three answers the server can give
 
 When a second request shows up with a familiar key, the server is basically answering *"what happened to the first one?"* There are only three possible answers, and each has a sensible reply:
 
@@ -471,10 +471,10 @@ if (r == null) {                       // never seen it → do the work (Case A)
 }
 ```
 
-**Analogy — calling a restaurant about your order.**
-- **`SUCCESS`** = "Your food's ready, here it is" → they hand you the *same* dish, they don't cook a second one.
-- **`IN_PROGRESS`** = "We're still cooking it" → "please hold" (`409`/`202`), don't start a second dish.
-- **`FAILED`** = "That order fell through" → either try again or tell you it failed, consistently.
+The three stored statuses map to three responses:
+- **`SUCCESS`** → return the *same* stored response; don't reprocess.
+- **`IN_PROGRESS`** → another copy is still being processed → return `409`/`202`, don't start a second one.
+- **`FAILED`** → either retry or return the failure consistently.
 
 #### Q: Why check the hash *before* looking at the status?
 
@@ -482,7 +482,7 @@ Because a matching key is supposed to mean "the exact same request." If the key 
 
 #### Q: Why update all the fields together at the end, not the response alone?
 
-So the record can never be left half-true (e.g. `status` still `IN_PROGRESS` but a response present). Writing `status`, `response`, `order_id`, and `http_status` in **one** update keeps the receipt internally consistent — a retry always sees a complete, trustworthy record.
+So the record can never be left half-true (e.g. `status` still `IN_PROGRESS` but a response present). Writing `status`, `response`, `order_id`, and `http_status` in **one** update keeps the record internally consistent — a retry always sees a complete, trustworthy record.
 
 ---
 
@@ -535,9 +535,9 @@ If the client retries:
 
 > **Mental model:** Redis = *"Have I seen this request before?"* · DB = *"What is the actual order?"*
 
-### Plain-English: two different "statuses" people keep confusing
+### Two different "statuses" people keep confusing
 
-**Analogy — the mailroom log vs the parcel itself.** The mailroom log tracks *"did we already handle this delivery request?"* (received / processing / done). The parcel itself has its *own* journey: packed → shipped → delivered. They're **two separate trackers** for two separate things. Idempotency status is the mailroom log; order status is the parcel.
+Idempotency status tracks *"did we already handle this request?"* (`IN_PROGRESS` / `SUCCESS` / `FAILED`). Order status tracks the order's own lifecycle (`CREATED` → `SHIPPED` → `DELIVERED`). They're **two separate trackers** for two separate things.
 
 ```java
 // Idempotency store — ONLY about request dedup ("have I handled this call?")
@@ -601,9 +601,9 @@ Normalized:
 
 5. **On retry:** if `incoming_hash != stored_hash` → return `400 Bad Request`.
 
-### Plain-English: the fingerprint that catches key reuse
+### The fingerprint that catches key reuse
 
-**Analogy — same ticket number, different order.** Imagine someone hands in coat-check ticket #42 but describes a *different* coat. Something's off. The **request hash** is a fingerprint of the original request; if a later call reuses the key but the fingerprint doesn't match, you reject it instead of returning the wrong result.
+The **request hash** is a fingerprint of the original request payload. If a later call reuses the key but the fingerprint doesn't match, the payload differs from what the key was first used for — so you reject it instead of returning the wrong stored result.
 
 ```java
 // Turn the body into ONE short fingerprint string
@@ -662,9 +662,9 @@ When B retries later, status is `SUCCESS` → it gets the stored response. No du
 
 **DB equivalent:** a `UNIQUE(idempotency_key)` constraint. First insert wins; others fail and fetch the existing record.
 
-### Plain-English: why "check, then set" is a trap
+### Why "check, then set" is a trap
 
-**Analogy — two people grabbing the last airplane seat.** Both look at the screen, both see "1 seat left," both click "book." If checking and booking are *separate* steps, they both succeed → the seat is double-booked. The fix is a **single atomic step**: "book *only if* still available." Whoever runs that instruction first wins; the other simply fails.
+If checking and setting are *separate* steps, two concurrent requests can both read "key absent" and both proceed → duplicate. The fix is a **single atomic step**: write the key *only if* it doesn't already exist. Whichever request runs that instruction first wins; the other fails the write.
 
 ```java
 // ❌ Trap: two separate steps → both can pass the check before either writes
@@ -745,18 +745,18 @@ On retry, the backend sees `IN_PROGRESS` and either returns `409` forever, or re
 If crash → retry hits DB constraint → fetch existing order
 ```
 
-### Plain-English: two systems that can disagree
+### Two systems that can disagree
 
-**Analogy — a notebook and a warehouse.** Redis is your quick notebook ("started order abc123"); the DB warehouse is where the real order actually gets built. If the power cuts out *after* the warehouse builds the order but *before* you tick your notebook, the two now disagree: notebook says "in progress," warehouse says "done." Neither is lying — they're just **separate systems that don't update together automatically**.
+Redis records that the request started; the DB is where the order is actually created. If the process crashes *after* the DB creates the order but *before* Redis is updated to `SUCCESS`, the two disagree: Redis says `IN_PROGRESS`, the DB says the order exists. Neither is wrong — they're just **separate systems that don't update together atomically**.
 
 ```
-1. notebook (Redis): IN_PROGRESS   ✅
-2. warehouse (DB):   order #789 built ✅
-3. 💥 crash before updating the notebook to SUCCESS
+1. Redis: IN_PROGRESS   ✅
+2. DB:    order #789 created ✅
+3. 💥 crash before updating Redis to SUCCESS
    → Redis: IN_PROGRESS   |   DB: order #789 exists   (they disagree)
 ```
 
-The robust fix is to let the **DB be the referee** with a unique key, so even a crashed-and-retried request can't build a second order:
+The robust fix is to let the **DB enforce uniqueness** with a unique key, so even a crashed-and-retried request can't create a second order:
 
 ```java
 try {
@@ -794,9 +794,9 @@ Idempotency keys shouldn't live forever.
 - Redis: `EX 86400` (24h)
 - After expiry, the key is deleted → a new request becomes a new operation
 
-### Plain-English: why keys expire
+### Why keys expire
 
-**Analogy — the coat-check closes for the night.** A coat-check ticket is only good for today; you can't show up a year later. Idempotency keys work the same way: they only need to live long enough to cover the realistic **retry window** (a client retries within seconds or minutes, not next week). After that, keeping them is pure waste.
+Idempotency keys only need to live long enough to cover the realistic **retry window** — a client retries within seconds or minutes, not next week. After that, keeping them is pure waste.
 
 ```java
 redis.set(key, value, "NX", "EX", 86400);  // EX 86400 = auto-delete after 24 hours
@@ -851,9 +851,9 @@ Instead of a dedicated key, use a **business identifier** — e.g. an `order_id`
 - **Pros:** simpler (no extra key to manage)
 - **Cons:** harder when the **server** generates the IDs
 
-### Plain-English: the key belongs to the *action*, not the network call
+### The key belongs to the *action*, not the network call
 
-**Analogy — one raffle ticket per person, not per attempt.** If you keep grabbing a *new* raffle ticket every time you try to enter, you're counted as many different people. The whole scheme breaks. The client must mint **one key per real user intent** ("Place Order" tapped once) and cling to that same key across every retry.
+The client must generate **one key per real user intent** ("Place Order" tapped once) and reuse that same key across every retry. Generating a new key on each retry makes the server treat every attempt as a different operation, which defeats the whole scheme.
 
 ```java
 // ✅ Correct: make the key when the user acts, reuse it on retries
@@ -892,9 +892,9 @@ A modded APK could generate fake keys, spam requests, or bypass retry logic — 
 
 Protect against abuse separately (auth, rate limiting, server-side validation).
 
-### Plain-English: dedup token, not a password
+### Dedup token, not a password
 
-**Analogy — a "please don't run this twice" sticky note.** The idempotency key is a courtesy note the client attaches; it isn't a badge that proves *who* they are or *what* they're allowed to do. A malicious client can forge notes all day — and that's okay, because the note never *authorizes* anything; it only helps you avoid accidentally repeating work.
+The idempotency key is a deduplication token the client attaches; it isn't a credential that proves *who* they are or *what* they're allowed to do. A malicious client can forge keys freely — and that's fine, because the key never *authorizes* anything; it only helps you avoid accidentally repeating work.
 
 #### Q: If a hacker can fake keys, doesn't that break the system?
 
@@ -949,11 +949,10 @@ Why it's powerful: DB gives **strong consistency**, no separate system needed, n
 
 > **Interview line:** *"I'd start with DB-based idempotency because it's simpler and strongly consistent. At scale, I'd introduce Redis for performance, but carefully handle consistency between Redis and DB."*
 
-### Plain-English: one referee, or a fast helper + a referee
+### DB-only vs Redis + DB
 
-**Analogy — a single strict referee vs a speedy assistant plus that referee.**
-- **DB-only** = one strict referee. The `UNIQUE(idempotency_key)` constraint is the referee's whistle: the first request blows through, duplicates get flagged. Simple, always consistent, but the referee handles *every* call so it can get busy.
-- **Redis + DB** = a fast assistant (Redis) waves most duplicates away instantly, with the referee (DB) still there for the final ruling. Faster and can cache the full response — but now you have *two* people who can momentarily disagree (the crash mismatch from §10).
+- **DB-only** = the `UNIQUE(idempotency_key)` constraint enforces "exactly one": the first request succeeds, duplicates fail. Simple and always consistent, but the DB handles *every* dedup check.
+- **Redis + DB** = Redis filters most duplicates instantly in memory, with the DB still there as the final guard. Faster and can cache the full response — but now two systems can momentarily disagree (the crash mismatch from §10).
 
 ```java
 // DB-only: the schema itself enforces "exactly one"
@@ -980,12 +979,12 @@ Start **DB-only** — it's simpler, strongly consistent, and needs no extra movi
 
 > Response consistency is non-negotiable: always return the **exact same body + HTTP status** on a retry. This is critical for client trust.
 
-### Plain-English: what each tool is doing here
+### What each tool is doing here
 
-**Analogy — filling roles on a team.** Each technology plays one job in the dedup story:
-- **DB (Postgres/MySQL)** = the record-keeper with a rulebook. Its `UNIQUE` constraint is the hard guarantee that no two orders share a key.
-- **Redis** = the fast doorman out front. It checks "seen this?" in memory in microseconds and can hand back the cached response.
-- **Kafka (idempotent consumers)** = for event-driven systems where the *queue* delivers a message twice (at-least-once); the consumer dedups so it processes the event once.
+Each technology plays one job in the dedup story:
+- **DB (Postgres/MySQL)** = the durable store. Its `UNIQUE` constraint is the hard guarantee that no two orders share a key.
+- **Redis** = the fast in-memory check out front. It answers "seen this?" in microseconds and can hand back the cached response.
+- **Kafka (idempotent consumers)** = for event-driven systems where the queue delivers a message twice (at-least-once); the consumer dedups so it processes the event once.
 
 #### Q: Why does the "same body + same status on retry" rule matter so much?
 
@@ -1001,7 +1000,7 @@ Because the client uses the response to decide what to show the user. If the fir
 - ❌ No persistence → duplicates on restart
 - ❌ Returning different responses on retry
 
-### Plain-English: each pitfall = a broken promise
+### Each pitfall = a broken promise
 
 Every pitfall above is just one of the earlier rules being violated — here's the "so what" for each:
 
@@ -1039,7 +1038,7 @@ DB            = "What is the actual order?"
 > `IN_PROGRESS / SUCCESS / FAILED` is about request dedup.
 > `CREATED / CONFIRMED / SHIPPED` is the order's business state (lives in DB).
 
-### Plain-English: the whole pattern in one annotated flow
+### The whole pattern in one annotated flow
 
 Putting every piece together — this is the "press pay twice, charged once" guarantee end to end:
 
@@ -1087,7 +1086,7 @@ Response handlePayment(Request req, String key) {
 6. **HTTP methods:** `GET`/`PUT`/`DELETE` are idempotent by spec; `POST` is not → that's why `POST` gets an `Idempotency-Key`.
 7. **Prefer naturally idempotent design** — absolute updates / upserts / conditional writes over relative deltas.
 
-### Plain-English: how to *say* it in an interview
+### How to *say* it in an interview
 
 If you get "design an idempotent payment/order API," walk it in this order — it mirrors the sections above:
 

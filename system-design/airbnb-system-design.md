@@ -2,7 +2,7 @@
 
 > **Core challenge:** a **two-sided marketplace** connecting **hosts** (who list properties) with **guests** (who book them). Combines **geo + faceted search**, **date-range availability booking** (no double-booking), **payments with host payouts (escrow)**, **two-way reviews**, and **messaging** — plus **request-to-book vs instant-book**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated code/SQL, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated code/SQL, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -36,17 +36,17 @@ Host lists property (calendar, price) → Guest searches by location + dates + g
 
 vs a hotel chain: Airbnb has **many independent hosts**, each property usually **unique (count = 1)** rather than "10 identical Deluxe rooms", plus **host approval**, **host payouts**, and **two-way trust/reviews**. Availability correctness is the same family (date-range, no double-book) but per **listing calendar** instead of per room-type count.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
-Imagine a giant online version of a **neighbourhood notice board** where people pin "my spare room is free" cards, and travellers walk up, read the cards, and grab one.
+Airbnb is a marketplace where many independent hosts list places and guests book them for specific date ranges.
 
-- **Hosts** are ordinary people (not a hotel company) who put up a card for their apartment, cabin, treehouse — each place is usually **one of a kind**.
-- **Guests** come along and say "I want *somewhere in Goa*, for *these 4 nights*, for *2 people*" and want to see only the cards that match **and are still free on those exact nights**.
-- When a guest grabs a card, that place must become **unavailable for those nights** so nobody else grabs the same dates. That's the whole ballgame.
+- **Hosts** are individuals (not a hotel company) listing an apartment, cabin, treehouse — each place is usually **one of a kind** (count = 1).
+- **Guests** query "somewhere in Goa, for *these 4 nights*, for *2 people*" and want only listings that match the filters **and are still free on those exact nights**.
+- When a guest books a listing, those nights must become **unavailable** so nobody else takes the same dates. That's the whole ballgame.
 
 So the system does four jobs: (1) let hosts **list** places, (2) let guests **search** by place + dates + filters, (3) **book** without ever letting two guests take the same nights, and (4) handle the **money and trust** (payments, payouts, reviews) so strangers feel safe transacting.
 
-### Plain-English: why is this harder than a normal shopping site?
+### Why is this harder than a normal shopping site?
 
 On Amazon, if 5 people buy "the same t-shirt," that's fine — there are thousands in the warehouse; you just decrement stock. On Airbnb, a listing is **a single thing tied to specific dates**:
 
@@ -104,11 +104,11 @@ Client → API Gateway
 
 - **CQRS:** search = ES read model (rebuilt from listing/calendar changes via CDC); booking = RDBMS write model.
 
-### Plain-English: two copies of the truth, on purpose
+### Two copies of the truth, on purpose
 
 The confusing part of this diagram: **listing data lives in two places** — the RDBMS (Listing/Booking services) *and* Elasticsearch (Search). Why duplicate?
 
-**Analogy: a library.** The **master ledger** at the front desk records exactly who owns/borrowed each book (must be correct — that's the RDBMS). The **searchable catalogue computer** lets you browse by topic/author fast (that's Elasticsearch). The catalogue is a *convenient copy* built for browsing; the ledger is the *authority* for who actually has the book.
+The RDBMS is the **authority**: it records exactly what's booked and owed, transactionally (must be correct). Elasticsearch is a **rebuilt-for-speed copy** used to browse by topic/filters fast. The search index is a *convenient copy* built for querying; the RDBMS is the *authority* for what's actually booked.
 
 - **RDBMS (write side)** = the authority. When a booking happens, it's written here, transactionally. Money and calendars are never wrong here.
 - **Elasticsearch (read side)** = a rebuilt-for-speed copy, optimized for "places near this map area, under ₹5000, with wifi, free next weekend." It can be a few seconds stale — that's fine.
@@ -149,14 +149,14 @@ The dominant read path: **location + date range + guests + filters** (price, typ
 
 > Search reads a **read model** (ES), never the transactional DB. Map-viewport searches use bounding-box geo queries + the availability bitset filter.
 
-### Plain-English: how does "near this location" even work?
+### How does "near this location" even work?
 
-A computer can't natively answer "which of 7 million pins are near *here*?" without a trick — otherwise it would measure the distance to all 7M for every search. Two common tricks:
+A computer can't natively answer "which of 7 million listings are near *here*?" without a trick — otherwise it would measure the distance to all 7M for every search. Two common tricks:
 
 - **Bounding box (map viewport):** when you drag the Airbnb map, the app knows the corners of the visible rectangle (min/max latitude & longitude). Search becomes "give me listings with `lat BETWEEN … AND …` and `lng BETWEEN … AND …`" — a simple range filter Elasticsearch does fast.
 - **Geohash:** encode a lat/lng into a short string where **nearby places share a prefix**. `tdr1y` and `tdr1z` are neighbours. So "near me" ≈ "starts with `tdr1`" — a cheap prefix match instead of distance math to everything.
 
-**Analogy:** a geohash is like a **postal/PIN code** that gets more precise as you add characters. `560` narrows to a city, `560103` to a neighbourhood. Places with the same prefix are physically close, so you filter by prefix first, then fine-sort by exact distance.
+A geohash gets more precise as you add characters — a shorter prefix covers a larger area, a longer one a smaller area. Places with the same prefix are physically close, so you filter by prefix first, then fine-sort by exact distance.
 
 ```
 lat/lng: 12.93, 77.62
@@ -166,13 +166,11 @@ lat/lng: 12.93, 77.62
 "places near me" ≈ WHERE geohash LIKE 'tdr1%'   ← cheap, no distance-to-everything
 ```
 
-### Plain-English: the availability filter — why it's the hard part, and the bitset trick
+### The availability filter — why it's the hard part, and the bitset trick
 
-You'd think "only show places free July 10–14" is easy. It's the **nastiest** part, because the calendar has ~2.5 **billion** rows (7M listings × 365 days). Joining that to every search is impossible at scale.
+You'd think "only show places free July 10–14" is easy. It's the **hardest** part, because the calendar has ~2.5 **billion** rows (7M listings × 365 days). Joining that to every search is impossible at scale.
 
-**The trick: bake availability into the search index as a bitset.** For each listing, store a row of 0/1 bits, one per upcoming day: `1` = free, `0` = taken. A date-range search just checks "are all the bits for July 10–14 set to 1?"
-
-**Analogy: a hotel key rack / punch card.** Instead of reading a thick logbook, you glance at a row of pegs — a hole present = that night is open. Checking 4 nights = glancing at 4 pegs.
+**The trick: bake availability into the search index as a bitset.** For each listing, store a row of 0/1 bits, one per upcoming day: `1` = free, `0` = taken. A date-range search just checks "are all the bits for July 10–14 set to 1?" — a fixed-width bitwise check instead of scanning a calendar table.
 
 ```
 Listing 42, next 10 days:   [1 1 0 0 1 1 1 1 1 0]
@@ -235,7 +233,7 @@ book(listing, checkIn, checkOut, guest):
 - **Calendar-per-night rows** are simple; an **interval/range model** (store booked ranges + an exclusion constraint) is more compact but trickier — the per-night model is the clean interview answer.
 - **Request-to-book** inserts `REQUESTED` and holds the calendar pending host approval (a saga with a human-in-the-loop timeout).
 
-### Plain-English: how do we stop two people booking the same nights?
+### How do we stop two people booking the same nights?
 
 This is *the* Airbnb interview question. The naive approach and why it fails:
 
@@ -249,7 +247,7 @@ if (calendar.allNightsFree(listingId, checkIn, checkOut)) {   // step 1: look
 
 Between "look" (step 1) and "grab" (step 2), a second guest can do their own "look" and also see it free. **Both** proceed → double-booked. The gap between checking and acting is the enemy.
 
-**Analogy: two people reaching for the last cookie.** If each first *looks* ("is a cookie there? yes") and *then* grabs, both see a cookie and both lunge. The fix is to make **look-and-grab a single, un-interruptible motion** — one hand clamps down atomically; the other hand finds nothing.
+The fix is to make **check-and-claim a single, un-interruptible operation** so only one transaction can win: one flips the nights atomically; the other finds them already taken.
 
 **The fix: one atomic conditional UPDATE.** Ask the database to flip the nights to `BOOKED` *only where they're still `AVAILABLE`*, in a single statement, and then check how many nights it actually changed:
 
@@ -287,11 +285,9 @@ insertBooking(bookingId, PENDING_PAYMENT);
 
 Why this is bulletproof: the database only lets **one** transaction modify a given row at a time. If two guests race for July 10–14, one `UPDATE` flips all 4 rows first; the other's `UPDATE` matches **0** of those rows (they're no longer `AVAILABLE`) → `rows_affected < nights` → it rolls back and gets `NOT_AVAILABLE`. **No gap, no double-book.**
 
-### Plain-English: the "hold" — why booking isn't instant
+### The "hold" — why booking isn't instant
 
-A guest clicks "book," but then spends 3 minutes typing card details (or the host takes hours to approve a request). We can't leave the nights free (someone else grabs them) *or* mark them permanently `BOOKED` (payment might fail). Middle ground: a **temporary HELD status with an expiry**.
-
-**Analogy: the 10-minute cart timer** on concert-ticket sites — "these seats are yours for 10 minutes; finish paying or we release them."
+A guest clicks "book," but then spends 3 minutes typing card details (or the host takes hours to approve a request). We can't leave the nights free (someone else grabs them) *or* mark them permanently `BOOKED` (payment might fail). Middle ground: a **temporary HELD status with an expiry** — the nights are reserved for a fixed window, and released automatically if payment/approval doesn't complete in time.
 
 ```java
 // Step 1: claim nights as HELD with a deadline (not BOOKED yet)
@@ -339,9 +335,9 @@ REQUESTED ─host accept→ PENDING_PAYMENT ─pay→ CONFIRMED ─check-in/stay
 
 - Every terminal-fail path **releases the held calendar nights** (compensation).
 
-### Plain-English: a booking is a little journey with checkpoints
+### The booking state machine
 
-Think of a booking as a **parcel moving through a delivery pipeline**. It's always in exactly one clearly-labelled stage, and it can only move along legal arrows — it can't teleport from "just requested" straight to "completed." That's a **state machine**: a fixed set of states + rules for which transitions are allowed.
+A booking is always in exactly one clearly-labelled state, and it can only move along legal transitions — it can't jump from "just requested" straight to "completed." That's a **state machine**: a fixed set of states + rules for which transitions are allowed.
 
 - **REQUESTED** — guest asked; waiting for the host to say yes (request-to-book only).
 - **PENDING_PAYMENT** — approved (or instant-book); waiting for the card to go through.
@@ -390,11 +386,11 @@ Instant-book simply **skips the REQUESTED state** — there's no host to wait fo
 - **Refunds** per **cancellation policy** (flexible/moderate/strict = Strategy).
 - **Idempotent** payments + **outbox** so a confirmed booking reliably triggers charge + eventual payout; multi-currency + FX.
 
-### Plain-English: Airbnb holds the money in the middle (escrow)
+### Airbnb holds the money in the middle (escrow)
 
 Airbnb does **not** pass your payment straight to the host. It **charges the guest, holds the cash itself, and only pays the host ~24h after check-in.**
 
-**Analogy: escrow is like a wedding-gift envelope held by a trusted friend.** The guest hands the money to a neutral middle-person (Airbnb). The host doesn't get it until the guest has actually arrived and the place is as promised. If the "apartment" turns out to be a broom closet, Airbnb still has the money and can refund the guest. This is what makes strangers trust each other.
+This is **escrow**: the platform holds the funds and only releases them to the host once the guest has checked in and the stay isn't disputed. If the listing was misrepresented, Airbnb still holds the money and can refund the guest — which is what lets two parties who don't know each other transact safely.
 
 ```
 Guest pays ₹10,000  ──►  Airbnb escrow (holds it)
@@ -403,7 +399,7 @@ Guest pays ₹10,000  ──►  Airbnb escrow (holds it)
                          pay host ₹8,500   (₹10,000 − ₹1,500 platform fee)
 ```
 
-### Plain-English: a double-entry ledger (money is never a single number)
+### Double-entry ledger (money is never a single number)
 
 Real money systems never store "host balance = ₹8,500" as one editable number — too easy to lose track / cheat. They record **every movement as paired entries that must sum to zero** (money leaves one bucket, enters another). This is **double-entry bookkeeping**.
 
@@ -425,11 +421,9 @@ ledger.record(bookingId, List.of(
 
 The invariant "**all entries for a transaction sum to zero**" means money can never be created or destroyed by a bug — a powerful audit/consistency guarantee.
 
-### Plain-English: how the price is built up (stacking fees)
+### How the price is built up (stacking fees)
 
-The number a guest pays isn't one figure — it's **base nightly price × nights, plus cleaning fee, plus service fee, plus taxes, minus discounts.** Each piece is added as a layer, so you can insert/remove a layer (a promo, a new tax) without rewriting the whole calculation. That "wrap the running total with one more adjustment" shape is the **Decorator / Chain** pattern.
-
-**Analogy: a restaurant bill.** Start with the food subtotal, then the waiter *stacks* a service charge, then GST, then subtracts your coupon — each line added on top of the previous total.
+The number a guest pays isn't one figure — it's **base nightly price × nights, plus cleaning fee, plus service fee, plus taxes, minus discounts.** Each piece is applied as a layer on top of the running total, so you can insert/remove a layer (a promo, a new tax) without rewriting the whole calculation. That "wrap the running total with one more adjustment" shape is the **Decorator / Chain** pattern.
 
 ```java
 // Each rule takes the running total and returns a new total. Order matters.
@@ -453,11 +447,9 @@ Storing these as swappable **pricing_rules** (or seasonal/weekend surge rules) l
 
 Both. The listing has a `base_price`, but `listing_calendar` also has a per-night `price`, so a host can charge more on weekends/holidays or a specific date. The quote sums the *per-night* calendar prices when they differ from the base.
 
-### Plain-English: idempotency — why the same tap doesn't charge twice
+### Idempotency — why the same tap doesn't charge twice
 
-The guest taps "Pay" and the network stalls, so they tap again. Without protection, that's **two charges**. Fix: the client sends a unique **Idempotency-Key** with the request; the server remembers keys it has already processed and returns the *same* result for a repeat instead of charging again.
-
-**Analogy: a coat-check ticket.** You hand over your coat and get ticket #42. Show ticket #42 twice and you still get back **one** coat, not two — the ticket identifies *the same* transaction.
+The guest taps "Pay" and the network stalls, so they tap again. Without protection, that's **two charges**. Fix: the client sends a unique **Idempotency-Key** with the request; the server remembers keys it has already processed and returns the *same* result for a repeat instead of charging again. The key identifies the request, so repeats of the same key resolve to a single transaction.
 
 ```java
 @PostMapping("/v1/bookings")
@@ -470,7 +462,7 @@ Booking book(@RequestHeader("Idempotency-Key") String key, @RequestBody BookReq 
 
 In SQL this is backed by `idempotency_key VARCHAR(255) UNIQUE` on `bookings`/`payments` — a duplicate insert simply fails the unique constraint.
 
-### Plain-English: the outbox — making "confirm booking" and "tell everyone" reliable
+### The outbox — making "confirm booking" and "tell everyone" reliable
 
 When a booking confirms, several things must follow: charge, notify host, update search index, schedule payout. Danger: you save the booking, then crash *before* sending the Kafka event → booking exists but nobody was told (a **dual-write** problem).
 
@@ -545,9 +537,9 @@ CREATE TABLE outbox ( id BIGINT PRIMARY KEY, event_type VARCHAR(50), payload JSO
 
 > **Tables to consider:** users, listings, listing_photos, **listing_calendar** (the key one), bookings, payments, payouts, cancellation_policies, reviews, conversations, messages, wishlists, outbox, pricing_rules. Photos → blob/CDN; search → ES.
 
-### Plain-English: the tables as a story
+### How the tables fit together
 
-Read the schema as the life of a booking, not a pile of tables:
+Read the schema as the lifecycle of a booking, not a pile of tables:
 
 - A **user** who is a host owns **listings** (with **listing_photos**).
 - Each listing has a **listing_calendar** — *one row per night* — the star of the show (§6).
@@ -637,7 +629,7 @@ Host declines / timeout → booking=DECLINED/EXPIRED → RELEASE held nights (co
 | Search shows unavailable listing | Search is approximate; **exact re-check at booking** rejects it |
 | Host edits calendar during a hold | Held nights are locked; edits apply to free nights only |
 
-### Plain-English: "strong where it matters, relaxed where it doesn't"
+### Strong where it matters, relaxed where it doesn't
 
 The single biggest idea tying this doc together: **not everything needs to be perfectly consistent.** Airbnb deliberately picks per feature:
 
@@ -647,7 +639,7 @@ The single biggest idea tying this doc together: **not everything needs to be pe
 | **Search results / availability bitset** | **Eventual** (seconds stale) | A stale card is harmless — booking re-checks and rejects it |
 | **Review counts, ratings on cards** | **Eventual** | Nobody's harmed if a rating updates a few seconds late |
 
-**Analogy: a bank.** Your account balance must be exact to the paisa (strong). The "customers also viewed" widget can lag (eventual). Same app, different guarantees on purpose — you pay for strong consistency with speed/complexity, so you only buy it where it matters.
+The pattern: an account balance must be exact to the paisa (strong), while a "customers also viewed" widget can lag (eventual). Same app, different guarantees on purpose — you pay for strong consistency with speed/complexity, so you only buy it where it matters.
 
 #### Q: Two guests race for the exact same dates — who wins and how does the loser find out?
 

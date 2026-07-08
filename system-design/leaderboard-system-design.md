@@ -2,7 +2,7 @@
 
 > **Core challenge:** maintain a **real-time ranking** of millions of players by score — support "top N", "my rank", and "players around me" — with **fast updates and reads**. The heart is a **Redis Sorted Set** (skip list) and how to scale it (sharding + approximate rank) at very large scale.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated code and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -36,7 +36,7 @@ Queries: top 10, "my rank", "10 players around me", "my score"
 
 Two operations dominate: **update score** and **get rank/range** — both must be fast. **Redis sorted sets** do exactly this in `O(log n)`.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
 Picture a mobile game like **Candy Crush** or **PUBG**. Every player has a score. The game shows:
 
@@ -51,7 +51,7 @@ So the whole system is a giant **score board that stays sorted, all the time**, 
 
 The entire design is about doing both — **"change a score"** and **"tell me where someone ranks"** — extremely fast, even with 100 million players.
 
-### Plain-English: why is "rank" the hard part?
+### Why is "rank" the hard part?
 
 Storing a score is trivial (`user → number`). The hard question is: **"how many people are ahead of me?"**
 
@@ -73,7 +73,7 @@ That structure is a **Redis Sorted Set** (§6). Everything else is "how do we ke
 **Non-functional**
 - **Real-time** updates + reads (sub-ms); scale to **millions/billions** of players; highly available. **Eventual consistency** usually fine (rank lagging a moment is OK).
 
-### Plain-English: what "eventual consistency is fine" really means here
+### What "eventual consistency is fine" really means here
 
 For a bank balance, being off by even a moment is unacceptable. For a leaderboard, it's totally OK if your rank is a **second or two stale**.
 
@@ -94,7 +94,7 @@ Durable store: scores table + score_events (audit) → modest
 
 > The serving structure is **in-memory (Redis)**; the DB is the durable backing. Sizing = members × ~100 bytes; shard when a single ZSET gets too big or too hot.
 
-### Plain-English: does the whole leaderboard really fit in memory?
+### Does the whole leaderboard really fit in memory?
 
 Yes — and that's the surprising, wonderful part. People assume "millions of players" means "huge storage," but a leaderboard entry is tiny: just a **user id + a number**.
 
@@ -132,7 +132,7 @@ Reads (top-N / rank / around) → Redis ZSET (+ cached top-N) ; DB only for cold
 
 - **CQRS-ish:** Redis is the fast read/serve model; the DB is the source of truth (write-behind).
 
-### Plain-English: two copies of the score, and why
+### Two copies of the score, and why
 
 This design keeps the same score in **two places on purpose**, each good at a different job:
 
@@ -141,7 +141,7 @@ This design keeps the same score in **two places on purpose**, each good at a di
 | **Redis ZSET** (serving) | In-memory sorted set | Instant rank/top-N/around; blazing reads & updates | If the box dies, RAM is wiped (needs rebuilding) |
 | **Scores DB** (truth) | A normal durable database (e.g. Postgres) | Never loses data; survives restarts | Slow at "who's ahead of me?" ranking queries (§5) |
 
-Analogy: **Redis is the live scoreboard on the stadium wall** — everyone glances at it, it updates in real time. The **DB is the official record book in the office** — nobody stares at it during the game, but it's the permanent, trustworthy copy if the scoreboard's power ever cuts out.
+Redis is the fast serving copy that every read hits; the DB is the durable copy that survives restarts and is the source of truth if Redis is lost.
 
 #### Q: What does "write-behind" mean in this picture?
 
@@ -171,7 +171,7 @@ SELECT * FROM scores ORDER BY score DESC LIMIT 10                               
 - "My rank" = a **COUNT over all higher scores** → O(n) (or heavy index work) **per query**.
 - With frequent updates + millions of rows, this crushes the DB. **Ranking is fundamentally an ordered-set problem, not a relational one.**
 
-### Plain-English: why the obvious SQL melts
+### Why the obvious SQL melts
 
 The obvious first attempt: "just put scores in a table and ask the database."
 
@@ -188,9 +188,9 @@ This reads correctly in English and works fine for 100 players. It **falls apart
 - Now multiply by **everyone checking their rank at once** → the DB is doing millions of these giant counts per second. It grinds to a halt.
 - And scores are **changing constantly**, so you can't just cache the answer — every update can shift thousands of people's ranks.
 
-Analogy: imagine a stadium of 1,000,000 people and someone asks *"what's my position by height?"* The SQL approach = **re-measure and re-count all million people, from scratch, every single time anyone asks.** Absurd.
+In other words, the SQL approach recomputes the full ranking from scratch on every single query — hopeless at scale.
 
-> **The fix (the whole insight):** don't count on demand — keep everyone **standing in sorted order permanently.** Then "what's my position?" is just "**look at which spot I'm standing in**" — instant, no counting. That's what a Redis Sorted Set gives you (§6).
+> **The fix (the whole insight):** don't count on demand — keep all players **stored in sorted order permanently.** Then "what's my position?" is a direct position lookup — instant, no counting. That's what a Redis Sorted Set gives you (§6).
 
 **Ranking is an ordered-set problem, not a relational one** — a relational DB is built for "fetch/update this specific row," not "maintain a live sorted order of millions."
 
@@ -212,17 +212,15 @@ ZSCORE   leaderboard <userId>               # my score                   O(1)
 - The skip list gives ordered range/rank; the hash map gives O(1) member→score lookup.
 - All the "hard" queries become single `O(log n)` (or `+k`) commands — that's the whole trick.
 
-### Plain-English: what a Sorted Set actually is
+### What a Sorted Set actually is
 
-A **Redis Sorted Set (ZSET)** is like a **magic scoreboard that keeps itself sorted, forever, automatically.**
+A **Redis Sorted Set (ZSET)** is a collection that keeps its members sorted by score, forever, automatically.
 
-You put in pairs of **(member, score)** — here `(userId, points)`. No matter the order you insert them, Redis always keeps them lined up from highest to lowest. When you change someone's score, they instantly slide to their new correct position — you never re-sort anything yourself.
+You put in pairs of **(member, score)** — here `(userId, points)`. No matter the order you insert them, Redis always keeps them ordered from highest to lowest. When you change someone's score, they instantly move to their new correct position — you never re-sort anything yourself. Queries like "top 3" or "what position is Alice in?" are answered instantly because the set is *always* in order.
 
-Analogy: imagine a **shelf of trophies that magically reorders itself.** You hand it a trophy labeled "Alice: 500." It slots Alice into exactly the right spot. Later you say "Alice now has 800" — the shelf silently shuffles her forward to the correct new position. Ask it "who are the top 3?" or "what position is Alice in?" and it answers instantly, because it's *always* in order.
+### The commands, annotated
 
-### Plain-English: the commands, annotated
-
-Here's the same command list, but read like a story of a real game session:
+Here's the same command list, walking through a real game session:
 
 ```redis
 # A player earns points — set or increment their score.
@@ -246,7 +244,7 @@ ZSCORE    game:leaderboard "alice"       # → 800                            O(
 - `ZREVRANGE` walks the board **high → low**; `ZRANGE` walks **low → high**.
 - Rank is **0-based**: rank 0 = the very top. To show "#1", add 1 for humans.
 
-### Plain-English: "players around me" — the neat trick
+### "Players around me" — the neat trick
 
 Every game shows *"here's you, and the people just above and below you."* This is two commands:
 
@@ -278,7 +276,7 @@ List<Entry> playersAroundMe(String userId, int range) {
 
 Because the set is already sorted, "grab the 11 people around position 45,212" is just **slicing a range by index** — cheap (`O(log n + k)`), no scanning millions.
 
-### Plain-English: Q&A
+### Q&A
 
 #### Q: Why a *sorted set* instead of a normal database or a sorted list?
 
@@ -323,9 +321,9 @@ onScore(user, delta):
 - **Write-behind:** the DB is updated asynchronously (batched) → fast writes, durable truth.
 - **Cold start / Redis loss:** rebuild the ZSET from the DB (`scores` table); Redis AOF/RDB persistence speeds recovery.
 
-### Plain-English: why `ZINCRBY` saves us from lost updates
+### Why `ZINCRBY` saves us from lost updates
 
-Imagine Alice scores twice at almost the same instant — say a +10 and a +5 arrive together. A classic bug (the **race condition**):
+Suppose Alice scores twice at almost the same instant — say a +10 and a +5 arrive together. A classic bug (the **race condition**):
 
 ```
 Server A reads Alice = 100
@@ -343,7 +341,7 @@ ZINCRBY game:leaderboard  5 "alice"   # Redis: 110 → 115   ✓ both counted
 
 > **Rule of thumb:** prefer `ZINCRBY delta` ("add 10") over `ZADD newValue` ("set to 110") whenever multiple sources update the same score, so you never clobber a concurrent update.
 
-### Plain-English: durability — what happens if Redis dies?
+### Durability — what happens if Redis dies?
 
 Redis lives in **RAM**. Pull the plug and memory is wiped — the whole board is gone. That would be a disaster if Redis were the *only* copy. It isn't. Two safety nets:
 
@@ -368,7 +366,6 @@ They're Redis's own **on-disk backups**, so it can recover *fast* without replay
 | --- | --- | --- |
 | What | Periodic full snapshot of memory to disk | Log of every write command, replayed on restart |
 | Recovery | Fast to load, but loses writes since last snapshot | More complete (up to last fsync), slower to replay |
-| Analogy | A photo of the board every few minutes | A running diary of every score change |
 
 With AOF/RDB, a restarted Redis reloads *itself* in seconds instead of re-reading millions of rows from the DB. The DB rebuild is the ultimate fallback; AOF/RDB is the fast path.
 
@@ -397,7 +394,7 @@ my_rank ≈ (Σ counts in all buckets with score > my bucket) + my position with
 ```
 - Top-N is still exact (merge each shard's top-N); **exact global rank** is what's expensive, so approximate it.
 
-### Plain-English: when one board isn't enough
+### When one board isn't enough
 
 Everything so far assumed **one** Redis holding **one** board. That's great until:
 
@@ -406,9 +403,9 @@ Everything so far assumed **one** Redis holding **one** board. That's great unti
 
 The fix is **sharding**: split the one giant board into several smaller boards, each on its own machine.
 
-Analogy: instead of one impossibly long line of a million people to rank, you open **10 lines**. Each line is easy to manage on its own. The only tricky part becomes *"combine the 10 lines into one global picture"* — which is exactly what the two problems below are about.
+Sharding turns one huge board into several smaller boards, each easy to manage on its own. The only tricky part becomes *"combine the shards into one global picture"* — which is exactly what the two problems below are about.
 
-### Plain-English: sharding by score range vs. by hashing
+### Sharding by score range vs. by hashing
 
 There are two common ways to split, and the choice changes how ranking works:
 
@@ -427,7 +424,7 @@ shard 0:  scores    0–999  ← entirely behind you
 my global rank ≈ (everyone in shard 2) + (my exact rank inside shard 1)
 ```
 
-### Plain-English: top-N across shards (still exact, and cheap)
+### Top-N across shards (still exact, and cheap)
 
 "Who are the global top 10?" stays **exact and easy** even when sharded — a **merge**:
 
@@ -447,7 +444,7 @@ List<Entry> globalTopN(int n) {
 
 Why this works: the #1 player globally is obviously #1 on *their* shard too. So the global top 10 is guaranteed to be hiding inside the union of each shard's top 10. Grab those, sort the small combined list, done.
 
-### Plain-English: why exact global rank is the expensive one
+### Why exact global rank is the expensive one
 
 "My rank" is the painful query across shards. If sharded by hash, to know exactly how many players beat your score, you'd have to ask **every shard** "how many of yours are above my score?" and sum — every time, for everyone. That's costly at scale.
 
@@ -478,7 +475,7 @@ long approxRank(long myScore) {
 }
 ```
 
-Analogy: to guess your height rank in a stadium, you don't measure all million people. You use census-style bands — *"~600k people are taller than 6ft; I'm 5'9", and among the ~50k people my exact height, I'm somewhere in the middle."* Close enough, and computed from a handful of bucket totals instead of a million comparisons.
+This estimates rank from a handful of bucket totals instead of comparing against every player — close enough for the deep middle of the board, and vastly cheaper than an exact cross-shard count.
 
 #### Q: Isn't an approximate rank a problem?
 
@@ -499,7 +496,7 @@ Two cheap, high-impact read optimizations:
 - **All-time** = a persistent ZSET.
 - A score update **increments all active windows** (daily + weekly + all-time).
 
-### Plain-English: "today's top players" vs "all-time greats"
+### "Today's top players" vs "all-time greats"
 
 Games usually show several boards at once: **Today**, **This Week**, and **All-Time**. Each is its own separate sorted set — you don't try to cram time logic into one board.
 
@@ -531,8 +528,6 @@ void onScore(String userId, long delta) {
 
 No cron job needed — that's the beauty of **TTL** (time-to-live). When you create today's board, you tell Redis "delete this automatically after N days." Once nobody needs `lb:daily:2026-07-01` anymore, Redis **evicts it on its own**. Yesterday's boards quietly disappear; you never write cleanup code.
 
-Analogy: it's a **whiteboard that erases itself** at the end of the week — you never have to wipe it down.
-
 #### Q: Why separate boards instead of filtering one big board by time?
 
 Because a sorted set only knows **(member, score)** — it has no notion of "when." To answer "today's top 10," a single board would have to store per-player timestamps and filter, which sorted sets can't do efficiently. Separate per-window boards keep each one a clean, fast, already-sorted list. The small cost — a few extra `ZINCRBY`s per score — is trivial.
@@ -555,7 +550,7 @@ CREATE TABLE score_events ( event_id BIGINT PRIMARY KEY, user_id BIGINT, delta B
 
 > **Stores to consider:** scores (durable), score_events (audit/rebuild), Redis ZSETs per window/region, score histogram (approx rank), cached top-N. Redis ZSET = serving; DB = truth.
 
-### Plain-English: what each store is for
+### What each store is for
 
 Two SQL tables plus the Redis structures — each earns its place:
 
@@ -574,7 +569,7 @@ They answer different questions:
 - **`scores`** answers *"what is Alice's score right now?"* — one row, always current. Fast to read, easy to rebuild Redis from.
 - **`score_events`** answers *"how did Alice get here?"* — every +10, +300, etc. This is your safety net: if you suspect cheating or a bug, you can **replay the events** to recompute the true score, or roll back a bad one.
 
-Analogy: `scores` is your **current bank balance**; `score_events` is your **transaction statement**. You want both — the balance for a quick glance, the statement to explain and audit it. (This is the **Event Sourcing** idea: the log of changes is the ground truth you can always rebuild from.)
+Put differently: `scores` is the *current total* (a quick lookup); `score_events` is the *history of changes* (to explain, audit, or recompute it). You want both. (This is the **Event Sourcing** idea: the log of changes is the ground truth you can always rebuild from.)
 
 ---
 
@@ -587,7 +582,7 @@ GET  /v1/leaderboard/rank?userId=            → { rank, score }
 GET  /v1/leaderboard/around?userId=&range=5
 ```
 
-### Plain-English: each endpoint mapped to a Redis command
+### Each endpoint mapped to a Redis command
 
 The API is a thin wrapper — every endpoint is basically **one Redis command** dressed up as HTTP:
 
@@ -639,7 +634,7 @@ On Redis restart with empty ZSET → stream scores table → ZADD each → servi
 (AOF/RDB persistence makes this fast; DB is the ultimate truth)
 ```
 
-### Plain-English: walking through a score update
+### Walking through a score update
 
 Follow a single "+300" from Alice, step by step:
 
@@ -671,7 +666,7 @@ Because `scores` already holds each player's **final** number — one `ZADD` per
 | Read during update | Eventual — a momentarily stale rank is fine |
 | Time-window rollover | New ZSET per window with TTL; writes hit all active windows |
 
-### Plain-English: ties — what happens when two players have the same score?
+### Ties — what happens when two players have the same score?
 
 Say Alice and Bob both have exactly **800**. Who's shown first? A sorted set needs *some* rule to break the tie, and by default Redis breaks it **lexicographically by member name** — "alice" sorts before "bob". Consistent, but arbitrary (alphabetical order has nothing to do with skill).
 
@@ -687,11 +682,9 @@ long compositeScore(long points, long timestampMs) {
 }
 ```
 
-Now two players at 800 points are separated by *when* they hit 800 — deterministic and fair, still a single `ZADD`/`ZREVRANK`, no extra queries.
+Now two players at 800 points are separated by *when* they hit 800 — deterministic and fair, still a single `ZADD`/`ZREVRANK`, no extra queries. The packed timestamp is just a tiebreaker so equal-point players still get a stable, fair order.
 
-Analogy: like a race timing to the millisecond — if two runners "tie" at the finish, the photo-finish clock (the packed timestamp) decides who's actually ahead.
-
-### Plain-English: Q&A on the other edge cases
+### Q&A on the other edge cases
 
 #### Q: A player is cheating / a score was wrong — can we roll it back?
 

@@ -2,7 +2,7 @@
 
 > **Core challenge:** move money **correctly** — never double-charge, never lose a payment, always know the exact state — while integrating external **payment gateways/banks** that are slow, async, and occasionally fail. The heart is **idempotency**, a **double-entry ledger**, **auth/capture**, **async webhooks + reconciliation**, and an **exactly-once financial effect**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -46,14 +46,14 @@ Client → Payment Service → Payment Gateway/PSP (Stripe/Razorpay) → Card Ne
 
 **Two commandments:** **never double-charge** (idempotency) and **money is never created or destroyed** (double-entry ledger — everything balances). Correctness > latency.
 
-### Plain-English: who are all these players?
+### Who are all these players?
 
-Imagine you tap your card at a coffee shop to pay ₹500. Behind that one tap, a small crowd of companies passes messages to each other. Here's the same cast, but as the coffee-shop story:
+When you tap your card at a shop to pay ₹500, a chain of companies exchange messages behind that one tap. Here's each player:
 
 - **You (the shopper)** = the **client/app**. You tapped "Pay".
 - **The shop's payment software** = the **Payment Service** (the system *we* are designing). It remembers "this order needs ₹500", writes everything down, and talks to everyone else.
 - **The card machine company** (e.g. Stripe, Razorpay) = the **PSP / Gateway**. The shop doesn't wire up to Visa directly — that's terrifying and heavily regulated. Instead it plugs into a PSP that knows how to talk to the banks and card networks. The PSP also **tokenizes** your card (turns your card number into a safe stand-in code) so the shop never touches raw card digits.
-- **Visa / Mastercard / UPI** = the **card network**. Think of it as the postal service that routes the "can this person pay ₹500?" letter to the right bank.
+- **Visa / Mastercard / UPI** = the **card network**. It routes the "can this person pay ₹500?" authorization request to the right bank.
 - **Your bank** (the one that gave you the card) = the **issuing bank**. It's the one that actually says "yes, she has ₹500, approved" or "declined".
 - **The shop's bank** = the **acquirer**. It's where the ₹500 eventually lands.
 
@@ -99,11 +99,11 @@ Storage: financial data retained for YEARS (compliance) → partition + archive,
 
 > Volume is modest vs a feed system, but **every write must be ACID + auditable + retained**. The hard part is correctness under retries, async gateways, and partial failures — not raw throughput.
 
-### Plain-English: why "small numbers, hard problem"
+### Why "small numbers, hard problem"
 
 A social feed might handle *millions* of writes per second; a payment system handles maybe ~120/sec. So why is payments considered *harder*? Because **the difficulty isn't volume — it's that every single write must be perfect.**
 
-Analogy: a fast-food counter serves thousands of orders quickly, and a wrong order is annoying but fixable. A **bank vault** processes far fewer transactions, but **each one must be exactly right, provable, and kept forever** — a single lost or duplicated rupee is a serious incident. Payments are the vault, not the counter.
+Payments trade throughput for correctness. Unlike a high-volume system where an occasional error is tolerable, every payment write must be exactly right, provable, and retained forever — a single lost or duplicated rupee is a serious incident.
 
 Concretely, the estimates tell us three things:
 
@@ -133,18 +133,18 @@ Client → API Gateway
 
 - **RDBMS with ACID** for payments + ledger; **outbox** so events aren't lost; **vault/PSP** holds card data (you don't).
 
-### Plain-English: what each box does (a tour of the building)
+### What each box does
 
-Think of the Payment Service as a **bank branch** with specialized desks. A customer walks in with "I want to pay ₹500"; the request moves desk to desk:
+The Payment Service is made of specialized components; a payment request moves through them in turn:
 
-- **API Gateway** = the **front door / receptionist**. Every request enters here; it checks you're allowed in (auth) before anyone does real work.
-- **Payment Service** = the **main clerk** who owns the request end-to-end: creates the payment record, decides what happens next, writes to the strongly-consistent database. This is the orchestrator.
-- **Gateway Adapter** = the **translator on the phone to Stripe/Razorpay**. It knows each PSP's quirks and wraps calls in a **circuit breaker** (if the PSP is down, stop calling and fail fast instead of hanging). "Port + adapter" = one clean interface, many possible providers behind it.
-- **Webhook Handler** = the **mail room** that receives the PSP's later callback ("payment SUCCESS"), checks the signature is genuine, and throws away duplicates.
-- **Ledger Service** = the **accountant**. Every money movement is written here as balanced debits/credits. This is the source of truth (§7).
-- **Reconciliation Job** = the **nightly auditor**. Once a day it compares the bank's official settlement file against our ledger and flags anything that doesn't match.
-- **Payout Service** = the **payroll desk** that later pays merchants their accumulated balance, in batches.
-- **Kafka / Outbox** = the **internal announcement system**: once a payment succeeds, it reliably tells the order service, notifications, and analytics — without risking the message getting lost.
+- **API Gateway** — the entry point. Every request enters here; it authenticates the caller before any real work happens.
+- **Payment Service** — owns the request end-to-end: creates the payment record, decides what happens next, writes to the strongly-consistent database. This is the orchestrator.
+- **Gateway Adapter** — talks to Stripe/Razorpay. It knows each PSP's quirks and wraps calls in a **circuit breaker** (if the PSP is down, stop calling and fail fast instead of hanging). "Port + adapter" = one clean interface, many possible providers behind it.
+- **Webhook Handler** — receives the PSP's later callback ("payment SUCCESS"), verifies the signature is genuine, and discards duplicates.
+- **Ledger Service** — records every money movement as balanced debits/credits. This is the source of truth (§7).
+- **Reconciliation Job** — once a day, compares the bank's official settlement file against our ledger and flags anything that doesn't match.
+- **Payout Service** — later pays merchants their accumulated balance, in batches.
+- **Kafka / Outbox** — once a payment succeeds, reliably notifies the order service, notifications, and analytics without risking the message getting lost.
 
 ```java
 // The Payment Service as an orchestrator, calling each "desk" in turn.
@@ -200,9 +200,9 @@ Card payments are often **two-phase**: **authorize** (hold funds) then **capture
 
 > Treat the **sync response as provisional**; the **webhook** (or a status poll) is the source of truth. Auth+capture lets you verify funds upfront and only take money when you deliver.
 
-### Plain-English: authorize vs capture (the hotel deposit)
+### Authorize vs capture
 
-The clearest analogy is a **hotel check-in**. When you arrive, the hotel doesn't charge you yet — it puts a **hold** on your card ("we've reserved ₹5000 in case you raid the minibar"). Your available balance drops, but no money has actually moved. That hold is **authorize**. When you check out, the hotel **captures** the real amount (say ₹4200 for the nights you stayed). If you never showed up, they **void** the hold and nothing is charged.
+A **hotel check-in** is the standard example. When you arrive, the hotel doesn't charge you yet — it puts a **hold** on your card (reserving, say, ₹5000). Your available balance drops, but no money has actually moved. That hold is **authorize**. When you check out, the hotel **captures** the real amount (say ₹4200 for the nights you stayed). If you never showed up, they **void** the hold and nothing is charged.
 
 - **Authorize** = *reserve/hold* the money. Confirms the card is real and has funds. No money moved yet.
 - **Capture** = *actually take* the held money. This is when the charge becomes real.
@@ -268,13 +268,11 @@ POST /payments  Idempotency-Key: <uuid>
 - **Dedup webhooks** by gateway `event_id`.
 - **Idempotency + at-least-once webhooks + reconciliation = exactly-once financial effect.**
 
-### Plain-English: idempotency (tapping "Pay" twice)
+### Idempotency (tapping "Pay" twice)
 
 You tap "Pay ₹500". The spinner hangs. Nervous, you tap again. Or your phone's network silently retried the request. Now the server might receive **two identical "charge ₹500" requests**. Without protection, you get charged ₹1000. **Idempotency** is the rule: *"doing the same thing twice has the same effect as doing it once."*
 
-The trick is a single **idempotency key** — a unique id (like a UUID) that the client generates **once** for this payment attempt and attaches to *every* retry of it. Both taps carry the **same** key. The server uses that key to recognize "oh, this is the same payment I already saw" and refuses to charge again.
-
-Analogy: a **coat check ticket**. You hand your coat over and get ticket #42. If you come back and wave ticket #42, they don't take a *second* coat from you — they see #42 is already used and just hand back the *same* coat. The ticket makes repeats harmless.
+The trick is a single **idempotency key** — a unique id (like a UUID) that the client generates **once** for this payment attempt and attaches to *every* retry of it. Both taps carry the **same** key. The server uses that key to recognize "this is the same payment I already saw" and refuses to charge again.
 
 ```java
 @RestController
@@ -360,11 +358,11 @@ User pays ₹500 for an order (with a ₹50 platform fee):
 - A **refund/chargeback** is a *new* transaction that reverses the original — you never edit history.
 - Balance updates and their ledger entries commit in **one ACID transaction**.
 
-### Plain-English: double-entry ledger (money never appears from nowhere)
+### Double-entry ledger (money never appears from nowhere)
 
 A **ledger** is just a notebook of money movements. "Double-entry" is a 500-year-old accounting rule: **every movement is written twice** — once as where money **came from** (a *debit*) and once as where it **went to** (a *credit*) — and the two sides must be **equal**. If they don't match, you know instantly that something is wrong.
 
-Analogy: think of money like **water in connected buckets**. Water never vanishes or appears — it only *moves* from one bucket to another. If 500 mL leaves your bucket, exactly 500 mL must show up in other buckets. Double-entry is the plumbing log that records "500 mL out of bucket A" and "450 mL into bucket B, 50 mL into bucket C" — and checks that in = out.
+Concretely: whatever amount leaves one account must arrive in one or more others, and the totals on each side must be equal. If ₹500 leaves account A, exactly ₹500 must be recorded arriving elsewhere — e.g. ₹450 into B and ₹50 into C — and the ledger checks that money out = money in.
 
 ```
 You pay ₹500 for an order; the platform keeps a ₹50 fee. One transaction, three entries:
@@ -453,9 +451,9 @@ Gateways are async and unreliable — design for it.
 
 > **Reconciliation is the ultimate safety net:** the settlement file is the bank's truth. Any discrepancy — a missed webhook, a stuck `PENDING`, a mismatched amount — is caught daily and resolved. Never trust a single signal.
 
-### Plain-English: webhooks (the callback you wait for)
+### Webhooks (the callback you wait for)
 
-When you order food, the restaurant doesn't make you stand at the counter until it's cooked. They take your number and **call you back** when it's ready. A **webhook** is exactly that callback: instead of us repeatedly asking the PSP "done yet? done yet?", the PSP **calls us** at a URL we gave it — "payment `pay_123` is now SUCCESS" — the moment it knows.
+A **webhook** is a callback: instead of us repeatedly polling the PSP "done yet?", the PSP **calls us** at a URL we gave it — "payment `pay_123` is now SUCCESS" — the moment it knows.
 
 Two catches make webhooks tricky, and both have standard fixes:
 
@@ -490,11 +488,11 @@ ResponseEntity<Void> onWebhook(@RequestBody String rawBody,
 }
 ```
 
-### Plain-English: reconciliation (the nightly auditor)
+### Reconciliation (the nightly audit)
 
 Even with webhooks, things slip: a webhook never arrives (our server was down), a payment is stuck in `PENDING` forever, or an amount is subtly wrong. **Reconciliation** is the daily sanity check: the PSP/bank sends a **settlement file** — the official, authoritative list of "here is every transaction that actually settled and how much" — and we compare it, line by line, against our own ledger.
 
-Analogy: **balancing your checkbook against the bank statement** at month-end. Your own notes might have a mistake or a missed entry; the bank statement is the source of truth, so you fix your records to match (and investigate anything weird).
+The settlement file is authoritative: where our records disagree with it, we correct ours to match and investigate anything that can't be reconciled.
 
 ```java
 @Scheduled(cron = "0 0 3 * * *")   // 3 AM daily
@@ -552,11 +550,9 @@ INITIATED ─► AUTHORIZED ─capture→ CAPTURED/SUCCESS ─► (settled)
 
 Every transition is durably recorded; stuck `PENDING` payments are **always** resolved by polling/reconciliation — never abandoned.
 
-### Plain-English: the state machine (a payment's life story)
+### The state machine (a payment's lifecycle)
 
-A **state machine** is just "a thing can only be in one state at a time, and can only move between states along allowed arrows." A payment isn't a free-for-all — it can't jump from `INITIATED` straight to `REFUNDED` (you can't refund money you never captured). Modeling it explicitly prevents illegal, money-losing transitions.
-
-Analogy: a **traffic light**. Green → yellow → red → green. It can *never* go green → red directly. A payment has the same discipline: only certain next-states are legal from where it is now.
+A **state machine** is just "a thing can only be in one state at a time, and can only move between states along allowed transitions." A payment isn't a free-for-all — it can't jump from `INITIATED` straight to `REFUNDED` (you can't refund money you never captured). Modeling it explicitly prevents illegal, money-losing transitions: only certain next-states are legal from wherever the payment is now.
 
 ```java
 enum Status { INITIATED, AUTHORIZED, PENDING, CAPTURED, SUCCESS,
@@ -604,11 +600,11 @@ That's the dangerous state — "we don't know yet." The rule: **PENDING is never
 - **Wallet** = an account in the ledger; top-up/spend are balanced entries; **atomic** balance changes (strong consistency; a wallet can't go negative → conditional debit).
 - **Chargeback/dispute** = network-initiated reversal → ledger reversal + case tracking + evidence.
 
-### Plain-English: refunds, payouts & wallets (three money moves)
+### Refunds, payouts & wallets (three money moves)
 
 These are three everyday money movements, and each maps to ledger entries:
 
-- **Refund** = giving money **back** to the customer. Not an "undo" of the original — a **new, opposite transaction**. (Like returning a shirt: the shop doesn't erase the sale, it records a *return*.)
+- **Refund** = giving money **back** to the customer. Not an "undo" of the original — a **new, opposite transaction** (the original sale stays recorded; a separate return is added).
 - **Payout** = the platform **paying merchants** their accumulated earnings, usually **batched** (e.g. all of a seller's sales settled once a day, minus fees). Money you were *holding* on their behalf now actually leaves to their bank.
 - **Wallet** = a stored balance the user can top up and spend. In our system a wallet is just **another account in the ledger**; top-ups and spends are balanced entries like everything else.
 
@@ -664,11 +660,11 @@ Merchants accumulate many sales; sending each one to their bank immediately woul
 | **Fraud** | Rate limits, velocity checks, ML scoring, block/allow lists |
 | **Audit** | Immutable ledger + access logs (compliance/retention) |
 
-### Plain-English: security & PCI (don't hold the hot potato)
+### Security & PCI
 
 **PCI DSS** is a set of strict security rules you must follow if you *store or handle raw card numbers* (the 16-digit PAN). The rules are expensive and audited. The single best move is therefore: **never touch raw card data at all.** Let the PSP handle it and give you a harmless **token** instead.
 
-Analogy: a **coat-check tag again, but for your card**. You hand your real coat (card number) to the PSP's vault; they give you tag `tok_abc123`. You store the tag. If someone steals your database, they get a pile of useless tags — not card numbers. The tag only works when *you* present it to *that* PSP.
+You send the real card number to the PSP's vault; it returns a token like `tok_abc123`, and you store only the token. If your database is stolen, the attacker gets useless tokens, not card numbers — and a token only works when *you* present it to *that* PSP.
 
 ```java
 // SAVING a card: the raw number goes to the PSP, we store only a token + last4.
@@ -748,11 +744,11 @@ CREATE TABLE reconciliation_log ( id BIGINT PRIMARY KEY, run_date DATE, mismatch
 
 > **Tables to consider:** payments, accounts, ledger_transactions, **ledger_entries** (double-entry core), refunds, payouts, webhook_events (dedup), payment_methods (tokenized), disputes/chargebacks, outbox, reconciliation_log.
 
-### Plain-English: reading the data model (which table does what)
+### Reading the data model (which table does what)
 
 The tables mirror the story above. Here's each one in plain terms:
 
-| Table | In plain English | Key detail |
+| Table | Purpose | Key detail |
 | --- | --- | --- |
 | `payments` | One row per payment attempt | `idempotency_key` is **UNIQUE** → the "never double-charge" guarantee lives here |
 | `accounts` | One row per money bucket (user, merchant, platform, wallet) | `balance` is a cached snapshot; the real truth is the entries |
@@ -821,7 +817,7 @@ poll PSP status  OR  daily reconciliation vs settlement file → resolve to SUCC
 idempotency ensures any retry doesn't double-charge
 ```
 
-### Plain-English: walking the happy path end-to-end
+### Walking the happy path end-to-end
 
 Let's replay one ₹500 checkout and watch every mechanism from this doc fire in order:
 
@@ -880,7 +876,7 @@ We **leave it PENDING and never guess** (§9). A timeout means "unknown", not "f
 
 - **Strong consistency (ACID)** on payment + ledger writes; balance and its entries commit together.
 
-### Plain-English: the failure playbook (what breaks, what saves you)
+### The failure playbook (what breaks, what saves you)
 
 Every row in that table is a real thing that *will* go wrong in production, paired with the mechanism that saves you. Grouped by the two commandments:
 
@@ -900,7 +896,7 @@ Every row in that table is a real thing that *will* go wrong in production, pair
 - *Two spends race on a wallet* → **conditional debit** (`WHERE balance >= amount`, §10): can't go negative.
 - *The bank reverses a charge (chargeback)* → **ledger reversal + dispute case** (§10): recorded, never edited away.
 
-Analogy: think of it as a building with **multiple independent smoke detectors**. Idempotency catches duplicates at the door; the ledger catches imbalances in the accounting; reconciliation is the fire marshal who inspects everything nightly. No single failure slips through because a *later, more authoritative* check always exists.
+The pattern is layered, independent safety nets: idempotency catches duplicates at the entry point, the ledger catches imbalances in the accounting, and reconciliation catches anything else in its nightly pass. No single failure slips through because a *later, more authoritative* check always exists.
 
 #### Q: What's the one-sentence version of the whole failure strategy?
 

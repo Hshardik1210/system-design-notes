@@ -2,7 +2,7 @@
 
 > **Core challenge:** upload and serve **photos/videos** fast and globally, build a **follow-based ranked feed** and **Stories**, and support likes/comments/Explore — a blend of **media pipeline + CDN** (like YouTube) and **feed fan-out** (like Twitter). Distinctive parts: **media handling** and the **unidirectional follow graph** with **private accounts**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -44,7 +44,7 @@ Stories = ephemeral (24h) media; Explore = discovery of content you don't follow
 
 It's **media-heavy** (YouTube-like pipeline + CDN) **plus** a **follow feed** (Twitter-like fan-out). Read-heavy.
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
 Imagine you're rebuilding Instagram from scratch. Strip away the branding and there are really just **two hard jobs glued together**:
 
@@ -53,10 +53,10 @@ Imagine you're rebuilding Instagram from scratch. Strip away the branding and th
 
 Everything else (Stories, Explore, likes, comments) hangs off those two.
 
-**Analogy:** think of Instagram as a **magazine printing press + a personalized mailroom**.
+The two halves map to the two subsystems:
 
-- The **printing press** takes your original photo and prints it at several sizes, on high-quality paper, and ships copies to warehouses (CDN edges) all over the world so delivery is instant. That's the media pipeline.
-- The **mailroom** decides *which* magazine clippings land in *your* personal scrapbook (feed) based on who you follow. That's fan-out + ranking.
+- The **media pipeline** takes your original photo, produces several sizes of it, and distributes copies to CDN edges worldwide so delivery is fast.
+- The **feed** decides *which* posts land in your feed based on who you follow. That's fan-out + ranking.
 
 #### Q: Why compare it to both Twitter *and* YouTube — isn't that two systems?
 
@@ -81,14 +81,14 @@ Why it matters: because follows are one-way and unlimited, one account (a celebr
 **Non-functional**
 - Fast media upload + **global low-latency delivery** (CDN); read-heavy feed; huge scale; **eventual consistency OK**.
 
-### Plain-English: functional vs non-functional, and "eventual consistency OK"
+### Functional vs non-functional, and "eventual consistency OK"
 
 - **Functional requirements** = *what the app does* — the features a user can name: post a photo, follow someone, see a feed, like, comment, watch a Story.
 - **Non-functional requirements** = *how well it must do them* — speed, scale, reliability. Users don't say "I want low latency," but they *feel* it when the app is slow.
 
 **The single most important non-functional line here: "eventual consistency OK."**
 
-Analogy: when you post a photo, it's fine if your friend in Australia sees it **3 seconds** after your friend next door does. Nobody is harmed. Compare that to a **bank transfer**, where everyone must agree on your balance *instantly* (strong consistency), or you get double-spending.
+For example, when you post a photo, it's fine if your friend in Australia sees it **3 seconds** after your friend next door does. Nobody is harmed. Compare that to a **bank transfer**, where everyone must agree on your balance *instantly* (strong consistency), or you get double-spending.
 
 ```
 Strong consistency  → "everyone sees the exact same thing at the exact same instant" (banks) — expensive, slow
@@ -120,7 +120,7 @@ Storage: exabytes of media (blob) + small metadata (DB); Stories auto-expire (24
 
 > **Bandwidth (media reads)** is the cost center → CDN. Fan-out write volume + feed read QPS → precompute + cache. DB holds only small metadata.
 
-### Plain-English: reading the back-of-envelope math
+### Reading the back-of-envelope math
 
 These numbers aren't trivia — each one *points at a specific design decision*. Let's translate them:
 
@@ -175,11 +175,9 @@ Client → API Gateway
           Kafka (POST_CREATED, MEDIA_READY, LIKE, FOLLOW → fan-out, index, notifications, analytics)
 ```
 
-### Plain-English: why so many separate services?
+### Why so many separate services?
 
-At first this box-diagram looks like overkill — why not one big program? Because each job has **wildly different needs**, and you want to scale/fix/deploy them independently.
-
-**Analogy: a big restaurant.** You don't have one person do everything. You have a host (API gateway), cooks (media workers), a pantry (blob store), waiters (feed service), etc. If Friday night gets busy, you hire more *cooks* without touching the *host*. Same here: if uploads spike, you add media workers without touching the feed service.
+At first this box-diagram looks like overkill — why not one big program? Because each job has **wildly different needs**, and you want to scale/fix/deploy them independently. If uploads spike, you add media workers without touching the feed service.
 
 | Service | Its one job | Why it's separate |
 | --- | --- | --- |
@@ -193,7 +191,7 @@ At first this box-diagram looks like overkill — why not one big program? Becau
 
 #### Q: What is Kafka doing sitting in the middle of all this?
 
-Kafka is the **announcement board** (a message queue / event log). When something happens, a service **posts an event** to Kafka instead of directly calling ten other services. Everyone interested **subscribes**.
+Kafka is a **message queue / event log**. When something happens, a service **publishes an event** to Kafka instead of directly calling ten other services. Everyone interested **subscribes**.
 
 ```
 You post a photo →  Post Service drops a "POST_CREATED" event on Kafka
@@ -208,7 +206,7 @@ Why this is huge: the Post Service doesn't need to *know* about search, notifica
 
 #### Q: Isn't calling other services directly simpler?
 
-For 2 services, yes. For 10 services during a traffic spike, no — direct calls create a fragile web where one slow service stalls everyone. Kafka acts as a **shock absorber**: if the notification service is down, events pile up safely in Kafka and get processed when it recovers, instead of failing the user's upload.
+For 2 services, yes. For 10 services during a traffic spike, no — direct calls create a fragile web where one slow service stalls everyone. Kafka acts as a **buffer**: if the notification service is down, events pile up safely in Kafka and get processed when it recovers, instead of failing the user's upload.
 
 ---
 
@@ -239,9 +237,9 @@ The signature part (shares DNA with the Video Streaming note).
 - **Blurhash/placeholder** → instant blurred preview while the image loads.
 - **EXIF stripped** (removes GPS/camera metadata → privacy).
 
-### Plain-English: the upload dance, step by step
+### The upload flow, step by step
 
-**Analogy: dropping film off at a photo lab.** You don't hand your film to the cashier and wait at the counter while they develop it. You drop it in a labeled envelope (upload), get a ticket, and leave. Behind the scenes, technicians develop prints in several sizes. When ready, your order is marked "done." Instagram uploads work the same way — **fast drop-off now, processing later.**
+The upload is decoupled from processing: the client uploads the original quickly and gets a response immediately, while the heavy work (making sizes, transcoding) happens afterward in the background. **Fast drop-off now, processing later.**
 
 #### Q: What is a "pre-signed upload URL" and why not just upload to the Media Service?
 
@@ -306,9 +304,9 @@ Each variant is an independent task, so many workers crunch them **in parallel**
 - Immutable media URLs → cache forever (long TTL); **signed URLs** for private content.
 - Video uses **adaptive bitrate (HLS)** like the Video Streaming note.
 
-### Plain-English: what a CDN actually is
+### What a CDN actually is
 
-**Analogy: coffee chains vs one giant roastery.** If there were only ONE Starbucks on Earth, everyone would fly there for coffee — slow and absurd. Instead there's a Starbucks on every corner. A **CDN (Content Delivery Network)** does that for files: instead of one server in Virginia serving the whole planet, it keeps **copies of your media in hundreds of cities**, so each viewer downloads from a server a few milliseconds away.
+A **CDN (Content Delivery Network)** keeps **copies of your media in hundreds of cities** instead of serving the whole planet from one origin server. Each viewer downloads from a nearby edge server a few milliseconds away rather than a distant origin.
 
 ```
 Without CDN:  user in Tokyo ──────── 10,000 km ────────► your server in Virginia   (slow, 300ms)
@@ -373,7 +371,7 @@ Build feed:
 - Store **post ids** in the feed cache (Redis sorted set); hydrate **media variant URLs** + counts on read.
 - **Private-account posts** only enter followers' feeds if the follow is `ACCEPTED`.
 
-### Plain-English: the feed is the heart of the whole design
+### The feed is the heart of the whole design
 
 Your home feed = "recent posts from people I follow, best stuff on top." Sounds trivial. It is *the* hardest scaling problem in the system. The core question:
 
@@ -385,7 +383,7 @@ That single choice is called **fan-out**, and there are two extremes.
 
 The moment I post, immediately **copy the post's id into the feed of every one of my followers**. When you open the app, your feed is already sitting there, pre-built.
 
-**Analogy: a newspaper delivered to your doorstep.** By the time you wake up, the paper is already there. Reading = instant. The work happened earlier, at "print + deliver" time.
+The work happens up front, at post time; reading is then instant because the feed is already built.
 
 ```java
 // Runs when a post is created (triggered by POST_CREATED on Kafka)
@@ -406,7 +404,7 @@ void fanOutOnWrite(Post post) {
 
 Store nothing ahead of time. When you open the app, **go gather** the recent posts from everyone you follow, right then.
 
-**Analogy: no delivery — you drive to every friend's house to ask "anything new?"** Cheap for them (they store nothing), but slow and exhausting for you every single morning.
+Nothing is precomputed, so every read must query all the accounts you follow — cheap on write, but expensive on every read.
 
 ```java
 // Runs when a user opens the app
@@ -504,11 +502,11 @@ Story = media with expires_at = created_at + 24h
 
 - View-state writes are huge (every view of every story) but **ephemeral** → cheap store + TTL.
 
-### Plain-English: Stories = posts with a self-destruct timer
+### Stories = posts with a 24h expiry
 
 A Story is basically a post that **auto-deletes after 24 hours**. That one twist (temporary) changes how you store it.
 
-**Analogy: a whiteboard vs a printed book.** A normal post is a printed book — it stays on the shelf forever, so you file it carefully. A Story is a whiteboard note — it'll be wiped tomorrow, so you don't bother with permanent archiving; you just need it *fast* while it's up.
+Because a Story is temporary, you don't need the permanent, carefully-archived storage a normal post gets — you just need it *fast* while it's live, then let it expire.
 
 #### Q: How does "expires after 24h" actually work?
 
@@ -563,11 +561,11 @@ Because it's short-lived, you can use a cheap, fast, write-optimized store and n
 - **Candidate generation** (trending, similar-to-liked, topics/hashtags, accounts like ones you follow) → **ML ranking** → cache.
 - Backed by a search/recommendation pipeline (Elasticsearch + embedding similarity + engagement signals), rebuilt continuously.
 
-### Plain-English: Explore = the feed for strangers
+### Explore = the feed for content you don't follow
 
 Your **home feed** shows people you *chose* to follow. **Explore** shows content from people you *don't* follow but might like. It's how Instagram grows — it keeps you scrolling past your own follow graph.
 
-**Analogy: a bookstore's "recommended for you" table.** Your home feed is the shelf of authors you already subscribe to. Explore is the front table the staff curates based on what you've browsed, hoping you discover something new.
+Explore surfaces content from accounts you don't follow, chosen by a recommender based on what you've engaged with — the mechanism that drives discovery.
 
 #### Q: How does it decide what to show a stranger's content to me?
 
@@ -644,7 +642,7 @@ CREATE TABLE notifications ( notif_id BIGINT PRIMARY KEY, user_id BIGINT, type V
 
 > **Tables to consider:** users, follows, posts, post_media, likes, comments, stories, story_views, hashtags, post_hashtags, notifications, precomputed feeds (Redis), explore/search index (ES). DMs = separate chat system.
 
-### Plain-English: reading the schema like a story
+### Reading the schema
 
 Each table maps to one real-world thing. Walk through them as "who / what / relationships":
 
@@ -715,13 +713,13 @@ POST /v1/stories { mediaRef }                  · GET /v1/stories/tray · POST /
 GET  /v1/explore
 ```
 
-### Plain-English: why the API is shaped this way
+### Why the API is shaped this way
 
 The APIs mirror the design decisions above. Two patterns stand out.
 
 #### Q: Why is posting a photo TWO calls (upload-url then posts)?
 
-Because of the "drop off the film, come back later" flow (§5). You **can't** cram a 3 MB (or 300 MB video) upload into a normal JSON API call — so it's split:
+Because of the decoupled upload-then-process flow (§5). You **can't** cram a 3 MB (or 300 MB video) upload into a normal JSON API call — so it's split:
 
 ```
 1. POST /v1/media/upload-url      → server returns a pre-signed S3 link + a mediaId
@@ -771,11 +769,9 @@ User → FeedSvc: read feed:{me} (pushed ids) + pull celebrity posts → rank �
        hydrate post_media variant URLs + counts → paginate
 ```
 
-### Plain-English: following one post from tap to feed
+### Following one post from tap to feed
 
-Let's trace a single photo through the whole system, tying the sections together.
-
-**Analogy: mailing a postcard.** You drop it at the post office (upload), they sort and stamp it (processing), then deliver copies to every mailbox on your list (fan-out). Each recipient reads it when they check their mail (feed read).
+Let's trace a single photo through the whole system, tying the sections together. The write path has three stages: upload the original, process it into variants, then fan out the post id into followers' feeds. Each follower reads it when they open the app (feed read).
 
 #### Upload → ready (the write path)
 
@@ -818,7 +814,7 @@ That's the whole strategy for a read-heavy app (§2): **push the hard work to wr
 | Media processing failure | Retry; `status=FAILED` after max attempts + notify |
 | Feed freshness | Eventual (a post may appear a few seconds late) |
 
-### Plain-English: the tricky corner cases, decoded
+### The tricky corner cases, decoded
 
 These are the "what happens if..." questions an interviewer loves. Each row is a real situation and a pragmatic answer.
 
@@ -878,7 +874,7 @@ No, it's a deliberate trade. A brand-new post might take a few seconds to fan ou
 | **Facade** | Feed service over graph + posts + media + rank | Simple API |
 | **Repository** | Data access | Testable |
 
-### Plain-English: the patterns, in one line each with a "where"
+### The patterns, in one line each with a "where"
 
 Patterns are just named solutions to recurring problems. Here's each one grounded in *this* app:
 
@@ -911,7 +907,7 @@ Don't recite it. When you make a decision, **name the pattern** as justification
 - **Private accounts** → follow requests (PENDING) + ACL on read.
 - Post shows `PROCESSING` until media ready (state machine); failed media retried.
 
-### Plain-English: how each piece scales, and what happens when it breaks
+### How each piece scales, and what happens when it breaks
 
 The trick to scaling is that each subsystem has a *different* pressure and a *different* release valve:
 

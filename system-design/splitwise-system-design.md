@@ -2,7 +2,7 @@
 
 > **Core challenge:** track **who owes whom** across group expenses, keep a correct **balance ledger** (always nets to zero), and **minimize the number of settle-up transactions**. Part **money/ledger correctness**, part a neat **graph/greedy algorithm** (debt simplification) — a common OOD + algorithm hybrid.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -36,9 +36,9 @@ Invariant: the sum of everyone's net balance is always 0 (money is conserved)
 
 Correctness (balances always net to zero) + a **greedy debt-minimization** algorithm are the interesting parts.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
-Imagine a **weekend trip with three friends — Alice, Bob, and Carol.** Over the weekend:
+Take a **weekend trip with three friends — Alice, Bob, and Carol.** Over the weekend:
 
 - Alice pays ₹900 for dinner (for all three).
 - Bob pays ₹600 for the cab (for all three).
@@ -52,7 +52,7 @@ At the end, nobody wants to remember "you paid this, I paid that." They just wan
 
 So Splitwise is basically a **shared, automatic scoreboard for money between friends.** Everything else is "how do we keep that scoreboard correct and simple."
 
-### Plain-English: why "everything nets to zero" is the golden rule
+### Why "everything nets to zero" is the golden rule
 
 Money isn't created or destroyed when friends split a bill — it just **moves between people**. So if you add up *everyone's* net position, it must equal **exactly 0**.
 
@@ -110,7 +110,7 @@ Client → API Gateway
 
 - **RDBMS with ACID** for expenses/splits/balances (money → strong consistency). Not much to shard.
 
-### Plain-English: why a boring SQL database wins here
+### Why a plain SQL database wins here
 
 The Ad-Click design needed Kafka and stream processors because it faced *millions of events per second*. Splitwise is the **opposite** situation. Expenses trickle in — a few per person per day. There is **no firehose.** What we care about instead is **never getting the money wrong.**
 
@@ -125,15 +125,15 @@ That's exactly what a plain relational database (Postgres/MySQL) with **ACID tra
 
 #### Q: What do all those "services" actually do?
 
-Think of them as **departments in a small accounting office**, each with one job:
+Each service has one job:
 
-| Service | Real-world analogy | Job |
-| --- | --- | --- |
-| **Expense Service** | the clerk who writes down each bill | validate the split, compute each person's share, update balances |
-| **Balance Service** | the ledger book | answer "who owes whom right now" fast |
-| **Settlement Service** | the cashier | record when someone actually pays back |
-| **Simplify Service** | the smart accountant | figure out the fewest payments to square everyone up |
-| **Notification / Activity log** | the noticeboard | tell members what happened, keep a history |
+| Service | Job |
+| --- | --- |
+| **Expense Service** | validate the split, compute each person's share, update balances |
+| **Balance Service** | answer "who owes whom right now" fast |
+| **Settlement Service** | record when someone actually pays back |
+| **Simplify Service** | compute the fewest payments to square everyone up |
+| **Notification / Activity log** | tell members what happened, keep a history |
 
 At small scale these can all live in **one app** — they're logical responsibilities, not necessarily separate servers.
 
@@ -157,7 +157,7 @@ Expense: Alice pays 900 for dinner, split equally among Alice, Bob, Carol (300 e
 - **Validate splits sum to the total** (money conservation) before recording.
 - **Rounding:** equal split of 100 among 3 = 33.33 each = 99.99 → assign the leftover cent to one payer so the sum is exact (never lose/create money).
 
-### Plain-English: the four ways to split a bill
+### The four ways to split a bill
 
 Picture the ₹900 dinner. There are four common ways the three friends might divide it:
 
@@ -170,7 +170,7 @@ Picture the ₹900 dinner. There are four common ways the three friends might di
 
 The **one rule that never bends**: whatever method you pick, the per-person shares must **add back up to the exact total**. If they don't, reject the expense — money would leak.
 
-### Plain-English: modeling this in Java (the OOP core)
+### Modeling this in Java (the OOP core)
 
 First, the basic objects — `User`, `Group`, `Expense`, and a `Split` (one person's portion of an expense):
 
@@ -322,9 +322,9 @@ Settle up (Bob pays Alice 300) → balance(Bob, Alice) -= 300
 - **A user's total** = sum of their pair balances; **group balance** = aggregate of member pair balances.
 - Keep the **`expenses`/`expense_splits` history** as the audit source; balances are a fast-read projection.
 
-### Plain-English: balances are just "IOU notes between pairs"
+### Balances are just IOUs between pairs
 
-Forget databases for a second. A balance is just an **IOU note between two people**: *"Bob owes Alice ₹300."* The whole balance system is a shoebox of these notes.
+A balance is just an **IOU between two people**: *"Bob owes Alice ₹300."* The whole balance system is the collection of these IOUs.
 
 Two things make it clean:
 
@@ -340,7 +340,7 @@ Ordering the pair consistently (`min(id), max(id)`) means there's **exactly one 
 
 **2. Every change touches two sides equally (double-entry).** When Bob's debt to Alice goes up by 300, that's the *only* change — the money that left Bob's "owed" column is the same money that entered Alice's "owed to me" column. Nothing is created. This is why the grand total always stays 0.
 
-### Plain-English: the balance math, step by step
+### The balance math, step by step
 
 ```
 Start: everyone at 0.
@@ -362,7 +362,7 @@ Now: Alice is owed net +100+300 = +400? Let's total everyone:
   sum =                                        0   ✅
 ```
 
-### Plain-English: a `BalanceSheet` in Java
+### A `BalanceSheet` in Java
 
 ```java
 // A directed pair key, always normalized so (Alice,Bob) and (Bob,Alice) map to ONE entry.
@@ -374,7 +374,7 @@ record PairKey(long low, long high) {
 
 class BalanceSheet {
 
-    // the shoebox of IOU notes: pair -> signed amount (+ = `low` is owed by `high`)
+    // one signed amount per pair (+ = `low` is owed by `high`)
     private final Map<PairKey, BigDecimal> balances = new HashMap<>();
 
     // Core primitive: "debtor now owes creditor `amount` more." Double-entry in one place.
@@ -455,7 +455,7 @@ Nets: Alice +300, Carol −300, Bob 0  → Carol pays Alice 300 (1 txn). Done.
 
 - Produces a **minimal-ish** set of transactions; **optimal min-cash-flow is NP-hard** → greedy is the standard practical answer (≤ n−1 transactions).
 
-### Plain-English: why we bother simplifying at all
+### Why we bother simplifying at all
 
 After a trip, the raw IOU notes can be a tangled mess:
 
@@ -469,7 +469,7 @@ Taken literally, that's **3 separate payments**. But look closer — the ₹300 
 
 That's debt simplification: **fewest payments to make everyone's net balance zero.** Nobody wants to make five Venmo transfers when one will do.
 
-### Plain-English: the trick — ignore *who owes whom*, only care about *net position*
+### The trick — ignore *who owes whom*, only care about *net position*
 
 The key insight that makes the algorithm simple: **it doesn't matter who the original debts were between.** All that matters is each person's **final net number**:
 
@@ -484,7 +484,7 @@ For each person:  net = (total others owe them) − (total they owe others)
 
 Once you have the net numbers, forget the history. Just **route cash from debtors to creditors** in as few moves as possible.
 
-### Plain-English: the greedy algorithm — "biggest owes biggest"
+### The greedy algorithm — "biggest owes biggest"
 
 The strategy: repeatedly take the person who **owes the most** and the person who is **owed the most**, and make the biggest single payment possible between them. This kills off at least one person per step.
 
@@ -560,7 +560,7 @@ The *simplified payments* are just a **suggestion for settling up** — a conven
 | **Rounding** | Distribute leftover cents deterministically so totals are exact |
 | **Edit/delete expense** | Reverse the original split's balance effect (compensating entries), then apply the new one — never mutate history silently |
 
-### Plain-English: what can go wrong when two things happen at once
+### What can go wrong when two things happen at once
 
 Imagine Alice and Bob **both add an expense to the same group at the exact same moment**, and both touch the `balance(Alice, Bob)` row. Without care:
 
@@ -573,7 +573,7 @@ Request 2 writes 100 + 200 = 300  ← overwrites! request 1's 300 vanished
 
 That's a **lost update** — money silently disappears. The fix is to make each expense an **all-or-nothing transaction** that locks the rows it touches, so the second request waits for the first to finish.
 
-### Plain-English: the ACID transaction that keeps money honest
+### The ACID transaction that keeps money honest
 
 ```java
 class ExpenseService {
@@ -607,7 +607,7 @@ class ExpenseService {
 }
 ```
 
-### Plain-English: the deadlock trap (and the fix)
+### The deadlock trap (and the fix)
 
 A **deadlock** is a stand-off: two transactions each hold a lock the other needs, so both wait forever.
 
@@ -676,7 +676,7 @@ CREATE TABLE activity_log ( id BIGINT PRIMARY KEY, group_id BIGINT, type VARCHAR
 
 > **Tables to consider:** users, groups, group_members, expenses, expense_splits, balances (denormalized pairs), settlements, activity_log. Balances derivable from splits+settlements or denormalized for read speed.
 
-### Plain-English: what each table is *for*
+### What each table is *for*
 
 Think of the tables in two buckets — **"the truth"** (what actually happened, never edited in place) and **"the fast summary"** (derived, for quick reads):
 
@@ -691,7 +691,7 @@ Think of the tables in two buckets — **"the truth"** (what actually happened, 
 
 If the `balances` summary ever looks wrong, you can **rebuild it from scratch** by replaying `expense_splits` + `settlements` — the truth tables are the safety net.
 
-### Plain-English: reading the `balances` table with an example
+### Reading the `balances` table with an example
 
 The `balances` row uses a **normalized pair** (`user_low < user_high`) and a **signed amount**, so one friendship = one row:
 

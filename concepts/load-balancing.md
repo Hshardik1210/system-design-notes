@@ -2,7 +2,7 @@
 
 > **Goal:** spread incoming traffic across multiple servers so no single one is overwhelmed — improving **scalability, availability, and latency**. The interview question is usually "L4 vs L7, which algorithm, and how do you handle a server dying?"
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (a running restaurant analogy — a host seating diners across waiters — plus simple annotated config/code and the exact confusions that trip people up). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated config/code and the exact confusions that trip people up). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -28,28 +28,20 @@
 
 > Clients hit **one address (the LB / VIP)**; the LB forwards to a healthy backend.
 
-### Plain-English: the host at a busy restaurant
+### Why a single entry point
 
-**Analogy used throughout this doc: a load balancer is the host (maître d') at the door of a busy restaurant.**
+If clients picked backend servers themselves, traffic would clump unevenly — many clients might hit the same server while others sit idle — and clients would need to know every server's address. Instead you put **one entry point** in front: every request goes to the load balancer first, and it decides which backend handles it. That single decision point is the whole idea:
 
-- **Diners walking in** = incoming requests (users).
-- **Waiters** = your backend servers.
-- **The host at the door** = the load balancer.
+- **Scale horizontally** — under more load, add a server. The load balancer starts routing to it too. Clients never need to know how many servers exist.
+- **Availability** — a server crashes? The load balancer stops routing to it. Clients don't notice.
+- **Latency** — it can send a request to the least-loaded backend, or the nearest region, so it's served faster.
+- **Zero-downtime deploys** — deploying new code? Stop sending a server *new* requests, let its in-flight ones finish, then swap it back in. No request is interrupted.
 
-Imagine diners just wandered in and picked their own waiter. Everyone would swarm the one friendly waiter near the entrance — he'd be buried in orders while three other waiters stand idle. Chaos, slow food, angry diners.
+The key win: clients only need to know **one address** (the VIP). They never track individual backend addresses. You can add, remove, or replace backends freely behind that one entry point.
 
-So you put **one host at the door**. Every diner talks to the host first, and the host decides which waiter takes them. That single decision point is the whole idea:
+#### Q: Isn't the load balancer now the bottleneck / single point of failure?
 
-- **Scale horizontally** — busy night? Hire another waiter (add a server). The host just starts seating diners with them too. Diners never need to know how many waiters exist.
-- **Availability** — a waiter goes home sick (server crashes)? The host simply stops seating people with them. Diners don't notice.
-- **Latency** — the host can send you to the waiter with the fewest tables (least-loaded) or the one nearest your seat (nearest region), so you get served faster.
-- **Zero-downtime deploys** — need to retrain a waiter (deploy new code)? Stop giving them *new* tables, let them finish their current ones, then swap them back in. Nobody's meal gets interrupted.
-
-The key win: diners remember **one thing — "ask the host"** (one address / the VIP). They never memorize waiter names. You can hire, fire, or retrain waiters freely behind that one front door.
-
-#### Q: Isn't the host now the bottleneck / single point of failure?
-
-Great instinct — yes, if there's only one host and they faint, nobody gets seated. That's why real setups run **two or more hosts** sharing one podium (the VIP), so if one drops, the other keeps seating. Covered in §6 (High Availability).
+Yes — if there's only one load balancer and it fails, nothing gets routed. That's why real setups run **two or more load balancers** sharing one VIP, so if one drops, another keeps routing. Covered in §6 (High Availability).
 
 ---
 
@@ -65,22 +57,22 @@ Great instinct — yes, if there's only one host and they faint, nobody gets sea
 
 > **L7** can route `/images` to one pool and `/api` to another, terminate TLS, and do sticky sessions by cookie. **L4** is faster and simpler but blind to content.
 
-### Plain-English: two kinds of host — the fast one and the smart one
+### L4 vs L7: how much of the request the LB reads
 
-Back to the restaurant. There are two styles of host, and the difference is **how much they're allowed to look at before seating you.**
+The difference between L4 and L7 is **how much of the request the load balancer inspects before routing.**
 
-**L4 host = fast but doesn't read your request.** This host only sees *where you came from* — basically your car's license plate and which door you walked through (your IP address + port). They don't ask what you want to eat. They just point: "table 4, go." Super fast, works for *any* kind of visitor (dinner, takeaway, a delivery driver — any protocol, not just HTTP), but they can't make clever choices because they never looked at your order.
+**L4 = fast, doesn't read the request body.** It sees only the connection-level info: source/destination IP address and port. It doesn't look at the application payload. Very fast, works for *any* protocol (not just HTTP — also databases, game traffic, raw TCP/UDP), but it can't make content-based decisions because it never inspects the request.
 
-**L7 host = slower but reads your actual request.** This host reads the *contents* of what you're asking for — "Are you here for the sushi bar or the pizza counter? Do you have a loyalty cookie? Reservation under a name?" (i.e. the HTTP URL, headers, cookies). With that, they can do smart things:
+**L7 = slower, reads the application request.** It parses the *contents* of the request — the HTTP URL, headers, cookies. With that, it can:
 
-- Send `/images` requests to the photo-serving waiters and `/api` requests to the API waiters (**content-based routing**).
-- Handle your coat/security check at the door so waiters don't have to (**TLS termination** — decrypt HTTPS once at the LB).
-- Remember you and always send you back to "your" waiter via a cookie (**sticky sessions**).
+- Send `/images` requests to one pool and `/api` requests to another (**content-based routing**).
+- Decrypt HTTPS once at the LB so backends don't have to (**TLS termination**).
+- Route a given client back to the same backend via a cookie (**sticky sessions**).
 
 ```
-L4:  sees  ──►  [ source IP:port, dest IP:port ]        → "table 4"          (fast, blind to content)
+L4:  sees  ──►  [ source IP:port, dest IP:port ]        → "backend 4"        (fast, blind to content)
 L7:  sees  ──►  GET /api/orders  Host: shop.com
-                Cookie: session=abc  Authorization: ...  → "API waiter pool" (smart, reads request)
+                Cookie: session=abc  Authorization: ...  → "API backend pool" (smart, reads request)
 ```
 
 #### Q: When do I pick L4 vs L7?
@@ -90,7 +82,7 @@ L7:  sees  ──►  GET /api/orders  Host: shop.com
 
 #### Q: If L7 is smarter, why not always use it?
 
-Reading and parsing every request costs time and CPU — the L7 host has to open and read your whole order before seating you. L4 just glances at the license plate. At massive scale, or for non-HTTP traffic, that L4 speed and simplicity wins. Many big systems even chain them: a fast **L4** in front spreads raw connections, then **L7** behind it does the smart per-request routing.
+Reading and parsing every request costs time and CPU — an L7 LB must decrypt and inspect the full request before routing, while L4 only looks at the connection tuple (IP + port). At massive scale, or for non-HTTP traffic, that L4 speed and simplicity wins. Many big systems even chain them: a fast **L4** in front spreads raw connections, then **L7** behind it does the smart per-request routing.
 
 ---
 
@@ -107,16 +99,16 @@ Reading and parsing every request costs time and CPU — the L7 host has to open
 
 > **Consistent hashing** (see its own note) minimizes remapping when servers are added/removed — important for cache/stateful backends.
 
-### Plain-English: how the host decides which waiter gets you
+### How the LB picks a server
 
-The "algorithm" is just the **rule the host uses to pick a waiter.** Here are the common rules, in restaurant terms.
+The "algorithm" is just the **rule the load balancer uses to pick a backend.** Here are the common ones.
 
-**Round Robin — go around the table, one by one.** Waiter 1, then 2, then 3, then back to 1. Dead simple, fair when all waiters and all diners are roughly equal.
+**Round Robin — cycle through servers in order.** Server 1, then 2, then 3, then back to 1. Dead simple, fair when all servers and all requests are roughly equal.
 
 ```java
 // Round Robin: keep a counter, hand out servers in a rotating cycle
 class RoundRobin {
-    List<String> servers = List.of("waiter-A", "waiter-B", "waiter-C");
+    List<String> servers = List.of("server-A", "server-B", "server-C");
     AtomicInteger next = new AtomicInteger(0);
 
     String pick() {
@@ -126,7 +118,7 @@ class RoundRobin {
 }
 ```
 
-**Weighted Round Robin — big waiters get more tables.** One waiter is a seasoned pro who can handle double the tables; give them twice the turns in the rotation. Use when servers have unequal capacity (a beefy box vs a small one).
+**Weighted Round Robin — bigger servers get more requests.** A more powerful server can handle more load, so give it more turns in the rotation. Use when servers have unequal capacity (a large box vs a small one).
 
 ```java
 // Weighted: a strong server appears MORE times in the rotation list
@@ -134,7 +126,7 @@ class RoundRobin {
 List<String> rotation = List.of("A", "B", "C", "C");
 ```
 
-**Least Connections — send the next diner to the waiter with the fewest tables right now.** This is smarter than round robin when some meals take way longer than others (a quick coffee vs a 3-hour tasting menu). Round robin would keep piling tables on a waiter stuck with slow diners; least-connections notices they're busy and skips them.
+**Least Connections — send the next request to the server with the fewest active connections right now.** This is smarter than round robin when some requests take far longer than others (a quick lookup vs a long-running stream). Round robin would keep piling requests on a server stuck with slow ones; least-connections notices it's busy and skips it.
 
 ```java
 // Least Connections: pick the server currently handling the fewest active requests
@@ -145,23 +137,23 @@ String pick(Map<String, Integer> activeConns) {   // e.g. {A:5, B:2, C:9}
 }
 ```
 
-**IP Hash / Consistent Hash — the same diner always gets the same waiter.** The host looks at *who you are* (your IP, or some key) and computes a fixed answer, so you land on the same waiter every visit. Great when the waiter remembers something about you (session state) or has your data cached.
+**IP Hash / Consistent Hash — the same client always maps to the same server.** The LB hashes *who the client is* (its IP, or some key) into a fixed answer, so the client lands on the same server every time. Useful when that server holds the client's session state or has its data cached.
 
 ```java
 // IP Hash: same client → same server, deterministically (no memory needed)
 String pick(String clientIp, List<String> servers) {
     int idx = Math.floorMod(clientIp.hashCode(), servers.size());
-    return servers.get(idx);   // "49.x.x.x" ALWAYS maps to the same waiter
+    return servers.get(idx);   // "49.x.x.x" ALWAYS maps to the same server
 }
 ```
 
-The catch with plain hashing: if a waiter quits, `hashCode % N` changes for *almost everyone* (N shrank), so nearly every diner gets reshuffled to a new waiter — cache/session cold everywhere. **Consistent hashing** fixes this: when one waiter leaves, only *their* diners move; everyone else stays put. (Full details in the [Consistent Hashing](consistent-hashing.md) note.)
+The catch with plain hashing: if a server is removed, `hashCode % N` changes for *almost every* client (N shrank), so nearly all clients get remapped to a different server — cache/session cold everywhere. **Consistent hashing** fixes this: when one server leaves, only *its* clients move; everyone else stays put. (Full details in the [Consistent Hashing](consistent-hashing.md) note.)
 
-**Random + "two choices" — pick two waiters at random, seat with the less busy one.** Surprisingly close to optimal and dirt cheap, because you avoid the herd all rushing to the single least-loaded waiter at once.
+**Random + "two choices" — pick two servers at random, route to the less loaded one.** Surprisingly close to optimal and dirt cheap, because it avoids every request rushing to the single least-loaded server at once.
 
 #### Q: Round Robin vs Least Connections — which is the default?
 
-- **Round Robin** if requests are short and uniform and servers are identical (each table takes about the same time). Simple, no bookkeeping.
+- **Round Robin** if requests are short and uniform and servers are identical (each request takes about the same time). Simple, no bookkeeping.
 - **Least Connections** if request durations vary a lot or connections are long-lived (websockets, streaming, big uploads). It reacts to who's *actually* busy instead of blindly rotating.
 
 #### Q: When would I reach for consistent hashing?
@@ -183,33 +175,33 @@ LB periodically probes each backend (e.g. GET /health every few sec)
 - **Failover:** dead backend removed automatically → no user impact if capacity remains.
 - **Connection draining:** on deploy, stop new conns to a server but let in-flight requests finish.
 
-### Plain-English: the host keeps checking if each waiter is still standing
+### How the LB detects and handles dead backends
 
-A waiter can collapse at any moment — trip in the kitchen, walk out mid-shift, freeze up. If the host keeps seating diners with a waiter who's face-down on the floor, those diners just wait forever. So the host **constantly checks** that each waiter is alive and okay.
+A backend can fail at any moment — crash, hang, or get stuck. If the LB keeps routing requests to a dead server, those requests just time out. So the LB **constantly checks** that each backend is healthy.
 
-**Active check = the host taps each waiter on the shoulder every few seconds.** "You good?" A healthy waiter says "yep" (HTTP 200 from `/health`). Miss a few taps in a row → assume they're down, stop seating them.
+**Active check = the LB probes each backend every few seconds.** It sends a request to `/health`; a healthy backend replies HTTP 200. Miss a few probes in a row → mark it down, stop routing to it.
 
-**Passive check = the host also watches real service.** Even if a waiter *says* they're fine, if diners at their tables keep complaining "my order failed," the host notices the real failures and pulls them anyway.
+**Passive check = the LB also watches real traffic.** Even if a backend passes its health probe, if real requests to it keep failing, the LB notices those failures and pulls it anyway.
 
 ```
 # Example health-check config (NGINX / typical LB)
 health_check:
-  path:      /health          # the "you good?" endpoint the LB hits
-  interval:  5s               # tap every 5 seconds
+  path:      /health          # the endpoint the LB probes
+  interval:  5s               # probe every 5 seconds
   timeout:   2s               # a reply must come back within 2s
   unhealthy_threshold: 3      # 3 misses in a row → mark DOWN, stop routing
-  healthy_threshold:   2      # 2 good replies → welcome back into rotation
+  healthy_threshold:   2      # 2 good replies → add back into rotation
 ```
 
-Why a **threshold** (3 misses) instead of reacting to one? A single missed tap might just be the waiter briefly turning around — you don't want to yank a healthy waiter over one blip (flapping). Requiring several misses in a row means "genuinely down," not "momentary hiccup."
+Why a **threshold** (3 misses) instead of reacting to one? A single missed probe might just be a momentary blip — you don't want to yank a healthy backend over one hiccup (flapping). Requiring several misses in a row means "genuinely down," not "momentary hiccup."
 
-**Connection draining = don't cut a waiter off mid-meal.** When you retire a waiter (deploy/restart), you don't grab plates out of diners' hands. You **stop seating new** diners with them, let their current tables finish eating, *then* send them home. In-flight requests complete; nobody's meal is interrupted.
+**Connection draining = don't cut off in-flight requests.** When you retire a backend (deploy/restart), you don't drop its current connections. You **stop routing new** requests to it, let its in-flight requests finish, *then* take it out. In-flight requests complete; no request is interrupted.
 
 ```
-Normal:        host → seats new diners with waiter-C, waiter-C serving 8 tables
-Deploy starts: host → STOPS new diners to waiter-C  (draining)
-               waiter-C → finishes its 8 in-flight tables
-All finished:  waiter-C → removed safely, upgraded, added back
+Normal:        LB → routes new requests to server-C, server-C serving 8 connections
+Deploy starts: LB → STOPS new requests to server-C  (draining)
+               server-C → finishes its 8 in-flight connections
+All finished:  server-C → removed safely, upgraded, added back
 ```
 
 #### Q: What actually is `/health` — does it prove the server really works?
@@ -234,20 +226,20 @@ If a server holds session state, subsequent requests from a user should return t
 
 > Prefer **stateless** app servers (session in a shared store) so any server can handle any request — stickiness is a crutch.
 
-### Plain-English: "please send me back to my waiter"
+### Why stickiness exists (and why to avoid it)
 
-Imagine a waiter jots your order on **their own personal notepad** — "table 4 wants no onions, allergic to nuts." If the host sends you to a *different* waiter next time, that new waiter has no idea about your notes; your order is lost. **Sticky sessions** = the host promising "I'll always send you back to *your* waiter" so your notepad stays valid.
+If a server stores a user's session in its own local memory, then a later request routed to a *different* server won't find that session — the user is effectively logged out. **Sticky sessions** = the LB always routing a given user back to the same server so its local session stays valid.
 
 Ways to make it sticky:
 
-- **Cookie-based (L7):** the host slips you a coat-check ticket (a cookie) that says "waiter-B." Every visit you show the ticket, the host sends you to waiter-B. Reliable, works even behind shared addresses.
-- **IP hash:** the host recognizes you by your license plate (IP) and always routes that plate to the same waiter. Simple, but **breaks behind NAT/mobile** — many diners can share one plate (corporate office, mobile carrier), so they'd all pile onto one waiter; and your plate can *change* (switching WiFi→cellular), sending you to a different waiter and losing your notes.
+- **Cookie-based (L7):** the LB sets a cookie identifying the chosen backend (e.g. `server-B`); on each request it reads the cookie and routes to that backend. Reliable, works even behind shared addresses (NAT).
+- **IP hash:** the LB hashes the client IP and always routes that IP to the same backend. Simple, but **breaks behind NAT/mobile** — many clients can share one IP (corporate office, mobile carrier), so they'd all land on one backend; and a client's IP can *change* (switching WiFi→cellular), sending it to a different backend and losing its session.
 
-**The better fix — don't let waiters keep private notepads.** Put every diner's notes on a **shared whiteboard in the kitchen** (a shared session store like Redis, or a self-contained JWT the diner carries). Now *any* waiter can read your notes, so it doesn't matter who serves you — no stickiness needed. This is why "stickiness is a crutch": it only exists to work around servers hoarding state.
+**The better fix — don't keep session state on the server at all.** Store every session in a **shared store** (like Redis) or a self-contained JWT the client carries. Now *any* server can read the session, so it doesn't matter which one handles a request — no stickiness needed. This is why "stickiness is a crutch": it only exists to work around servers hoarding local state.
 
 ```
-Sticky (fragile):     you → MUST return to waiter-B (only B has your notepad)
-Stateless (robust):   you → ANY waiter works; all read notes from shared Redis / your JWT
+Sticky (fragile):     client → MUST return to server-B (only B has the session)
+Stateless (robust):   client → ANY server works; all read the session from shared Redis / the JWT
 ```
 
 #### Q: If stateless is better, why does stickiness still exist?
@@ -256,7 +248,7 @@ Some apps hold in-memory session state that's hard to externalize (legacy apps, 
 
 #### Q: What breaks if I use sticky sessions and a server dies?
 
-Everyone stuck to that waiter loses their session (their notepad went down with them) — they get logged out / lose cart, etc. With a **shared store**, a dead server is a non-event: the user's next request just goes to another server that reads the same session. That resilience is the real reason to go stateless.
+Every client pinned to that server loses its session (it went down with the server) — they get logged out / lose cart, etc. With a **shared store**, a dead server is a non-event: the user's next request just goes to another server that reads the same session. That resilience is the real reason to go stateless.
 
 ---
 
@@ -272,37 +264,37 @@ DNS (GeoDNS / round-robin) → Global LB → Regional LB → [ backend pool ]
 - **GSLB / GeoDNS** routes users to the nearest region; regional LBs spread within.
 - **Anycast** IPs route to the closest edge (used by CDNs/DNS).
 
-### Plain-English: who watches the host? (and picking the right city)
+### Making the LB itself highly available (and routing by region)
 
-We solved "one waiter is a bottleneck" by adding a host. But now the **host** is the single point of failure — if the only host faints, the whole restaurant seizes up, no matter how many waiters are free. So the host role itself must be redundant, and the layers stack up like this:
+Adding a load balancer fixed the "no single entry point" problem, but now the **LB itself** is the single point of failure — if the only LB dies, nothing gets routed, no matter how many backends are healthy. So the LB layer must be redundant, and the layers stack up like this:
 
 ```
-You (diner) → GPS picks the nearest branch → that branch's front-door host → a waiter
-   DNS/GeoDNS         Global LB                    Regional LB              backend
+Client → nearest region chosen → that region's LB → a backend
+   DNS/GeoDNS       Global LB        Regional LB       backend
 ```
 
-**Two hosts sharing one podium (VIP).** Run **two** hosts. They share a single sign at the door — the **VIP (virtual IP)** — the one address diners actually walk up to. If the active host faints, the standby host **grabs the same podium/sign** (the VIP "floats" over to it) and keeps seating people. Diners still walked up to the same door; they never knew a host was swapped.
+**Two LBs sharing one VIP.** Run **two** load balancers sharing a single **VIP (virtual IP)** — the one address clients connect to. If the active LB fails, the standby LB **takes over the VIP** (it "floats" to the standby) and keeps routing. Clients still connect to the same address; they never notice the swap.
 
-- **Active-passive:** one host works, the other stands by ready to take the podium.
-- **Active-active:** both hosts seat diners at once, and if one drops, the other absorbs the load.
+- **Active-passive:** one LB serves traffic, the other stands by ready to take the VIP.
+- **Active-active:** both LBs serve traffic at once, and if one drops, the other absorbs the load.
 
-**Picking the right *city* first (GeoDNS / GSLB).** A restaurant chain has branches in many cities. Before you even reach a door, your phone's GPS sends you to the **nearest branch** — no point driving cross-country. That's **GeoDNS / global server load balancing**: route each user to the closest *region*, then the regional host spreads them across that branch's waiters.
+**Routing to the nearest *region* first (GeoDNS / GSLB).** With deployments in multiple regions, DNS resolves each client to the **nearest region** before any connection is made. That's **GeoDNS / global server load balancing**: route each user to the closest *region*, then the regional LB spreads them across that region's backends.
 
-**Anycast — "same address, nearest building answers."** One advertised address, but the network automatically routes you to the physically closest location sharing it. Used by CDNs and DNS so you always hit a nearby edge.
+**Anycast — same address, nearest location answers.** One advertised IP, but the network automatically routes each client to the physically closest location sharing it. Used by CDNs and DNS so you always hit a nearby edge.
 
 #### Q: Wait — is the LB one machine or many? This is confusing.
 
 Think in layers, outermost first:
 
-1. **DNS / GeoDNS** points you at the nearest region (not a machine — it's the "which city" decision).
-2. A **redundant pair (or cluster) of LBs** in that region shares a **VIP**; that's the front door. One address, but ≥2 machines behind it for failover.
-3. Those LBs spread requests across the **backend server pool** (the waiters).
+1. **DNS / GeoDNS** points you at the nearest region (not a machine — it's the "which region" decision).
+2. A **redundant pair (or cluster) of LBs** in that region shares a **VIP**; that's the entry point. One address, but ≥2 machines behind it for failover.
+3. Those LBs spread requests across the **backend server pool**.
 
 So "the load balancer" is usually a *highly-available cluster*, not a lone box — otherwise it'd just move the single-point-of-failure problem up one level.
 
 #### Q: How does the standby actually take over the VIP?
 
-The two LBs health-check each other (protocols like VRRP / keepalived). When the standby stops hearing "I'm alive" from the active one, it **claims the VIP** — it starts answering for that address. Because clients only ever talk to the VIP, the swap is invisible to them; in-flight users just continue against the same front-door address.
+The two LBs health-check each other (protocols like VRRP / keepalived). When the standby stops hearing heartbeats from the active one, it **claims the VIP** — it starts answering for that address. Because clients only ever talk to the VIP, the swap is invisible to them; in-flight users just continue against the same address.
 
 ---
 

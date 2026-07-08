@@ -2,7 +2,7 @@
 
 > Companion to **Notification System — System Design**. This doc is split into **Part A: High-Level Design (HLD)** — the big-picture architecture — and **Part B: Low-Level Design (LLD)** — concrete schema, contracts, classes, state machines, and algorithms.
 
-> **How to read this doc:** each section gives the dense interview summary first, then a **Plain-English** deep dive (real-world analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand. Running example throughout: an app (think Amazon/Swiggy) that fires **order confirmations, OTPs, and promotions** across push, SMS, email, and in-app.
+> **How to read this doc:** each section gives the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand. Running example throughout: an app (think Amazon/Swiggy) that fires **order confirmations, OTPs, and promotions** across push, SMS, email, and in-app.
 
 ---
 
@@ -47,9 +47,9 @@
 
 > Full requirements + estimation live in the main **Notification System — System Design** note (§2, §3).
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
-Think of the little messages your phone gets all day: *"Your order #789 is confirmed"*, *"Your OTP is 458213"*, *"FLASH SALE — 50% off today!"*. Some arrive as a **push** banner, some as an **SMS**, some as an **email**, some show up in the app's **bell icon** (in-app). A notification system is the **central post office** that every part of your company hands messages to, and it figures out *how* to actually get each one to the user.
+Think of the little messages your phone gets all day: *"Your order #789 is confirmed"*, *"Your OTP is 458213"*, *"FLASH SALE — 50% off today!"*. Some arrive as a **push** banner, some as an **SMS**, some as an **email**, some show up in the app's **bell icon** (in-app). A notification system is the shared service that every part of your company hands messages to, and it figures out *how* to actually get each one to the user.
 
 Why build one shared service instead of letting the Order team call Twilio themselves?
 
@@ -125,9 +125,9 @@ Networks fail mid-call, so the safe default is **at-least-once**: if unsure, try
                     └──────────────────┘
 ```
 
-### Plain-English: reading the diagram like a mailroom
+### Reading the diagram top to bottom
 
-**Analogy: a big company mailroom.** Departments (Order, Payment, Campaign) drop off "please tell this customer X" slips. A **front desk** (API Gateway + Notification API) checks the slip is valid, looks up the customer's preferences, writes the message text, files a copy, and drops it into the right **outbox bins** (Kafka topics). Separate **couriers** (workers) each empty one bin and hand the mail to a real delivery company (FCM for push, Twilio for SMS, SES for email). If a courier can't deliver, the slip goes to a **"return to sender" tray** (DLQ) instead of being lost.
+Producers (Order, Payment, Campaign) send "notify this user" requests. The API Gateway + Notification API validate the request, look up the user's preferences, render the message text, persist a copy, and publish to the right Kafka topics. Separate workers each consume one topic and hand the message to a provider (FCM for push, Twilio for SMS, SES for email). If a worker can't deliver after retries, the message goes to a **DLQ** instead of being lost.
 
 Top-to-bottom, the flow is:
 
@@ -182,28 +182,28 @@ Because delivery is **slow and flaky** (provider timeouts, rate limits, spikes).
 
 > The **Notification API** orchestrates; **workers deliver**. Never call FCM/Twilio from the API synchronously.
 
-### Plain-English: who does what (restaurant roles)
+### Who does what
 
-**Analogy: a restaurant.** The **waiter** (Notification API) takes your order, checks the menu (templates) and any allergies (preferences), writes the ticket, and pins it to the rail. The **cooks** (channel workers) each own one station — grill, fryer, salad — and only cook tickets for their station. The waiter never fries the food, and a cook never takes new orders. That split is the whole point: one clear owner for "decide", one clear owner for "deliver".
+The **Notification API** takes the request, checks templates and preferences, persists a record, and publishes a job per channel. The **channel workers** each own one channel and only process jobs for that channel. The API never calls a provider itself, and a worker never accepts new requests. That split is the whole point: one clear owner for "decide", one clear owner for "deliver".
 
 ```java
-// The waiter (API/orchestrator): decides, saves, enqueues — then returns immediately.
+// The orchestrator (API): decides, saves, enqueues — then returns immediately.
 class NotificationOrchestrator {
     SendResult send(SendRequest req) {
-        var channels = resolvePreferences(req);      // check allergies
-        var text     = renderTemplates(req, channels);// read the menu
-        var saved    = db.save(req, channels, text);  // write the ticket
+        var channels = resolvePreferences(req);      // check preferences
+        var text     = renderTemplates(req, channels);// render templates
+        var saved    = db.save(req, channels, text);  // persist the record
         for (Channel ch : channels)
-            queue.publish(topicFor(ch), saved.id, ch);// pin to the rail
-        return SendResult.accepted(saved.id);         // "202 — order taken!"
+            queue.publish(topicFor(ch), saved.id, ch);// enqueue a job per channel
+        return SendResult.accepted(saved.id);         // "202 — accepted!"
     }
 }
 
-// A cook (worker): grabs its own tickets, cooks, records the result. Never takes orders.
+// A worker: consumes its own jobs, delivers, records the result. Never accepts requests.
 class PushWorker {
     @KafkaListener(topics = "notification-normal")
     void onJob(DeliveryJob job) {                     // only push jobs reach here
-        fcm.send(job.token, job.title, job.body);     // do the actual cooking
+        fcm.send(job.token, job.title, job.body);     // do the actual delivery
         db.markSent(job.notificationId, Channel.PUSH);
     }
 }
@@ -242,16 +242,16 @@ They're **hot, shared, and independently owned**. Every single notification read
 
 **Dual-write caveat:** `insert notification` (DB) + `publish` (Kafka) are not atomic. Guard with an **outbox** or a **reconciliation sweeper** for `PENDING` rows (see B5, B12).
 
-### Plain-English: "post the letter, don't wait for it to arrive"
+### Sync vs async — only wait when you need the reply
 
-**Analogy: mailing a letter.** You drop it in the postbox and walk away (**async** — you don't stand there until it's delivered). But when you phone a friend, you wait for them to pick up (**sync** — you need the answer now). The rule of thumb: **use sync only when you genuinely need the reply right now; otherwise fire-and-forget.**
+**Async** = fire-and-forget: send the request and move on without waiting for the result. **Sync** = wait for the reply before continuing. The rule of thumb: **use sync only when you genuinely need the reply right now; otherwise fire-and-forget.**
 
 Mapping that to the system:
 
 ```
 Checkout → Notification API      : sync-ish, but the API replies "202 Accepted" instantly
                                     (it does NOT wait for the SMS to be delivered)
-Notification API → Workers       : async (Kafka)  — drop in the postbox, move on
+Notification API → Workers       : async (Kafka)  — enqueue and move on
 Worker → Twilio/FCM              : sync (HTTP)     — you must know if the provider accepted it
 Client ↔ WebSocket               : sync/persistent — a live open pipe for instant in-app updates
 ```
@@ -302,11 +302,11 @@ Two standard fixes (both in B5/B12):
 
 **PII at rest:** encrypt `device_token`, `phone`, `email`, and sensitive rendered bodies (KMS / column encryption); never log message bodies or raw tokens; support GDPR delete via time-partitioned purge.
 
-### Plain-English: right tool for each job
+### Right tool for each job
 
-**Analogy: an office.** The **filing cabinet** (RDBMS/Postgres) is where you keep the permanent, must-never-lose records — signed and dated. The **sticky notes on your monitor** (Redis) are things you read constantly and can re-create if lost — a phone extension, today's tally. The **conveyor belt** (Kafka) carries work between people. The **basement archive** (S3) stores old boxes you rarely open but must keep. You wouldn't file a legal contract on a sticky note, or keep today's scratch tally in the fireproof cabinet.
+Each store fits a different need. **Postgres (RDBMS)** holds the permanent, must-never-lose records with ACID guarantees and unique constraints. **Redis** holds data you read constantly and can rebuild if lost — cached preferences, today's counters. **Kafka** carries work between services. **S3** stores old data you rarely query but must retain. You wouldn't keep an audited record in a cache, or a high-churn counter in the primary DB.
 
-| Data | Home | Why (plain) |
+| Data | Home | Why |
 | --- | --- | --- |
 | The notification record + history | **Postgres** | must be exact, audited, never lost — use `UNIQUE` to stop dupes |
 | Preferences & templates | **Redis** (cache) | read on *every* send; DB is the truth, Redis is the fast copy |
@@ -340,9 +340,9 @@ long id = Snowflake.next();   // e.g. timestamp-bits | machine-bits | sequence-b
 
 > Details in main note §11, §19–§21.
 
-### Plain-English: surviving spikes and outages
+### Surviving spikes and outages
 
-**Analogy: a supermarket during a rush.** When a crowd hits, you don't build a bigger store — you **open more checkout lanes** (autoscale workers) and let the line (Kafka queue) hold people calmly. If the card machine at one lane dies (email provider down), the cash lanes (push, in-app) keep serving; you don't shut the whole shop.
+Under a spike, you don't rebuild the system — you **autoscale workers** and let the Kafka queue hold the backlog calmly. If one provider dies (email down), the other channels (push, in-app) keep delivering; you don't take the whole system down.
 
 The four ideas, in plain terms:
 
@@ -379,7 +379,7 @@ No — that's **graceful degradation**. Channels are independent, so if email is
 | Background jobs | Scheduler cron + Kafka consumers |
 | Infra | Kubernetes + LB |
 
-### Plain-English: why these picks (and none are sacred)
+### Why these picks (and none are sacred)
 
 None of these are magic — each is just "the popular, boring, reliable choice" for its job, and every one is swappable behind a port (see B3.5):
 
@@ -412,9 +412,9 @@ All may share one codebase; they run **different commands** and scale **independ
 
 > API must never synchronously call FCM/Twilio — return `202 Accepted` after enqueue.
 
-### Plain-English: one recipe book, many kitchens
+### One codebase, many deployments
 
-**Analogy: a food chain with one recipe book but separate kitchens.** All the branches share the same cookbook (one codebase/repo), but the *pizza kitchen* and the *sushi kitchen* are separate rooms with separate staff you can grow independently. When pizza orders spike, you add pizza cooks — you don't add sushi chefs.
+All the workers can share one codebase/repo, but each runs as a **separate deployment** you scale independently. When push volume spikes, you add push-worker instances — you don't touch the SMS workers.
 
 Concretely, "same code, different entry command" looks like:
 
@@ -462,16 +462,16 @@ Retry flow stays entirely inside Notification Service:
 Worker fails  →  update notification_db  →  republish notificationId to Kafka retry topic
 ```
 
-### Plain-English: each department guards its own filing cabinet
+### Each service owns its own database
 
-**Analogy: departments in a company.** HR keeps the HR files; Finance keeps the Finance files. If HR needs a salary figure, they **ask Finance** (a phone call / request) — they do **not** walk into Finance's room and edit the ledger themselves. Same rule in code: a service reads/writes **only its own database**; to change someone else's data, it sends an **API call or a Kafka event**.
+Each service reads/writes **only its own database**. To change another service's data, it sends an **API call or a Kafka event** — it never writes directly to another service's tables.
 
 ```java
 // ✅ Allowed — Notification service writing its OWN db
 notificationDb.update("UPDATE notifications SET status='RETRYING' WHERE id=?", id);
 
 // ❌ Forbidden — reaching into another service's db
-orderDb.update("UPDATE orders SET ...");        // NO — that's the Order team's cabinet
+orderDb.update("UPDATE orders SET ...");        // NO — that's the Order service's DB
 
 // ✅ The right way to affect the Order service:
 orderServiceClient.notifyDelivered(orderId);    // ask them (API)
@@ -510,9 +510,9 @@ No. A retry is **entirely inside** the Notification service: the worker updates 
 7. DLQ poison messages
 8. Monitor **oldest message age**, not just lag count
 
-### Plain-English: the pile of unread mail
+### Kafka lag = the backlog of unprocessed messages
 
-**Analogy: mail piling up while you're on holiday.** "Lag" is simply *how many letters are waiting that you haven't opened yet*. A little pile after a busy day is fine — you'll catch up. A pile that **keeps growing** means letters arrive faster than you open them, and you'll never catch up without help.
+"Lag" is simply *how many messages are waiting that you haven't processed yet*. A small backlog after a busy spike is fine — you'll catch up. A backlog that **keeps growing** means messages arrive faster than you process them, and you'll never catch up without adding capacity.
 
 ```
 lag = latest_offset − consumer_offset
@@ -562,13 +562,13 @@ Adding workers to fix Kafka lag can **overload the DB**.
 
 > **Key trade-off:** Kafka absorbs spikes; workers throttle delivery rate; DB must not become the hidden bottleneck.
 
-### Plain-English: don't just fix the queue and forget the sink
+### Don't just fix the queue and forget the DB
 
-**Analogy: one kitchen sink, many cooks.** You hired 100 cooks (workers) to clear the ticket backlog — but they all wash up at **one sink** (the database). Now the sink is the jam. Scaling workers without scaling/protecting the DB just moves the bottleneck downstream.
+You added 100 workers to clear the Kafka backlog — but they all write to **one database**. Now the DB is the bottleneck. Scaling workers without scaling/protecting the DB just moves the bottleneck downstream.
 
 The two cheapest, biggest wins:
 
-- **Batch writes** — instead of 5,000 tiny `UPDATE`s, do one `UPDATE ... WHERE id IN (...)`. One trip to the sink with a full tray, not 5,000 trips with one cup.
+- **Batch writes** — instead of 5,000 tiny `UPDATE`s, do one `UPDATE ... WHERE id IN (...)`. One round-trip with many rows, not 5,000 single-row round-trips.
 - **Fewer status transitions** — if you don't need `PROCESSING`, go straight `PENDING → SENT`. Every extra state = an extra write.
 
 ```java
@@ -738,9 +738,9 @@ CREATE INDEX idx_campaign_batch_pending ON campaign_batches (campaign_id)
 
 > **Alternative to `user_ids[]`:** a `campaign_batch_users (batch_id, user_id)` join table — cleaner at scale. Array shown for brevity.
 
-### Plain-English: the tables, and why there are two "main" ones
+### The tables, and why there are two "main" ones
 
-**Analogy: a courier company's paperwork.** `notifications` is the **customer's order** ("send this parcel to Hardik"). `notification_attempts` are the **per-carrier delivery slips** ("tried via FedEx", "tried via DHL"). One order, potentially several delivery slips — because the same message goes out over push *and* email *and* in-app, and each can succeed or fail on its own.
+`notifications` is the **logical message** ("send this to Hardik"). `notification_attempts` are the **per-channel delivery records** (one for push, one for email, and so on). One message, potentially several attempt rows — because the same message goes out over push *and* email *and* in-app, and each can succeed or fail on its own.
 
 ```
 notifications (1)  ───►  notification_attempts (many)
@@ -906,9 +906,9 @@ POST /v1/campaigns
 
 Worker loads title/body from `notifications` table (or attempt row). Avoid duplicating full message in Kafka.
 
-### Plain-English: reading the API like a form
+### Reading the API
 
-**Analogy: dropping a request slip at the front desk.** `POST /v1/notifications` is you handing over a slip that says *"tell user 123 their order is confirmed, over push/email/in-app."* The desk stamps it **`202 Accepted`** ("got it, we'll handle it") and gives you a tracking number (`notificationId`) — it does **not** wait for the SMS to land.
+`POST /v1/notifications` says *"tell user 123 their order is confirmed, over push/email/in-app."* The server responds **`202 Accepted`** ("got it, we'll handle it") and returns a `notificationId` — it does **not** wait for the SMS to land.
 
 ```java
 // What the caller (e.g. Order service) sends — note it says WHAT, not HOW to deliver low-level
@@ -1300,9 +1300,9 @@ class RedisWebSocketAdapter     implements WebSocketPort   { /* pub to ws:user:{
 > - `RetryDispatcher` — polls `notification_attempts WHERE next_retry_at <= now()`.
 > - `ReconciliationSweeper` — re-enqueues `notifications WHERE status='PENDING' AND created_at < now()-N` (fixes dual-write gaps; idempotent).
 
-### Plain-English: ports & adapters = wall sockets
+### Ports & adapters
 
-**Analogy: the wall sockets in your house.** Your laptop charger plugs into a **socket** (a *port*) without knowing or caring what's behind the wall — solar, coal, or nuclear. The power company can switch the source and your charger never changes. In code, a **port** is an interface (`SmsPort`) and an **adapter** is the concrete plug behind it (`TwilioSmsAdapter`). The orchestrator "plugs into" `SmsPort` and never learns it's Twilio — so swapping Twilio for AWS SNS is a one-line wiring change, no business logic touched.
+A **port** is an interface (`SmsPort`) and an **adapter** is a concrete implementation behind it (`TwilioSmsAdapter`). The rest of the code depends only on the port, not the implementation. The orchestrator calls `SmsPort` and never learns it's Twilio — so swapping Twilio for AWS SNS is a one-line wiring change, with no business logic touched.
 
 ```java
 // PORT — the socket shape the rest of the code depends on
@@ -1396,9 +1396,9 @@ DRAFT ──► SCHEDULED ──► RUNNING ──► COMPLETED
               └── cancel ──┴── error ──► FAILED / CANCELLED
 ```
 
-### Plain-English: states = parcel tracking
+### State machines
 
-**Analogy: tracking a parcel online.** *Order placed → Out for delivery → Delivered*, or *Failed → Re-attempt → Returned*. A **state machine** is just the fixed set of statuses a thing can be in, plus the **only** legal moves between them. You can't jump from "Delivered" back to "Order placed"; the arrows enforce sanity.
+A **state machine** is just the fixed set of statuses a thing can be in, plus the **only** legal moves between them. For example a notification goes `PENDING → PROCESSING → SENT`, never backwards; the arrows enforce which transitions are valid.
 
 Two levels here, mirroring the two tables (B1):
 
@@ -1553,7 +1553,7 @@ every 1 minute:
         UPDATE scheduled_notifications SET status='DISPATCHED' WHERE id=row.id
 ```
 
-### Plain-English: the algorithms, one confusion at a time
+### The algorithms, one confusion at a time
 
 #### Dedup vs idempotency — the "don't count it twice" pair
 
@@ -1574,7 +1574,7 @@ var attempt = db.findAttempt(job.notificationId, job.channel);
 if (attempt.status == SENT) return;          // duplicate Kafka message → skip, don't re-send
 ```
 
-**Analogy:** the API guard is the ticket counter refusing to sell you a *second* ticket for the same seat; the worker guard is the usher checking your stub before letting you in *again*. Both are needed because duplicates can appear at either door.
+Both guards are needed because duplicates can appear at either door: the API guard blocks a duplicate *request*, and the worker guard blocks a duplicate *delivery*.
 
 #### Retries with backoff + jitter — "don't all stampede back at once"
 
@@ -1589,7 +1589,7 @@ Duration backoff(int attempt) {
 // after MAX_RETRIES → give up on auto-retry → send to DLQ for a human/alert
 ```
 
-**Analogy:** a busy phone line. You don't redial instantly forever — you wait a bit longer each time, and if everyone redialed at the *same* instant the line jams again. Jitter = everyone waits a *slightly different* amount.
+Without jitter, if every failed message retried at the *same* instant, they'd hit the recovering provider in one synchronized spike. Jitter = each retry waits a *slightly different* amount, spreading the load over a window.
 
 #### Q: What's a DLQ and when does a message land there?
 
@@ -1607,7 +1607,7 @@ if (count > limit(type)) return false;             // over the cap → skip this
 // OTP/transactional: no cap (they're essential), but the message itself has a short TTL
 ```
 
-**Analogy:** a nightclub with a "5 entries per night" stamp on your hand. The bouncer (Redis) counts your entries; past 5, you're turned away — but VIPs (OTPs) always get in.
+Redis counts each promotional send; past the daily cap, further promos are skipped — but transactional messages (OTPs) are never capped.
 
 #### Q: Campaign fan-out — how do we notify 10M users without exploding?
 
@@ -1623,7 +1623,7 @@ for (long userId : cursor) {
 // consumer: for each userId in the batch → orchestrator.send(...) → reuses everything
 ```
 
-**Analogy:** mailing 10M flyers. You don't stack all 10M on your desk (memory blow-up); you print them in trays of 5,000 and hand each tray to the post office as it's ready.
+The key point: you never load all 10M users into memory at once — you stream them in pages and publish batches as you go.
 
 #### Q: The scheduler — how does "send at T-1hr" work without double-sending?
 
@@ -1651,11 +1651,11 @@ OrderSvc   Kafka    NotifAPI    Pref/Template   DB       Kafka(push)   PushWorke
    │         │          │            │          │◄── UPDATE notif=SENT ─────────────┤         │
 ```
 
-### Plain-English: following one order confirmation
+### Following one order confirmation
 
-Read the diagram left-to-right as a relay race:
+Read the diagram left-to-right:
 
-1. **Order service** finishes an order and shouts an event ("order 789 confirmed").
+1. **Order service** finishes an order and emits an event ("order 789 confirmed").
 2. **Notification API** picks it up, asks **Preference/Template** services ("is push on? what's the wording?"), fills in the blanks.
 3. It **saves** the notification + attempt rows to the DB, then **drops a job on Kafka** and immediately replies `202` — its work is done in milliseconds.
 4. Later (could be 50ms later), the **Push Worker** picks up the job, calls **FCM**, and the banner appears on the phone.
@@ -1690,7 +1690,7 @@ PushWorker    FCM        DB         Kafka(retry)    Kafka(DLQ)
     │          │          │         alert on-call (DLQ depth metric)
 ```
 
-### Plain-English: what happens when FCM says "503"
+### What happens when FCM says "503"
 
 Walk it as "try, wait, try again, eventually give up":
 
@@ -1734,9 +1734,9 @@ Admin    CampaignSvc   SegmentSvc   DB(batches)   Kafka    NotifAPI   PushWorker
 
 > Each user in the batch becomes a normal `send()` call — reuses the same orchestrator, prefs, rate limits, and workers.
 
-### Plain-English: blasting millions without melting
+### Blasting millions without melting
 
-**Analogy: a phone-tree/relay, not one megaphone.** You don't shout to 10M people at once. The **Campaign Service** streams the audience from the **Segment Service** in pages (cursor), packs them into **batches of ~5,000**, and drops each batch on Kafka. Consumers unpack a batch and call the *ordinary* `send()` for each user — so a campaign is really just "a lot of normal notifications, produced carefully."
+You can't send to 10M people in one shot. The **Campaign Service** streams the audience from the **Segment Service** in pages (cursor), packs them into **batches of ~5,000**, and drops each batch on Kafka. Consumers unpack a batch and call the *ordinary* `send()` for each user — so a campaign is really just "a lot of normal notifications, produced carefully."
 
 ```
 segment (10M) → stream in pages → batch(5k) → Kafka → unpack → send() per user
@@ -1773,9 +1773,9 @@ BookSvc    NotifAPI    DB(scheduled)    Scheduler(cron)    Kafka    PushWorker
    │           │              │                │              ├──────────►│
 ```
 
-### Plain-English: "remind me in an hour"
+### "Remind me in an hour"
 
-**Analogy: setting an alarm clock.** When the Booking service asks for a "movie starts in 1 hour" reminder, we don't hold a thread awake for an hour. We **write it down** in `scheduled_notifications` with `scheduled_at = T-1hr` and forget about it. A **cron job** ticks every minute asking "anything due now?" When the time arrives, it fires a normal `send()` and marks the row `DISPATCHED`.
+When the Booking service asks for a "movie starts in 1 hour" reminder, we don't hold a thread awake for an hour. We **write it down** in `scheduled_notifications` with `scheduled_at = T-1hr` and forget about it. A **cron job** ticks every minute asking "anything due now?" When the time arrives, it fires a normal `send()` and marks the row `DISPATCHED`.
 
 ```
 now:       INSERT scheduled_notifications(scheduled_at = 6:00pm, status=PENDING)
@@ -1808,9 +1808,9 @@ They could, so we prevent it: claim rows with `SELECT … FOR UPDATE SKIP LOCKED
 | Lost enqueue after DB insert | Outbox in notification DB, or reconciliation sweeper for stale `PENDING` rows |
 | Stale device token | Deactivate on provider error; don't retry same token |
 
-### Plain-English: delivery guarantees without a headache
+### Delivery guarantees
 
-**Analogy: registered post.** We'd love "exactly once" — the letter arrives precisely one time. But over unreliable networks that's very hard and expensive. So we settle for **at-least-once** (we'd rather deliver twice than not at all — imagine losing an OTP) and then make **duplicates harmless** so the user never actually *sees* two. That combo — *at-least-once + idempotency* — is the practical stand-in for exactly-once.
+We'd love "exactly once" — the message arrives precisely one time. But over unreliable networks that's very hard and expensive. So we settle for **at-least-once** (we'd rather deliver twice than not at all — imagine losing an OTP) and then make **duplicates harmless** so the user never actually *sees* two. That combo — *at-least-once + idempotency* — is the practical stand-in for exactly-once.
 
 The layered defenses, in plain terms:
 
@@ -1844,11 +1844,11 @@ To preserve **per-user ordering**. All of one user's notifications land on the s
 | `devices:{userId}` | list of active tokens | 5 min | optional; DB is source of truth |
 | `unread:{userId}` | integer | none (rebuild on miss) | bell-icon count; INCR on create, DECR on read, SET 0 on read-all |
 
-### Plain-English: keep the hot answers on a sticky note
+### Cache the hot reads
 
-**Analogy: a receptionist's sticky notes.** Instead of walking to the archive room (the DB) for every "is push on for this user?" or "what's the promo template?", the receptionist keeps the answers they use constantly on **sticky notes** (Redis). Way faster — and if a note is lost, they just re-copy it from the archive (rebuild on miss).
+Instead of hitting the DB for every "is push on for this user?" or "what's the promo template?", keep the answers you read constantly in **Redis**. Much faster — and if a cached entry is lost, rebuild it from the DB on the next miss.
 
-The pattern is **cache-aside**: read Redis first; on a miss, read the DB and write it back to Redis. On a *change*, throw the sticky note away (**invalidate**) so nobody reads stale info.
+The pattern is **cache-aside**: read Redis first; on a miss, read the DB and write it back to Redis. On a *change*, evict the cached entry (**invalidate**) so nobody reads stale info.
 
 ```java
 NotificationPreference getPref(long userId, String type) {
@@ -1894,7 +1894,7 @@ For preferences/templates a few minutes of staleness is acceptable, and the **sh
 | Template edited after send | Notification stored rendered `title`/`body` snapshot + `template_id`/`version`; audit still exact |
 | Queue backlog | Autoscale workers; prioritize HIGH topic |
 
-### Plain-English: the "what could go wrong?" checklist
+### The "what could go wrong?" checklist
 
 This table is really the **paranoia list** — every way a message could be lost, doubled, or sent wrong, and the one-line defense. A few that trip up beginners:
 
@@ -1943,9 +1943,9 @@ Yes — they're **transactional and essential**. Quiet hours and the "5/day" cap
 | "PII & compliance?" | Main note §25 | A4 auth, A5 PII-at-rest |
 | "Fast unread count / digests?" | Main note §26 | A5 + B11 `unread:{userId}` counter |
 
-### Plain-English: how to use this table in an interview
+### How to use this table in an interview
 
-**Analogy: a phrasebook.** Each row is a common interview "phrase" (the ask), with the **big-picture answer** (HLD) and the **concrete detail** (LLD) side by side. Answer in that order: sketch the shape first, then drop into specifics only if pushed.
+Each row is a common interview ask, with the **big-picture answer** (HLD) and the **concrete detail** (LLD) side by side. Answer in that order: sketch the shape first, then drop into specifics only if pushed.
 
 > **One-breath summary of the whole system:** *A source drops a request → the API decides (prefs, template, dedup) and saves it → Kafka decouples decide from deliver → per-channel workers deliver via provider adapters, retrying with backoff and DLQ → idempotency everywhere makes at-least-once look like exactly-once.* If you can say that and then zoom into any one piece (retries, fan-out, scheduling, hot topics), you've got the design.
 

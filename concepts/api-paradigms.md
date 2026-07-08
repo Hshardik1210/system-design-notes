@@ -2,7 +2,7 @@
 
 > How services expose functionality. The interview question is "which would you choose and why?" — the answer is **REST for public/CRUD, gRPC for internal service-to-service, GraphQL for flexible client-driven queries**.
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (a food-ordering analogy, annotated sample requests/responses, and the exact confusions that trip beginners up). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated sample requests/responses and the exact confusions that trip beginners up). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -38,18 +38,18 @@ DELETE /users/123          # delete
 
 - Use HTTP status codes (200/201/400/404/409/429/500), idempotent verbs (GET/PUT/DELETE), pagination (cursor), versioning (`/v1`).
 
-### Plain-English: REST is ordering from a fixed menu
+### How REST works
 
-**Analogy: REST is a restaurant with a fixed menu.** Each dish (a *resource* like `user`, `order`, `post`) has a set name and comes exactly as the kitchen decided to plate it. You point at a menu item and say what you want *done* with it — bring one, make a new one, change it, take it away. You don't get to say "the burger but hold the bun and add three extra patties"; you get the burger as-is.
+REST models your app as **resources** (`user`, `order`, `post`), each addressed by a URL, and returned in a fixed shape the server defines. You name a resource and apply a standard HTTP verb to it — read one, create one, update it, delete it. The server decides which fields the response contains; you get that whole object.
 
-- The **menu item** = the URL (e.g. `/users/123`). Each thing you can act on has its own address.
-- The **verb** = what you want done to it: `GET` (bring me), `POST` (make a new one), `PUT`/`PATCH` (change it), `DELETE` (remove it).
-- The **plate that comes back** = a fixed JSON shape the server decided. You take the whole plate.
+- The **URL** identifies the resource (e.g. `/users/123`). Each resource has its own address.
+- The **verb** is the action: `GET` (read), `POST` (create), `PUT`/`PATCH` (update), `DELETE` (remove).
+- The **response** is a fixed JSON shape the server decides — you get all of its fields.
 
 A real request/response, annotated:
 
 ```http
-GET /users/123 HTTP/1.1        # verb GET = "read"; /users/123 = the resource (menu item)
+GET /users/123 HTTP/1.1        # verb GET = "read"; /users/123 = the resource
 Host: api.example.com
 Accept: application/json        # "please reply in JSON"
 ```
@@ -58,16 +58,16 @@ Accept: application/json        # "please reply in JSON"
 HTTP/1.1 200 OK                 # status code: 200 = success (201 create, 404 not found, 429 too many)
 Content-Type: application/json
 
-{                               # the WHOLE plate — you get every field, even ones you didn't need
+{                               # the full object — you get every field, even ones you didn't need
   "id": 123,
   "name": "Ada",
-  "email": "ada@example.com",   # ← you only wanted the name, but email + everything else tags along
+  "email": "ada@example.com",   # ← you only wanted the name, but email + everything else comes along
   "address": { "city": "Pune", "zip": "411001" },
   "createdAt": "2026-01-02T10:00:00Z"
 }
 ```
 
-That "you get the whole plate" is exactly the **over-fetching** pain: you asked for a name and got the address and timestamps too. And if you now also need the user's last 3 posts, there's no post on this plate — you make a **second** trip to `/users/123/posts` (that extra trip is **under-fetching** / the N+1 round-trip problem). GraphQL (§2) exists to fix precisely these two.
+Getting the full object is exactly the **over-fetching** pain: you asked for a name and got the address and timestamps too. And if you now also need the user's last 3 posts, they aren't in this response — you make a **second** request to `/users/123/posts` (that extra round-trip is **under-fetching** / the N+1 round-trip problem). GraphQL (§2) exists to fix precisely these two.
 
 #### Q: What actually makes an API "RESTful"? Is any HTTP+JSON API REST?
 
@@ -100,18 +100,18 @@ query {
 
 - Great when many **different clients** need different shapes of data (e.g. mobile vs web).
 
-### Plain-English: GraphQL is a build-your-own bowl
+### How GraphQL works
 
-**Analogy: GraphQL is a build-your-own bowl / salad bar.** There's one counter (a **single endpoint**), and *you* fill out the card: base, two toppings, this sauce, skip the rest. The kitchen hands back a bowl containing **exactly** what you ticked — nothing more, nothing less. Contrast REST's fixed menu (§1) where the plate is pre-decided.
+With GraphQL the **client specifies exactly which fields it wants** in a query sent to a single endpoint, and the response contains **exactly** those fields — nothing more, nothing less. Contrast REST (§1), where the server decides the response shape.
 
-- **One counter** = one URL (usually `POST /graphql`) for everything, instead of one URL per resource.
-- **The order card** = the query: you literally list the fields you want, including nested ones.
-- **The bowl** = a response shaped like your query — same fields, same nesting.
+- **Single endpoint** = one URL (usually `POST /graphql`) for everything, instead of one URL per resource.
+- **The query** = you list the fields you want, including nested ones.
+- **The response** = shaped like your query — same fields, same nesting.
 
 The query and its response, side by side and annotated:
 
 ```graphql
-# YOU write this — the "order card". Every line is a field you actually want.
+# The client writes this query. Every line is a field it actually wants.
 query {
   user(id: 123) {
     name              # ← give me name
@@ -173,9 +173,9 @@ service UserService {
 
 - Best for **internal, high-throughput, low-latency** service communication and streaming.
 
-### Plain-English: gRPC is the kitchen's private intercom
+### How gRPC works
 
-**Analogy: gRPC is the intercom between the kitchen and the prep station — staff-only, no customers.** The cooks don't speak in polite full English ("could you please bring me one order of..."); they use fast shorthand codes both sides pre-agreed on. It's not meant for customers (browsers) to read — it's built for **speed between insiders (your own services)**.
+gRPC is designed for **fast service-to-service calls**, not for browsers or external developers. Both sides pre-agree on a compact binary contract, so messages are small and quick to parse — at the cost of not being human-readable.
 
 - **RPC = Remote Procedure Call.** Instead of thinking in URLs/resources, you just **call a function** that happens to run on another machine: `userService.GetUser(123)`. It *feels* like a normal local method call.
 - **Protobuf (Protocol Buffers)** = the pre-agreed shorthand. You write a `.proto` contract; a code generator spits out ready-made client + server classes in your language. Both sides are guaranteed to agree on the shape (strong typing).
@@ -229,13 +229,13 @@ Both are "call a function on another server" (RPC in spirit). The differences ar
 
 > **Rule of thumb:** REST for public/simple APIs, **gRPC for internal service-to-service**, GraphQL when diverse clients need tailored data. They coexist — public REST/GraphQL gateway → internal gRPC.
 
-### Plain-English: the three, back-to-back with the food analogy
+### The three, back-to-back
 
-| Style | Analogy | You say... | You get... |
+| Style | Request model | You specify... | You get... |
 | --- | --- | --- | --- |
-| **REST** | fixed menu | "bring me menu item #123" (`GET /users/123`) | the whole pre-plated dish (fixed JSON) |
-| **GraphQL** | build-your-own bowl | "this base, these 2 toppings, skip the rest" | exactly the fields you ticked |
-| **gRPC** | kitchen intercom | "GetUser(123)" in staff shorthand | a fast binary reply, staff-to-staff |
+| **REST** | resource + verb | "read resource #123" (`GET /users/123`) | the full object (fixed JSON) |
+| **GraphQL** | field selection | the exact fields (and nesting) you want | exactly the fields you asked for |
+| **gRPC** | function call | a typed call like `GetUser(123)` | a fast binary response |
 
 The same "get user 123" in all three, so you can *see* the difference:
 
@@ -268,7 +268,7 @@ So they're three different questions: *which thing?* (REST), *which action?* (RP
 
 - **Over-fetching** = the response contains **more than you needed** (asked for a name, got the whole user object). Wastes bandwidth.
 - **Under-fetching** = a single response has **too little**, so you make **extra round-trips** (get the user, *then* separately get their posts → the N+1 problem).
-- **REST suffers from both** (fixed plates + one-resource-per-URL). **GraphQL fixes both** by letting the client name exactly the fields and nest related data into one request.
+- **REST suffers from both** (fixed response shape + one-resource-per-URL). **GraphQL fixes both** by letting the client name exactly the fields and nest related data into one request.
 
 #### Q: When is gRPC the right call in an interview answer?
 
@@ -291,13 +291,11 @@ One-liner: **REST versions the URL, GraphQL evolves the schema (add/deprecate), 
 - **Webhooks** — server calls *you* on an event (push). Great for async notifications (payments). Must verify signature + dedup.
 - **Polling** — client asks repeatedly (simple, wasteful). **Long polling** holds the request open until data. For true real-time → **WebSocket/SSE** (see Real-Time Communication note).
 
-### Plain-English: "don't call us, we'll call you"
+### Webhooks vs polling
 
-**Analogy: waiting on a food order.**
-
-- **Polling** = walking up to the counter every 30 seconds asking "is it ready yet?" Simple, but most trips are wasted because the answer is usually "not yet."
-- **Long polling** = you ask "is it ready?" and the staff make you *wait at the counter* until it actually is, then answer. Fewer wasted trips.
-- **Webhook** = you give them your phone number and sit down; **they text you** the moment it's ready. No wasted trips at all — the server calls *you* on the event.
+- **Polling** = the client repeatedly asks "is it ready yet?" on a fixed interval. Simple, but most requests are wasted because the answer is usually "not yet."
+- **Long polling** = the client asks and the server *holds the request open* until data is ready, then responds. Fewer wasted requests.
+- **Webhook** = the client registers a callback URL; the server **calls that URL** the moment the event happens. No wasted requests at all — the server pushes to the client on the event.
 
 ```http
 # Webhook: the OTHER server POSTs to a URL YOU registered, when something happens.

@@ -2,7 +2,7 @@
 
 > **Core challenge:** let users **post** short messages and see a **home timeline** of posts from everyone they follow, ranked and fresh — at massive scale where **reads ≫ writes** and some accounts have **tens of millions of followers**. The signature problem is **feed fan-out** (push vs pull) and the **celebrity/hot-key** problem.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated code and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -37,7 +37,7 @@ Home timeline = merge of tweets from everyone you follow, ranked by time/relevan
 
 Read-heavy. The whole design hinges on **how the home timeline is assembled**: precompute per-user timelines (**push**), assemble at read time (**pull**), or a **hybrid**. (Deep dive on the pattern: [Fan-Out / Fan-In](../concepts/fan-out-fan-in.md).)
 
-### Plain-English: what are we even building?
+### What are we even building?
 
 Picture Twitter/X. Two everyday actions:
 
@@ -60,12 +60,12 @@ The trick that drives the whole design:
 
 That precompute-vs-compute-on-read decision is the single biggest fork in the road — it's called **fan-out** (push vs pull), and everything below is about getting it right.
 
-#### Analogy: a magazine subscription vs. visiting every newsstand
+#### Push vs pull
 
-- **Push (precompute):** every publisher **mails** each new issue straight to your mailbox. When you want to read, you just open your mailbox — instant. (But the publisher has to mail a copy to *every* subscriber.)
-- **Pull (compute on read):** nothing is mailed. When you want to read, **you** run to all your publishers and collect the latest issues yourself. (No mailing cost, but reading is a lot of running around.)
+- **Push (precompute):** when a tweet is posted, its id is written into each follower's stored timeline immediately. A read just returns that ready-made timeline — instant. (But every post costs one write per follower.)
+- **Pull (compute on read):** nothing is precomputed on write. On read, the system fetches the latest tweets from everyone you follow and merges them. (No per-follower write cost, but each read does a lot of work.)
 
-Home timeline = your mailbox. The rest of this doc is "how do we fill that mailbox without drowning in mailing costs when a publisher has 50 million subscribers?"
+The rest of this doc is about how to fill each timeline without incurring huge write costs when an account has 50 million followers.
 
 ---
 
@@ -80,7 +80,7 @@ Home timeline = your mailbox. The rest of this doc is "how do we fill that mailb
 - **Read-heavy** (reads ≫ writes, ~100:1); low-latency timeline (feels instant); huge scale (100s M users).
 - **Eventual consistency** is fine (a tweet appearing a second late is OK); **highly available** (read the feed even if some parts are degraded).
 
-### Plain-English: reading the requirements
+### Reading the requirements
 
 - **"Read-heavy, ~100:1"** — for every 1 tweet posted, the system serves ~100 timeline reads. So we happily do **extra work at write time** if it makes reads cheap. (This is why "precompute the timeline" wins.)
 - **"Eventual consistency is fine"** — if your friend tweets and it shows up in your feed **2 seconds later**, nobody cares. Twitter is not a bank. This looseness is a *gift*: it lets us do fan-out **asynchronously** (in the background) instead of making the poster wait.
@@ -109,7 +109,7 @@ Storage:
 
 > Two pressures: **enormous fan-out write volume** (async workers) and **very high timeline read QPS** (precompute + cache). Celebrities break naive push.
 
-### Plain-English: where the scary numbers come from
+### Where the numbers come from
 
 The one line to internalize:
 
@@ -119,7 +119,7 @@ Walk the math like a story:
 
 ```
 You tweet once.                          → 1 tweet stored
-You have 200 followers.                  → we copy its id into 200 mailboxes = 200 writes
+You have 200 followers.                  → we copy its id into 200 timelines = 200 writes
 The whole site posts 500M tweets/day.
 500M tweets × 200 followers each         ≈ 100,000,000,000 timeline writes/day (!!)
 ```
@@ -143,7 +143,7 @@ A viral tweet followed by millions is stored **one time**; millions of timelines
 celebrity with 50,000,000 followers tweets once → 50,000,000 timeline writes for ONE tweet
 ```
 
-Copying one tweet id into 50 million mailboxes is a disaster (slow, bursty, overloads the machines holding those mailboxes). This is the **celebrity / hot-key problem** and it's the reason pure "push" doesn't work — solved by the **hybrid** approach in §5.
+Copying one tweet id into 50 million timelines is a disaster (slow, bursty, overloads the machines holding those timelines). This is the **celebrity / hot-key problem** and it's the reason pure "push" doesn't work — solved by the **hybrid** approach in §5.
 
 ---
 
@@ -163,18 +163,18 @@ Client → API Gateway
 
 - **Write path and read path are separate services** (CQRS) — the read path is optimized for the 100:1 read load.
 
-### Plain-English: who does what (the cast of services)
+### Who does what (the services)
 
-Think of it like a newsroom. Each box in the diagram is one team with one job:
+Each box in the diagram is one service with one job:
 
-| Service | Its one job | Everyday analogy |
-| --- | --- | --- |
-| **Tweet Service** | Save the tweet, hand back an id | The printing press (stores the article) |
-| **Fan-out Service** | Copy the new tweet id into followers' timelines | The mailroom (mails copies to subscribers) |
-| **Timeline Service** | Assemble + return your home feed on read | The front desk that hands you your mailbox contents |
-| **Graph Service** | Answer "who follows whom" | The subscriber list |
-| **Search Service** | Full-text search of tweets | The library index |
-| **Kafka** | A conveyor belt of "a tweet happened" events | The intercom announcing "new issue!" so every team reacts |
+| Service | Its one job |
+| --- | --- |
+| **Tweet Service** | Save the tweet, hand back an id |
+| **Fan-out Service** | Copy the new tweet id into followers' timelines |
+| **Timeline Service** | Assemble + return your home feed on read |
+| **Graph Service** | Answer "who follows whom" |
+| **Search Service** | Full-text search of tweets |
+| **Kafka** | Carries "a tweet happened" events so every service can react |
 
 #### Q: Why split "write path" and "read path" into different services (CQRS)?
 
@@ -186,8 +186,8 @@ Because posting a tweet and reading a timeline are **totally different shapes of
 If one service did both, you couldn't tune them independently. So we **C**ommand-**Q**uery-**S**eparate them: the write side optimizes for "accept the tweet fast and fan out in the background," the read side optimizes purely for "return a ready-made timeline in milliseconds."
 
 ```
-WRITE side:  you post → Tweet Service → Kafka → Fan-out workers fill mailboxes   (do work now)
-READ side:   you open app → Timeline Service → read your ready mailbox            (just fetch)
+WRITE side:  you post → Tweet Service → Kafka → Fan-out workers fill timelines   (do work now)
+READ side:   you open app → Timeline Service → read your ready timeline           (just fetch)
 ```
 
 #### Q: Why is Kafka in the middle instead of Tweet Service calling Fan-out directly?
@@ -213,15 +213,15 @@ Hybrid:
 
 > **The crux:** pure push dies on celebrities (50M writes/tweet); pure pull is slow on every read. **Hybrid** (push for the masses, pull for the handful of celebrities you follow) is the standard answer. Threshold on follower count (e.g. >100k = "celebrity", skip push).
 
-### Plain-English: the single most important idea in the whole design
+### The single most important idea in the whole design
 
 "Fan-out" just means: **when a tweet is created, how do we get it into the feeds of everyone who should see it?** There are two moments where we *could* do the work — when the tweet is written, or when the feed is read — and that choice is everything.
 
-#### Analogy (same magazine, extended)
+#### Push vs pull vs hybrid
 
-- **Push = mail a copy to every subscriber the moment an issue is printed.** Reading is instant (open your mailbox). But if a magazine has 50M subscribers, printing+mailing 50M copies for one issue is brutal.
-- **Pull = mail nothing; readers visit each publisher and grab the latest.** No mailing cost, but every *read* means running to 300 publishers and merging what you find — slow, and you do it on every refresh.
-- **Hybrid = mail copies for normal magazines, but for the 3 mega-magazines you subscribe to, go grab those yourself at read time.** You avoid the 50M-copy mailings *and* keep reads fast, because you only "run out" for a tiny handful of celebrities.
+- **Push = write the tweet id into every follower's timeline the moment it's posted.** Reads are instant (the timeline is prebuilt). But if an account has 50M followers, one tweet triggers 50M writes.
+- **Pull = write nothing extra; on read, fetch each followed account's latest tweets and merge.** No per-follower write cost, but every read fetches from ~300 accounts and merges them — slow, and it happens on every refresh.
+- **Hybrid = push for normal accounts, but for the few celebrities you follow, pull their tweets at read time.** You avoid the 50M-write explosion *and* keep reads fast, because you only pull for a tiny handful of celebrities.
 
 #### Push (fan-out on write) — annotated
 
@@ -332,15 +332,15 @@ No, because you follow only a **handful** of celebrities, and each celebrity's r
 - **Backpressure:** a huge (non-celebrity) account's fan-out is queued/throttled so it doesn't starve others.
 - Store **tweet IDs** in timelines (8 bytes), not content → hydrate on read.
 
-### Plain-English: the mailroom, step by step
+### The fan-out pipeline, step by step
 
-When you post, you get a fast "posted!" back immediately. The actual copying-into-followers'-mailboxes happens **afterward, in the background**. Here's the mailroom:
+When you post, you get a fast response immediately. The actual copying into followers' timelines happens **afterward, in the background**:
 
 ```java
 // 1) The poster's request finishes here — instantly. No waiting for fan-out.
 String postTweet(long authorId, String text) {
     Tweet t = tweetStore.save(new Tweet(authorId, text));  // save once
-    kafka.publish("TWEET_CREATED", t);                     // drop a note on the conveyor belt
+    kafka.publish("TWEET_CREATED", t);                     // publish the event; fan-out happens later
     return t.id;                                            // return NOW; fan-out happens later
 }
 
@@ -399,13 +399,13 @@ GET /home:
 - **Cursor pagination** by (score, tweet_id) — stable under new inserts.
 - Cap timeline length; deeper history falls back to pull.
 
-### Plain-English: ids in the mailbox, tweets in the library
+### Ids in the timeline, content in a shared store
 
 Two separate stores, and it matters that they're separate:
 
 ```
-timeline:{userId}  = [ 987, 986, 971, 970, ... ]     ← just IDS (your mailbox: a list of pointers)
-tweet:987          = { text, author, likes, media }  ← the ACTUAL tweet (the library, stored once)
+timeline:{userId}  = [ 987, 986, 971, 970, ... ]     ← just IDS (the timeline: a list of pointers)
+tweet:987          = { text, author, likes, media }  ← the ACTUAL tweet (stored once, shared)
 ```
 
 Reading your home feed is a two-step dance: get the **list of ids**, then **hydrate** them (look up the real tweets).
@@ -459,16 +459,16 @@ Rebuild it by **pulling** — read the recent tweets of everyone you follow from
 - **Ranked feed** = ML relevance: candidate generation (follow graph + pulled celebrities + some recommendations) → **scoring** (engagement likelihood, recency, author affinity, media type) → sort → cache.
 - Treat the model as a **black box**; emphasize the pipeline: **candidates → rank → cache**, recomputed periodically or at read with cached features.
 
-### Plain-English: "newest first" vs "best first"
+### "Newest first" vs "best first"
 
 Two ways to order your feed:
 
 - **Chronological** — literally sort by time, newest at top. Simple, predictable. (Our sorted-set score = timestamp already gives this for free.)
 - **Ranked** — show what you're *most likely to care about* first, even if it's not the newest. This is what modern Twitter/X, Instagram, etc. do.
 
-#### Analogy: a good newspaper editor
+#### Chronological vs ranked
 
-Chronological is a stack of every article in the order it was filed. Ranked is an **editor** deciding what goes on the front page: a huge story from someone you love beats a plain "gm" from someone you barely interact with, even if "gm" is newer.
+Chronological orders posts purely by time, newest first. Ranked orders by predicted relevance: a high-engagement post from an account you interact with a lot beats a low-value post from an account you barely engage with, even if the latter is newer.
 
 #### The pipeline (don't overthink the ML)
 
@@ -513,13 +513,13 @@ Usually a mix: candidate lists are precomputed (via fan-out), and **scoring** ha
 - **Search** via **Elasticsearch** (tweet text, hashtags, users), fed from `TWEET_CREATED` via CDC/consumer; inverted index → fast full-text (see the ES section in Databases Deep Dive).
 - **Trending** = count hashtag/term frequency over a **sliding time window** per region (stream aggregation, like ad-click counting) → top-k with time decay; cache and refresh every few minutes.
 
-### Plain-English: search and "what's trending"
+### Search and "what's trending"
 
-Two different jobs that both feed off the same `TWEET_CREATED` conveyor belt.
+Two different jobs that both feed off the same `TWEET_CREATED` event stream.
 
-#### Search — the book index analogy
+#### Search — the inverted index
 
-You don't read a whole book to find a word — you flip to the **index** at the back: "Tokyo → pages 12, 88, 203." Elasticsearch builds exactly that, an **inverted index**, for tweets:
+An **inverted index** maps each word to the list of documents that contain it, so instead of scanning every tweet you look the word up directly. Elasticsearch builds one for tweets:
 
 ```
 word "tokyo"  → [ tweet 987, tweet 1200, tweet 5501, ... ]
@@ -598,7 +598,7 @@ CREATE TABLE hashtags ( tag VARCHAR(100), tweet_id BIGINT, created_at TIMESTAMP,
 
 > **Tables to consider:** users, tweets, follows, likes, retweets, hashtags, notifications, media_refs, precomputed timelines (Redis), search index (ES), trending (stream/cache). Media → blob/CDN.
 
-### Plain-English: reading the schema
+### Reading the schema
 
 Each table maps to one real-world thing:
 
@@ -609,7 +609,7 @@ Each table maps to one real-world thing:
 | `follows` | one row per follow edge | the social graph: "A follows B" |
 | `likes` / `retweets` | one row per action | who liked/retweeted what |
 | `hashtags` | tag → tweet | powers search/trending |
-| `timeline:{id}` (Redis) | list of ids | the precomputed mailbox |
+| `timeline:{id}` (Redis) | list of ids | the precomputed timeline |
 
 #### Q: Why is `tweet_id` a "Snowflake" id and not just `AUTO_INCREMENT`?
 
@@ -673,9 +673,9 @@ User → TimelineSvc:
   → merge → hydrate content (mget tweet:{id}) → rank → paginate → return
 ```
 
-### Plain-English: following the two arrows
+### Following the two paths
 
-- **Post (write) sequence:** you post → Tweet Service saves it and hands you an id **right away** → it drops a `TWEET_CREATED` note on Kafka → background workers later look up your followers and drop the id into each mailbox. The key point: **you got your "posted!" back before any fan-out happened.** Celebrities are simply skipped in that last step.
+- **Post (write) sequence:** you post → Tweet Service saves it and hands you an id **right away** → it drops a `TWEET_CREATED` note on Kafka → background workers later look up your followers and drop the id into each follower's timeline. The key point: **you got your "posted!" back before any fan-out happened.** Celebrities are simply skipped in that last step.
 - **Read sequence:** you open the app → Timeline Service grabs your ready-made list of ids, mixes in a quick pull of the celebrities you follow, turns ids into full tweets (hydrate), ranks, and returns a page. Almost all the heavy lifting already happened at write time, so this is fast.
 
 One-line mnemonic:
@@ -698,17 +698,17 @@ READ  = grab list + pull celebs + hydrate   (mostly just fetching precomputed st
 | **Retweet of a celebrity** | Store as a retweet edge; hydrate original; avoid duplicating content |
 | **Backfill for inactive users** | Don't fan out to long-inactive users (lazy pull on return) → saves huge write volume |
 
-### Plain-English: the tricky "what ifs"
+### The tricky "what ifs"
 
 - **You follow someone new:** your precomputed timeline has none of their past tweets. Fix: **backfill** — pull their recent tweets in and merge, or just let the pull path cover them until fan-out catches up. Their *future* tweets will fan out normally.
 - **You unfollow someone:** their tweets may still sit in your cached timeline. We don't scramble to scrub them — we **lazily filter** them out on read, or rebuild the timeline in the background. Cheaper than reacting instantly.
 - **A tweet gets deleted:** timelines still hold its **id** (a dangling pointer). We don't hunt through millions of timelines to remove it. Instead, on hydrate the lookup returns nothing (**tombstone**) and we just **skip it**. Self-cleaning.
 - **An account crosses the celebrity threshold:** flip it from **push to pull** — stop fanning out its tweets; readers pull them instead. (And vice-versa if it drops below.)
-- **Inactive users:** someone who hasn't opened the app in months doesn't need tweets pushed into a mailbox they never check. **Skip fan-out to them**; rebuild via pull if they return. Across millions of dormant accounts this saves an enormous amount of write volume.
+- **Inactive users:** someone who hasn't opened the app in months doesn't need tweets pushed into a timeline they never check. **Skip fan-out to them**; rebuild via pull if they return. Across millions of dormant accounts this saves an enormous amount of write volume.
 
 #### Q: Why is "don't touch millions of timelines" a recurring theme?
 
-Because any fix that requires editing every follower's timeline is itself a fan-out-sized operation. So the design consistently prefers **lazy** fixes (filter/skip on read) and **tombstones** over eagerly rewriting millions of mailboxes. The read path is cheap to make a little smarter; rewriting all timelines is not.
+Because any fix that requires editing every follower's timeline is itself a fan-out-sized operation. So the design consistently prefers **lazy** fixes (filter/skip on read) and **tombstones** over eagerly rewriting millions of timelines. The read path is cheap to make a little smarter; rewriting all timelines is not.
 
 ---
 
@@ -736,7 +736,7 @@ Because any fix that requires editing every follower's timeline is itself a fan-
 - **Hot key (celebrity/viral tweet)** → pull + heavy caching + CDN; the viral tweet's content is cached once.
 - **Failure:** timeline cache miss → rebuild from user timelines (pull) → eventual consistency (a brief lag is fine); fan-out worker lag → some followers see a tweet a bit late.
 
-### Plain-English: what breaks, and why it's OK
+### What breaks, and why it's OK
 
 The comforting theme: because a timeline is **derived data** (rebuildable from `tweets` + `follows`), most failures are **degradations, not disasters**.
 

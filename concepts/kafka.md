@@ -4,7 +4,7 @@
 >
 > This note assumes **zero prior knowledge** and builds up to the hard operational questions: **how to size partitions, how to scale consumers and concurrency, and how to handle consumer lag.**
 
-> **How to read this doc:** most sections give the dense summary first, then a **Plain-English** deep dive (a real-world analogy, annotated code/config, and the exact confusions that come up while learning). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** most sections give the dense summary first, then a **deep dive** (annotated code/config, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -67,29 +67,27 @@ Order Service ──► [ Kafka topic: orders ] ──► Email consumer
 
 > Kafka is often called a "distributed commit log" or an "event streaming platform." It's **not** just a queue — the key difference is **messages aren't deleted when read**; they stay until retention expires, so many consumers (and replays) are possible.
 
-### Plain-English: Kafka is the office bulletin board, not a phone call
+### How Kafka decouples producers from consumers
 
-**Analogy: a shared bulletin board vs. making phone calls.**
+Without Kafka, the Order Service must call Email, then Analytics, then Inventory synchronously — waiting for each to respond. If Email is down, the whole operation stalls. If 10,000 orders arrive at once, the caller is overwhelmed.
 
-Without Kafka, the Order Service is like a person who, for every order, has to *phone* Email, then *phone* Analytics, then *phone* Inventory — and wait on hold for each to pick up. If Email doesn't answer, the whole errand stalls. If 10,000 orders come in at once, the caller is overwhelmed.
-
-Kafka is a **bulletin board in the hallway**. The Order Service just **pins a note** ("Order #55 placed") and walks away — instantly, done. Email, Analytics, and Inventory each **stroll by whenever they're ready** and read the notes at their own pace. The note stays pinned even after someone reads it, so a team that was on vacation (down) can catch up later by reading everything they missed.
+With Kafka, the Order Service **appends one record** ("Order #55 placed") to a topic and returns immediately. Email, Analytics, and Inventory each consume the record independently, at their own pace. The record stays in the log even after it's read, so a consumer that was down can catch up later by reading everything it missed.
 
 ```
-Old way (phone calls):   Order ──waits──► Email ──waits──► Analytics ──waits──► Inventory
-Kafka way (bulletin):    Order ──pins note──► [ board ]  ◄──reads whenever──  Email / Analytics / Inventory
+Old way (synchronous calls):   Order ──waits──► Email ──waits──► Analytics ──waits──► Inventory
+Kafka way (log):               Order ──append──► [ topic ]  ◄──consume when ready──  Email / Analytics / Inventory
 ```
 
-#### Q: Isn't this just a message queue like a to-do list?
+#### Q: Isn't this just a message queue?
 
-Not quite. A normal queue is a **to-do list where you tear off a task once you do it** — the task is gone, and only one worker can ever see it. Kafka is a **logbook**: reading an entry doesn't erase it. That's what unlocks two superpowers a plain queue can't do:
+Not quite. A traditional queue **removes a message once a worker consumes it** — the message is gone, and only one worker ever sees it. Kafka is a **log**: reading a record doesn't delete it. That's what unlocks two capabilities a plain queue can't offer:
 
-- **Fan-out** — Email, Analytics, and Inventory can *all* read the same "Order #55" note independently. On a tear-off list, whoever grabs it first denies it to the others.
-- **Replay** — if Analytics had a bug, it can go back and re-read last week's notes. On a tear-off list those tasks are long gone.
+- **Fan-out** — Email, Analytics, and Inventory can *all* read the same "Order #55" record independently. In a delete-on-consume queue, whoever reads it first denies it to the others.
+- **Replay** — if Analytics had a bug, it can go back and re-read last week's records. In a delete-on-consume queue those messages are long gone.
 
-#### Q: If notes are never torn off, doesn't the board fill up forever?
+#### Q: If records are never deleted on read, doesn't the log fill up forever?
 
-No — Kafka deletes old notes on a schedule (**retention**, e.g. "keep 7 days"), *not* when they're read. So the board self-cleans by age/size, but within the retention window everyone gets as many reads and replays as they want. (More in [§14](#14-retention-compaction--cleanup).)
+No — Kafka deletes old records on a schedule (**retention**, e.g. "keep 7 days"), *not* when they're read. So the log self-cleans by age/size, but within the retention window every consumer gets as many reads and replays as it wants. (More in [§14](#14-retention-compaction--cleanup).)
 
 ---
 
@@ -113,30 +111,30 @@ Partition (an ordered log):
 
 Everything else in Kafka (topics, partitions, consumer groups, replication) is machinery around this log idea.
 
-### Plain-English: a numbered notebook you only ever add to
+### The append-only log model
 
-**Analogy: a spiral notebook where you only write on the next blank line.**
+A partition is an append-only log:
 
-- You **never erase or edit** a line you already wrote. New stuff goes on the **next empty line**, always at the bottom.
-- Every line has a **line number** that only goes up: 0, 1, 2, 3... That number is the **offset**.
-- Each reader keeps their **own bookmark** ("I've read up to line 95"). A reader can move the bookmark *back* to re-read old lines (replay) or *forward* to skip ahead. Reading doesn't rub anything out.
+- Records are **never erased or edited**. New records are written to the **end** of the log.
+- Every record has an **offset** that only increases: 0, 1, 2, 3...
+- Each consumer tracks its **own position** ("I've read up to offset 95"). A consumer can move its position *back* to re-read old records (replay) or *forward* to skip ahead. Reading removes nothing.
 
 ```
-line #:   0      1      2      3      4      5
-        [m0]   [m1]   [m2]   [m3]   [m4]   [m5]   ← writer always adds here
+offset:   0      1      2      3      4      5
+        [m0]   [m1]   [m2]   [m3]   [m4]   [m5]   ← producer always appends here
                               ▲
-                     reader's bookmark (offset 3): "I've read up to here"
+                     consumer position (offset 3): "I've read up to here"
 ```
 
-The single most important mental shift: **an offset is not "how many messages are left" — it's a permanent address for a slot in the notebook.** Message at offset 3 is *always* at offset 3, forever, for everybody. Your bookmark is separate from the writing.
+The key mental shift: **an offset is not "how many messages are left" — it's a permanent address for a slot in the log.** The record at offset 3 is *always* at offset 3, forever, for everybody. A consumer's position is separate from the log itself.
 
-#### Q: If two consumers read the same partition, do they share one bookmark?
+#### Q: If two consumers read the same partition, do they share one position?
 
-No — that's the magic. **Each consumer group keeps its own bookmark.** Email's group might be at line 95 while Analytics's group is at line 40, both reading the same notebook. Neither disturbs the other's position (see [§7 Offsets](#7-offsets--committing)).
+No. **Each consumer group keeps its own position.** Email's group might be at offset 95 while Analytics's group is at offset 40, both reading the same partition. Neither disturbs the other's position (see [§7 Offsets](#7-offsets--committing)).
 
-#### Q: Why "append-only"? Why can't I just edit a line?
+#### Q: Why "append-only"? Why can't I edit a record?
 
-Because appending to the end of a file is one of the *fastest* things a computer can do (no searching, no shuffling, sequential disk write). Editing the middle would mean locking, finding the spot, and rewriting — slow, and it would break every reader's bookmark. Immutability is *why* Kafka is fast and replayable.
+Because appending to the end of a file is one of the *fastest* operations a computer can do (no searching, no shuffling, sequential disk write). Editing the middle would mean locking, finding the spot, and rewriting — slow, and it would break every consumer's position. Immutability is *why* Kafka is fast and replayable.
 
 ---
 
@@ -174,27 +172,27 @@ Cluster
        └── topic "orders" partition 1 (follower)
 ```
 
-### Plain-English: the vocabulary as a library
+### The vocabulary in concrete terms
 
-**Analogy: a chain of libraries.** All the abstract terms map to something physical:
+Restating the core terms in plain language:
 
-| Kafka term | Library analogy |
+| Kafka term | What it is |
 | --- | --- |
-| **Message/Event** | A single note/fact you want to record |
-| **Topic** | A *subject* — e.g. the "Orders" shelf vs the "Clicks" shelf |
-| **Partition** | One *volume* of that subject (Orders Vol. 0, Vol. 1, Vol. 2) — a real, ordered book |
-| **Offset** | The *page number* inside one volume |
-| **Broker** | One *library building* that physically holds some volumes |
-| **Cluster** | The whole *library chain* (all buildings together) |
-| **Producer** | Someone *writing* new pages |
-| **Consumer** | Someone *reading* pages |
-| **Consumer Group** | A *team* of readers splitting the volumes among themselves |
-| **Replica** | A *photocopy* of a volume kept in another building (in case one burns down) |
-| **Leader / Follower** | The *official* copy you write to vs. the *backup* copies |
-| **ISR** | The backups that are *fully up to date* right now |
-| **Controller / KRaft** | The *head librarian* deciding who holds what and who's in charge |
+| **Message/Event** | A single record you want to store |
+| **Topic** | A category of records (e.g. "Orders" vs "Clicks") |
+| **Partition** | One ordered log within a topic (Orders partition 0, 1, 2) — the real physical unit |
+| **Offset** | The position of a record within one partition |
+| **Broker** | One server that physically holds some partitions |
+| **Cluster** | All the brokers together |
+| **Producer** | A client writing new records |
+| **Consumer** | A client reading records |
+| **Consumer Group** | A set of consumers splitting a topic's partitions among themselves |
+| **Replica** | A copy of a partition on another broker, for fault tolerance |
+| **Leader / Follower** | The replica you read/write vs. the copies that replicate it |
+| **ISR** | The replicas that are fully caught up right now |
+| **Controller / KRaft** | The component deciding which broker leads which partition |
 
-The one thing to burn in: **"topic" is a logical label; "partition" is the real physical ordered log.** When people say "Kafka scales" or "Kafka keeps order," they always mean *per partition* — the topic is just the folder name over a set of partitions.
+The key point: **"topic" is a logical label; "partition" is the real physical ordered log.** When people say "Kafka scales" or "Kafka keeps order," they mean *per partition* — the topic is just a name over a set of partitions.
 
 #### Q: What's the difference between a broker and a cluster, really?
 
@@ -261,43 +259,43 @@ If you used no key, "cancelled" could be processed before "placed" (different pa
 
 > ⚠️ **You can increase partitions later, but not decrease them** — and increasing changes the `hash(key) % N` mapping, so a key that used to go to partition 1 may now go to partition 4 → **ordering for existing keys breaks** at the boundary. Plan partition count ahead. See [§10](#10-how-to-decide-partition-count).
 
-### Plain-English: partitions are checkout lanes at a supermarket
+### How partitions provide parallelism and ordering
 
-**Analogy: checkout lanes.** One topic = the store. Partitions = the checkout lanes. Splitting into lanes does two things at once:
+A topic is split into partitions, and this does two things at once:
 
-1. **Parallelism** — 4 lanes serve 4 customers simultaneously, instead of one giant queue. More lanes = more throughput.
-2. **Ordering only *within* a lane** — the store guarantees the *order of people in lane 3*, but makes **no promise** about lane 3 vs lane 1. If your grandma and grandpa must be served in order, they must stand in the **same lane**.
+1. **Parallelism** — multiple partitions are consumed independently and in parallel, instead of everything going through one log. More partitions = more throughput.
+2. **Ordering only *within* a partition** — Kafka guarantees the order of records *within a single partition*, but makes **no promise** about ordering across partitions. If two events must be processed in order, they must go to the **same partition**.
 
-That second point is the whole reason for **keys**. The key decides which lane you're sent to:
+That second point is the whole reason for **keys**. The key decides which partition a record goes to:
 
 ```java
-// key = user_id → all of user 123's events go to the SAME lane → processed in order
+// key = user_id → all of user 123's events go to the SAME partition → processed in order
 producer.send(new ProducerRecord<>("orders", "user-123", "order placed"));
 producer.send(new ProducerRecord<>("orders", "user-123", "order cancelled"));
 // both land in the same partition → "placed" is guaranteed to be read before "cancelled"
 
-// no key → round-robin across lanes → fast, but "cancelled" might be read before "placed"
+// no key → round-robin across partitions → fast, but "cancelled" might be read before "placed"
 producer.send(new ProducerRecord<>("orders", null, "order cancelled"));
 ```
 
-How Kafka turns a key into a lane — a tiny bit of arithmetic you can do by hand:
+How Kafka turns a key into a partition:
 
 ```
 partition = hash(key) % numPartitions
 
 hash("user-123") = 887788        (some big number, always the same for this key)
-887788 % 4 (lanes)  = 0          → user-123 ALWAYS goes to lane 0
+887788 % 4 (partitions)  = 0     → user-123 ALWAYS goes to partition 0
 ```
 
-Same key → same hash → same lane. Every single time. That determinism is what preserves per-user order.
+Same key → same hash → same partition. Every time. That determinism preserves per-key order.
 
 #### Q: Why can I add partitions but never remove them?
 
-Because the lane is chosen by `hash(key) % N`. If you change `N` (add lanes), the math changes: `hash("user-123") % 4` might be lane 0, but `% 6` might be lane 2. So a user's **new** events start landing in a different lane than their **old** events — and the old ones sitting in lane 0 are now out of order relative to the new ones. This is why you **plan partition count up front and over-provision** rather than resizing later (see [§10](#10-how-to-decide-partition-count)).
+Because the partition is chosen by `hash(key) % N`. If you change `N` (add partitions), the math changes: `hash("user-123") % 4` might be partition 0, but `% 6` might be partition 2. So a key's **new** events start landing in a different partition than its **old** events — and the old ones are now out of order relative to the new ones. This is why you **plan partition count up front and over-provision** rather than resizing later (see [§10](#10-how-to-decide-partition-count)).
 
 #### Q: What is a "hot partition"?
 
-If one key is wildly more popular than the rest (one giant customer, one viral ad), *its* lane gets slammed while other lanes idle — because that key always maps to one lane. That's a **hot partition / hot key** (see [§17](#17-failure-scenarios--gotchas), and the salting fix in the [Ad Click Aggregation](../system-design/ad-click-aggregation-system-design.md) note).
+If one key is far more popular than the rest (one giant customer, one viral ad), *its* partition gets overloaded while others idle — because that key always maps to one partition. That's a **hot partition / hot key** (see [§17](#17-failure-scenarios--gotchas), and the salting fix in the [Ad Click Aggregation](../system-design/ad-click-aggregation-system-design.md) note).
 
 ---
 
@@ -344,15 +342,13 @@ producer.send(topic, key, value)
   → ack returned based on `acks` setting
 ```
 
-### Plain-English: the producer is a courier dropping off packages
+### How a producer sends records
 
-**Analogy: sending a package and choosing how much delivery confirmation you want.**
+`acks` controls how much confirmation the producer waits for before considering a send successful:
 
-`acks` is literally "how sure do you want to be that it arrived before you move on?":
-
-- `acks=0` — **drop it on the porch and drive off.** Fastest, but if it blows away you'll never know.
-- `acks=1` — **wait for the front-desk clerk (leader) to sign.** Good enough usually, but if the clerk faints before filing the copy in the back office (replicating), it's lost.
-- `acks=all` — **wait until the clerk AND the backup filers (in-sync replicas) all have a copy.** Slowest, but the package survives a building fire.
+- `acks=0` — don't wait for any acknowledgment. Fastest, but a lost message goes unnoticed.
+- `acks=1` — wait for the **leader** to write the record. Usually fine, but if the leader dies before followers replicate it, the record is lost.
+- `acks=all` — wait until the leader **and all in-sync replicas** have the record. Slowest, but the record survives a broker failure.
 
 ```java
 // for anything that matters (payments, orders): be safe
@@ -361,17 +357,17 @@ props.put("enable.idempotence", true);    // don't double-write on retry (see be
 // pair with min.insync.replicas=2 on the topic (see §9)
 ```
 
-**Batching = the courier waits to fill the van.** Instead of one trip per package, the producer waits a few milliseconds (`linger.ms`) to pile up packages going to the same lane, then sends them together. A tiny wait dramatically raises throughput:
+**Batching.** Instead of sending each record individually, the producer waits a few milliseconds (`linger.ms`) to accumulate records going to the same partition, then sends them together. A small wait dramatically raises throughput:
 
 ```java
-props.put("batch.size", 32768);   // pack up to 32 KB per lane per trip
-props.put("linger.ms", 5);        // wait up to 5ms to fill the van before leaving
-props.put("compression.type", "lz4");  // shrink-wrap the load → more fits, faster
+props.put("batch.size", 32768);   // up to 32 KB per partition per batch
+props.put("linger.ms", 5);        // wait up to 5ms to fill the batch before sending
+props.put("compression.type", "lz4");  // compress the batch → more fits, faster
 ```
 
 #### Q: What does the idempotent producer actually fix?
 
-Imagine the courier delivers a package, but the "signed!" confirmation gets lost on the way back. The courier assumes it failed and **delivers a second copy** — now there are two. The idempotent producer stamps each package with a **sequence number**, so the receiving desk notices "I already have #7" and quietly ignores the duplicate.
+Suppose the producer sends a record, but the acknowledgment is lost on the way back. The producer assumes the send failed and **retries, writing the record twice**. The idempotent producer tags each record with a **sequence number**, so the broker notices "I already have #7" and ignores the duplicate.
 
 ```
 Without idempotence:   send #7 → (ack lost) → retry #7 → broker stores #7 TWICE  ✗
@@ -435,35 +431,33 @@ Topic "orders"
 
 Each group reads all messages and tracks its own offsets. One slow group doesn't block another.
 
-### Plain-English: a consumer group is a crew splitting the delivery routes
+### How a consumer group splits partitions
 
-**Analogy: a pizza shop with delivery drivers (one crew) and multiple lanes of orders.**
+A consumer group is a set of consumers that share the work of consuming a topic's partitions:
 
-A **partition** is a delivery route. A **consumer group** is the crew of drivers for *one purpose* (say, "delivery"). The rules fall right out of the analogy:
-
-- **Each route is handled by exactly one driver in the crew** — you don't want two drivers racing to the same house. So a partition is owned by exactly one consumer *within a group*.
-- **More drivers than routes = idle drivers.** If you have 4 routes and hire a 5th driver, they sit in the break room — there's no route left to give them. **Max useful drivers = number of routes = number of partitions.**
+- **Each partition is consumed by exactly one consumer within a group** — two consumers in the same group never read the same partition simultaneously.
+- **More consumers than partitions = idle consumers.** With 4 partitions and a 5th consumer, that consumer has no partition to read. **Max useful consumers = number of partitions.**
 
 ```
-4 routes (partitions), 2 drivers:   each drives 2 routes
-4 routes, 4 drivers:                each drives 1 route   ← max parallelism
-4 routes, 5 drivers:                5th driver is IDLE    ← partitions cap you
+4 partitions, 2 consumers:   each reads 2 partitions
+4 partitions, 4 consumers:   each reads 1 partition   ← max parallelism
+4 partitions, 5 consumers:   5th consumer is IDLE     ← partitions cap you
 ```
 
-**Different crews = fan-out.** The "delivery crew," the "accounting crew," and the "marketing crew" are separate groups. Each crew independently reads *every* order for its own purpose, with its own progress bookmark. The delivery crew being slow doesn't hold up accounting.
+**Different groups = fan-out.** Separate consumer groups (e.g. email, accounting, marketing) each read *every* record independently, each with its own committed offsets. A slow group doesn't hold up another.
 
 ```java
-// This app is part of the "email-service" crew.
-// Kafka automatically hands each instance some partitions and rebalances if one dies.
-props.put("group.id", "email-service");   // ← the crew you belong to
+// This app is part of the "email-service" group.
+// Kafka assigns each instance some partitions and rebalances if one dies.
+props.put("group.id", "email-service");   // ← the group you belong to
 
-// A totally separate crew, reading the SAME topic independently:
+// A separate group, reading the SAME topic independently:
 props.put("group.id", "analytics-service");
 ```
 
 #### Q: If I want to process faster, do I just keep adding consumers?
 
-Only **up to the partition count**. Adding drivers past the number of routes does nothing (they idle). To go faster beyond that, you must **add partitions first**, or speed up each consumer / add in-consumer threads (see [§11](#11-scaling-consumers--concurrency)). This "partitions cap parallelism" rule is *the* most important operational fact about Kafka.
+Only **up to the partition count**. Adding consumers past the number of partitions does nothing (they idle). To go faster beyond that, you must **add partitions first**, or speed up each consumer / add in-consumer threads (see [§11](#11-scaling-consumers--concurrency)). This "partitions cap parallelism" rule is *the* most important operational fact about Kafka.
 
 #### Q: Same `group.id` vs different `group.id` — what's the practical effect?
 
@@ -499,50 +493,48 @@ If a consumer crashes and restarts, it resumes from the last committed offset.
 | `latest` (default) | Only new messages from now |
 | `earliest` | From the very beginning of the partition |
 
-### Plain-English: committing an offset = saving your place in a book
+### Committing offsets
 
-**Analogy: reading a long book and using a bookmark.**
-
-- The **offset** is the page you're on. **Committing** the offset is the act of *moving the physical bookmark* so that if you close the book (crash) and reopen it later, you resume from the bookmark — not from page 1, and not from wherever you happened to stop reading.
-- The subtle part: **reading a page and moving the bookmark are two separate actions.** *When* you move the bookmark decides what happens if you get interrupted mid-page.
+- The **offset** is your current position. **Committing** the offset records that position, so if the consumer crashes and restarts, it resumes from the committed offset — not from the beginning, and not necessarily from where it actually stopped.
+- The subtle part: **processing a record and committing its offset are two separate actions.** *When* you commit decides what happens if the consumer crashes mid-processing.
 
 ```java
-// enable.auto.commit = false → YOU control when the bookmark moves
+// enable.auto.commit = false → YOU control when the offset is committed
 props.put("enable.auto.commit", false);
 
 while (true) {
-    var records = consumer.poll(Duration.ofMillis(100));  // read a batch of pages
+    var records = consumer.poll(Duration.ofMillis(100));  // fetch a batch of records
     for (var record : records) {
         process(record);            // do the actual work first
     }
-    consumer.commitSync();          // THEN move the bookmark → "at-least-once"
+    consumer.commitSync();          // THEN commit the offset → "at-least-once"
 }
 ```
 
 **The two orderings, and why they matter:**
 
 ```
-Process THEN commit  (bookmark moves after work is done):
-    crash after processing but before commit → you re-read those pages → work happens AGAIN
+Process THEN commit  (commit after work is done):
+    crash after processing but before commit → those records are re-read → work happens AGAIN
     ⇒ AT-LEAST-ONCE  (never lose a message, but may repeat → be idempotent)
 
-Commit THEN process  (bookmark moves before work is done):
-    crash after commit but before work → those pages are skipped forever
+Commit THEN process  (commit before work is done):
+    crash after commit but before work → those records are skipped forever
     ⇒ AT-MOST-ONCE  (never repeat, but may lose messages)
 ```
 
 Almost everyone picks **process-then-commit (at-least-once)** and makes their processing idempotent, because losing a payment is worse than processing it twice.
 
-#### Q: Where is the bookmark actually stored? In the consumer's memory?
+#### Q: Where are committed offsets actually stored? In the consumer's memory?
 
-No — if it were in memory it'd vanish on crash. Kafka saves committed offsets in a special internal topic called `__consumer_offsets`, **per group, per partition**. That's why a brand-new consumer instance can pick up exactly where the crashed one left off.
+No — if they were in memory they'd vanish on crash. Kafka saves committed offsets in a special internal topic called `__consumer_offsets`, **per group, per partition**. That's why a brand-new consumer instance can pick up exactly where the crashed one left off.
 
-#### Q: What's `auto.offset.reset` for — isn't there always a bookmark?
+#### Q: What's `auto.offset.reset` for — isn't there always a committed offset?
 
-Only if the group has read before. For a **brand-new group** (or one whose old bookmark expired), there's no saved page. `auto.offset.reset` decides the starting page:
+Only if the group has committed before. For a **brand-new group** (or one whose committed offset expired), there's no saved position. `auto.offset.reset` decides where to start:
 
-- `latest` (default) → "start from now, ignore history" (typical for live processing).
-- `earliest` → "start from page 1, read everything ever written" (typical for backfills/replay).
+- `latest` (default) → start from now, ignore history (typical for live processing).
+- `earliest` → start from the beginning, read everything ever written (typical for backfills/replay).
 
 ---
 
@@ -556,17 +548,15 @@ Only if the group has read before. For a **brand-new group** (or one whose old b
 
 > **Practical answer:** almost everyone runs **at-least-once + idempotent consumers** (dedup by a business key). True exactly-once is real in Kafka (transactions), but it only spans Kafka reads/writes — the moment you call an external DB/API, you're back to needing idempotency.
 
-### Plain-English: the three delivery promises, via a package courier
+### The three delivery guarantees
 
-**Analogy: how carefully a courier handles your package.**
-
-| Guarantee | Courier behavior | Result |
+| Guarantee | How it's achieved | Result |
 | --- | --- | --- |
-| **At-most-once** | Marks "delivered" *before* actually knocking, then knocks | Might mark done but drop it → **you can lose messages, never get doubles** |
-| **At-least-once** | Knocks and delivers *first*, then marks "delivered" | If it crashes before marking, it redelivers → **never lost, but you can get doubles** |
-| **Exactly-once** | Delivers with a tamper-proof ledger entry that can't be double-counted | **No loss, no doubles** — but only works inside Kafka's own building |
+| **At-most-once** | Commit the offset *before* processing | If it crashes after commit but before processing → **can lose messages, never duplicates** |
+| **At-least-once** | Process *first*, then commit the offset | If it crashes before committing, it reprocesses → **never lost, but can get duplicates** |
+| **Exactly-once** | Idempotent producer + transactions | **No loss, no duplicates** — but only within Kafka-to-Kafka flows |
 
-The key realization: **at-least-once will hand you duplicates, and that's fine** — as long as *your* processing is idempotent (doing it twice = same result). This is why "dedup by a business key" comes up everywhere.
+The key realization: **at-least-once will hand you duplicates, and that's usually fine** — as long as *your* processing is idempotent (doing it twice = same result). This is why "dedup by a business key" comes up everywhere.
 
 ```java
 // At-least-once in practice: make processing safe to repeat.
@@ -621,27 +611,27 @@ This tolerates **1 broker failure with zero data loss**. If ISR drops below `min
 | `replication.factor` | Data loss risk | More disk + network |
 | `min.insync.replicas` | Weak durability | Writes fail more easily during outages |
 
-### Plain-English: keeping photocopies in different buildings
+### How replication keeps data safe
 
-**Analogy: a critical document you can't afford to lose.** You keep the **original** in Building 1 (the **leader**) and **photocopies** in Buildings 2 and 3 (**followers**). If Building 1 burns down, you grab a photocopy and promote it to the new original — no data lost.
+Each partition has one **leader** replica and one or more **follower** replicas on other brokers. If the broker holding the leader fails, a follower is promoted to leader — no data lost.
 
-- **Leader** = the one everybody reads from and writes to (the working copy).
-- **Followers** = backups that constantly copy the leader.
-- **ISR (in-sync replicas)** = the backups that are *currently fully caught up*. A new leader can only be promoted from the ISR (you'd never promote a stale, half-copied backup).
+- **Leader** = the replica that handles all reads and writes for the partition.
+- **Followers** = replicas that continuously copy the leader's log.
+- **ISR (in-sync replicas)** = the followers currently fully caught up. A new leader can only be promoted from the ISR (never a stale, partially-copied follower).
 
-The **durability combo** and what each knob means in plain terms:
+The **durability combo** and what each setting means:
 
 ```
-replication.factor = 3     → keep 3 copies total (1 original + 2 photocopies)
-acks = all                 → the courier waits until all in-sync copies exist before saying "done"
-min.insync.replicas = 2    → refuse to accept writes unless at least 2 copies will exist
+replication.factor = 3     → keep 3 copies total (1 leader + 2 followers)
+acks = all                 → the producer waits until all in-sync copies have the record before "done"
+min.insync.replicas = 2    → refuse writes unless at least 2 copies will exist
 ```
 
 Together: **you can lose 1 whole broker and lose zero data.**
 
 #### Q: What does `min.insync.replicas=2` actually do during an outage?
 
-It's a **safety brake**. Suppose two of your three brokers are down, so only the leader is left. With `min.insync.replicas=2`, Kafka says: "I can't guarantee a second copy right now, so I'll **reject new writes**" rather than accept a write that exists on only one machine (which would be lost if that one dies). It **fails safe** — the producer gets an error and can retry later, instead of silently risking data loss.
+It's a **safety limit**. Suppose two of your three brokers are down, so only the leader is left. With `min.insync.replicas=2`, Kafka says: "I can't guarantee a second copy right now, so I'll **reject new writes**" rather than accept a write that exists on only one machine (which would be lost if that one dies). It **fails safe** — the producer gets an error and can retry later, instead of silently risking data loss.
 
 ```
 Healthy:   leader + 2 followers in ISR (3 ≥ 2) → writes accepted ✓
@@ -718,21 +708,21 @@ If you think you'll need 50 consumers at peak, you need **≥ 50 partitions** �
 - **Over-provision slightly** because increasing later reshuffles key→partition mapping (ordering break) and you **cannot decrease**.
 - If you need strict global ordering, you're stuck with **1 partition** (no parallelism) — usually you relax to per-key ordering instead.
 
-### Plain-English: how many checkout lanes should the store build?
+### Choosing a partition count
 
-**Analogy: designing a supermarket.** Partitions are checkout lanes, and you're deciding how many to build *before opening day* (because you can add lanes later but never remove them without chaos). The question is really: **"at peak, how many cashiers do I want working at once?"**
+You're deciding the partition count *up front*, because you can add partitions later but not remove them cleanly. The real question is: **at peak, how many consumers do I want processing in parallel?**
 
-The formula, in plain words:
+The formula:
 
 ```
 partitions = max( T / P , T / C )
 
-T = total shoppers per hour you must handle   (target throughput)
-P = shoppers one lane can handle if the WRITE side is the limit (producer)
-C = shoppers one cashier can ring up per hour (consumer)
+T = target throughput you must handle
+P = throughput one partition sustains on the producer side
+C = throughput one consumer sustains reading one partition
 ```
 
-You take the **bigger** of the two because you must satisfy whichever side needs more lanes.
+You take the **bigger** of the two because you must satisfy whichever side needs more partitions.
 
 Worked example, spelled out:
 
@@ -740,22 +730,22 @@ Worked example, spelled out:
 Need to handle:            100,000 messages/sec
 One consumer can process:    5,000 messages/sec   (limited by its DB writes)
 
-→ need 100,000 / 5,000 = 20 cashiers working at once
-→ so you need AT LEAST 20 lanes (partitions), else you can't run 20 cashiers
-→ round up for headroom → build ~24–30 lanes
+→ need 100,000 / 5,000 = 20 consumers running at once
+→ so you need AT LEAST 20 partitions, else you can't run 20 consumers
+→ round up for headroom → ~24–30 partitions
 ```
 
-#### Q: Why can't I just build 10,000 lanes to be safe?
+#### Q: Why not just create 10,000 partitions to be safe?
 
-Because empty lanes still cost money and slow you down. Each partition = open files, memory buffers, and replication work on every broker. Too many lanes means **slower failover** (more to reassign when a broker dies), **slower rebalances**, and **higher latency**. It's like a store with 10,000 checkout lanes and 12 customers — mostly overhead. Right-size to *peak desired parallelism + a bit of headroom*, not infinity.
+Because each partition has a cost even when idle. Each partition = open file handles, memory buffers, and replication work on every broker. Too many partitions means **slower failover** (more to reassign when a broker dies), **slower rebalances**, and **higher latency**. Right-size to *peak desired parallelism + a bit of headroom*, not infinity.
 
-#### Q: I only need 10 cashiers today — why over-provision to, say, 30?
+#### Q: I only need 10 consumers today — why over-provision to, say, 30?
 
-Because **adding lanes later reshuffles the `hash(key) % N` mapping and breaks per-key ordering** (see [§4](#4-partitions--the-heart-of-kafka)), and you can **never reduce** lanes. So you pick for your *future peak*, not today's load. If you'll ever want 50 consumers at peak, build ≥ 50 partitions now.
+Because **adding partitions later reshuffles the `hash(key) % N` mapping and breaks per-key ordering** (see [§4](#4-partitions--the-heart-of-kafka)), and you can **never reduce** partitions. So you pick for your *future peak*, not today's load. If you'll ever want 50 consumers at peak, create ≥ 50 partitions now.
 
 #### Q: What if I need *strictly global* ordering (everything in one exact sequence)?
 
-Then you're forced to **1 partition** — one lane, one cashier, no parallelism. That's a real cost, so teams almost always relax the requirement to **per-key ordering** (order within each user/account, but not across them), which lets them use many partitions.
+Then you're forced to **1 partition** — no parallelism. That's a real cost, so teams almost always relax the requirement to **per-key ordering** (order within each user/account, but not across them), which lets them use many partitions.
 
 ---
 
@@ -828,29 +818,29 @@ If topic has 10 partitions → only 10 consumers possible → max 20,000/sec →
    → add partitions to 20+, or add thread-pool concurrency, or make processing faster.
 ```
 
-### Plain-English: two different ways to add muscle
+### Two ways to add throughput
 
-**Analogy: a warehouse unloading trucks (partitions), and you need to unload faster.** There are two totally different levers, and mixing them up causes real bugs.
+There are two distinct levers, and mixing them up causes real bugs.
 
-**Lever 1 — hire more workers (more consumer instances).** Each worker grabs whole trucks (partitions). Simple and safe, but you can't have more workers than trucks — extras stand around.
+**Lever 1 — more consumer instances.** Each consumer takes whole partitions. Simple and safe, but you can't have more consumers than partitions — extras sit idle.
 
 ```
-12 trucks (partitions):
-  4 workers  → each unloads 3 trucks
-  12 workers → each unloads 1 truck   ← maxed out
-  13th worker → idle (no truck for them)
+12 partitions:
+  4 consumers  → each reads 3 partitions
+  12 consumers → each reads 1 partition   ← maxed out
+  13th consumer → idle (no partition to assign)
 ```
 
-**Lever 2 — one worker with a team of helpers (threads inside one consumer).** A single worker grabs a truck, then hands boxes to a thread pool to unpack in parallel. This gets you *past* the truck limit — but you lose the guarantee that boxes come out in order, and saving your place (committing offsets) gets tricky.
+**Lever 2 — more concurrency inside one consumer (threads).** A single consumer polls a batch, then hands records to a thread pool to process in parallel. This gets you *past* the partition limit — but you lose per-partition ordering, and committing offsets gets tricky.
 
 ```java
 // Lever 2: one consumer, fan the batch out to a thread pool
 var records = consumer.poll(Duration.ofMillis(100));   // e.g. 500 records from my partitions
 var futures = records.stream()
-    .map(r -> threadPool.submit(() -> process(r)))     // unpack boxes in parallel
+    .map(r -> threadPool.submit(() -> process(r)))     // process records in parallel
     .toList();
 futures.forEach(Future::get);   // WAIT for ALL to finish...
-consumer.commitSync();          // ...only THEN move the bookmark (else a crash loses in-flight work)
+consumer.commitSync();          // ...only THEN commit the offset (else a crash loses in-flight work)
 ```
 
 | Lever | Use when | The catch |
@@ -944,20 +934,20 @@ Lag high → add 100 consumers → they all hammer the DB → DB overloaded → 
 
 > "I monitor consumer lag **and oldest-message age**. To fix lag I scale consumers up to the partition count, add partitions if I've hit the ceiling, speed up per-message processing (batching/async), separate critical from low-priority topics with dedicated consumer pools, throttle bursty producers, and DLQ poison messages. And I check whether the real bottleneck is downstream — adding consumers won't help if the DB is the limit."
 
-### Plain-English: lag is the pile of unread mail
+### Consumer lag
 
-**Analogy: a mailbox filling up while you're on vacation.** The mail carrier (producer) keeps delivering; you (consumer) read when you can. **Lag = the stack of letters you haven't opened yet.**
+Lag is how many records the producer has written that the consumer hasn't processed yet. The producer keeps appending; the consumer processes when it can. **Lag = the backlog of unprocessed records.**
 
 ```
-Latest letter delivered  = #100,000   (producer wrote up to here)
-Last letter you opened   =  #95,000   (you processed up to here)
-Lag                      =    5,000    unopened letters
+Latest offset written    = 100,000   (producer wrote up to here)
+Last offset processed    =  95,000   (consumer processed up to here)
+Lag                      =   5,000    unprocessed records
 ```
 
-The crucial insight: **the size of the pile matters less than how *old* the oldest letter is.**
+The crucial insight: **the size of the backlog matters less than how *old* the oldest unprocessed record is.**
 
-- 5,000 letters you'll clear in 2 seconds → totally fine.
-- 5,000 letters where the oldest has been sitting **30 minutes** → that's an incident (especially for OTPs, payments, alerts).
+- 5,000 records you'll clear in 2 seconds → totally fine.
+- 5,000 records where the oldest has been waiting **30 minutes** → that's an incident (especially for OTPs, payments, alerts).
 
 That's why you **alert on oldest-message age**, not just the count.
 
@@ -1004,25 +994,25 @@ After:   A→[P0,P1,P2,P3]      (rebalance reassigns B's partitions to A)
 
 > **Modern fix:** **cooperative / incremental rebalancing** (and static group membership via `group.instance.id`) avoids reassigning everything at once and prevents needless rebalances on quick restarts.
 
-### Plain-English: reshuffling the delivery routes when the crew changes
+### How a rebalance reassigns partitions
 
-**Analogy: your delivery crew reassigning routes.** When a driver joins (you deployed a new instance), quits (crashed), or is presumed lost (stopped checking in), the crew stops and **re-divides all the routes** among whoever's left. That reshuffle is a **rebalance**.
+When a consumer joins (you deployed a new instance), leaves (crashed), or is presumed dead (stopped sending heartbeats), the group stops and **re-divides all the partitions** among the remaining consumers. That reassignment is a **rebalance**.
 
-The pain: in the classic protocol, it's **stop-the-world** — *everyone* drops their routes and waits while the new assignment is worked out. During those seconds, **nobody is delivering**, so unread mail (lag) spikes.
+The cost: in the classic protocol, it's **stop-the-world** — *every* consumer drops its partitions and waits while the new assignment is computed. During those seconds, **nobody consumes**, so lag spikes.
 
 ```
 Before:  A → [P0, P1]    B → [P2, P3]
 B crashes → REBALANCE (everyone pauses) →
-After:   A → [P0, P1, P2, P3]     ← A picks up B's routes; consumption resumed
+After:   A → [P0, P1, P2, P3]     ← A picks up B's partitions; consumption resumed
 ```
 
 What triggers a rebalance — and the timeouts that govern it:
 
 ```
-group.instance.id        # give each instance a stable ID → quick restart ≠ "new member" → no needless rebalance
-session.timeout.ms       # no heartbeat within this → "driver is dead" → rebalance
-heartbeat.interval.ms    # how often the consumer pings "I'm alive"
-max.poll.interval.ms     # took too long between poll() calls → "driver stuck" → kicked → rebalance
+group.instance.id        # stable ID per instance → quick restart ≠ "new member" → no needless rebalance
+session.timeout.ms       # no heartbeat within this → consumer considered dead → rebalance
+heartbeat.interval.ms    # how often the consumer sends a heartbeat
+max.poll.interval.ms     # too long between poll() calls → consumer considered stuck → kicked → rebalance
 ```
 
 #### Q: Why does slow processing cause a rebalance? I never left the group.
@@ -1063,18 +1053,18 @@ After compaction:   (user2, X) (user1, C)      ← only newest per key kept
 | `compact` | Latest-state-per-key (e.g. `user → current profile`) |
 | `compact,delete` | Both |
 
-### Plain-English: two ways to keep the notebook from overflowing
+### Two cleanup policies
 
-**Analogy: cleaning out records you no longer need.** Kafka gives you two very different cleanup styles.
+Kafka gives you two very different cleanup styles.
 
-**Style 1 — `delete` (time/size retention): the newspaper recycling bin.** Keep the last 7 days of papers; anything older gets recycled, *whether or not anyone read it*. This is the default and fits almost everything (event streams, logs).
+**Style 1 — `delete` (time/size retention).** Keep records for a fixed window (e.g. 7 days); anything older is deleted, *whether or not anyone read it*. This is the default and fits almost everything (event streams, logs).
 
 ```
 retention.ms    = 604800000   # keep 7 days, then auto-delete old segments
 retention.bytes = 10737418240 # OR cap each partition at ~10 GB, whichever hits first
 ```
 
-**Style 2 — `compact` (log compaction): a contacts app, not a chat log.** For each **key**, keep only the **most recent value** and throw away older versions. Perfect for "current state" topics like `user_id → current profile`.
+**Style 2 — `compact` (log compaction).** For each **key**, keep only the **most recent value** and discard older versions. Ideal for "current state" topics like `user_id → current profile`.
 
 ```
 cleanup.policy = compact
@@ -1141,25 +1131,25 @@ When the topic represents **the latest state of something**, not a history of ev
 
 > **When to pick Kafka:** high throughput, multiple independent consumers, event replay, stream processing, ordering per key. **When not to:** you just need a simple managed task queue with low volume → SQS/RabbitMQ is less operational overhead.
 
-### Plain-English: log vs. to-do list vs. mailroom
+### Kafka vs message brokers vs managed queues
 
-**Analogy: three different tools people lump together as "queues."**
+Three tools people often lump together as "queues":
 
-- **Kafka = a shared logbook.** Everyone reads it, entries stay put until they age out, you can re-read the past. Built for *firehose volume* and *many readers*.
-- **RabbitMQ = a smart mailroom.** A clerk *routes* each letter to the right recipient based on rules, hands it over, and the letter is **gone once accepted**. Great for complex "send this to exactly the right worker" routing.
-- **AWS SQS = a managed drop-box.** Dead simple, someone else runs it, a message disappears once a worker deletes it. Great when you want zero ops and just need a task queue.
+- **Kafka = a durable log.** Records stay until they age out, many consumer groups read independently, and you can re-read the past. Built for high throughput and multiple readers.
+- **RabbitMQ = a message broker.** It *routes* each message to the right queue based on rules, delivers it, and the message is **gone once acknowledged**. Great for complex routing to specific workers.
+- **AWS SQS = a managed queue.** Simple, fully managed, a message disappears once a worker deletes it. Great when you want zero ops and just need a task queue.
 
 The single biggest difference: **Kafka doesn't delete on read; the other two do.** That's why replay and fan-out are natural in Kafka and awkward elsewhere.
 
 ```
-Kafka:     write → [ logbook keeps it 7 days ] → read, re-read, many groups read independently
+Kafka:     write → [ log keeps it 7 days ] → read, re-read, many groups read independently
 RabbitMQ:  write → [ router → queue ] → worker acks → message DELETED
 SQS:       write → [ managed queue ] → worker deletes → message GONE
 ```
 
 #### Q: RabbitMQ can also fan out — how is Kafka different?
 
-RabbitMQ fans out by **copying** a message into several queues at publish time; once each consumer acks, its copy is gone (no built-in replay). Kafka fans out because the **one** log stays put and each consumer group keeps its **own bookmark** — so a group added *next month* can still read everything from the start (within retention). Kafka's fan-out is "many readers of one durable log"; RabbitMQ's is "many disposable copies."
+RabbitMQ fans out by **copying** a message into several queues at publish time; once each consumer acks, its copy is gone (no built-in replay). Kafka fans out because the **one** log stays put and each consumer group keeps its **own committed offset** — so a group added *next month* can still read everything from the start (within retention). Kafka's fan-out is "many readers of one durable log"; RabbitMQ's is "many disposable copies."
 
 #### Q: When is Kafka the *wrong* choice?
 
@@ -1181,14 +1171,14 @@ When you have **low volume** and just need a **simple task queue** with minimal 
 | **Rebalance storms** | Frequent restarts/timeouts → constant pauses. Use static membership + cooperative rebalancing |
 | **Hot partition** | One key gets all traffic (e.g. one huge tenant) → that partition's consumer is overloaded. Use a better key or sub-partition the hot key |
 
-### Plain-English: the greatest hits of "why is production on fire?"
+### Common failure scenarios explained
 
-Every scenario above is really one of a few recurring themes. Here's the intuition behind the scary ones.
+Every scenario above is really one of a few recurring themes. Here's the intuition behind the important ones.
 
-**Poison message — the letter that jams the printer.** One record always throws an exception. Naive retry loops forever on it, and because a partition is read **in order**, everything *behind* it is stuck too — one bad letter freezes the whole lane.
+**Poison message.** One record always throws an exception. Naive retry loops forever on it, and because a partition is read **in order**, everything *behind* it is stuck too — one bad record freezes the whole partition.
 
 ```java
-// Fix: retry a few times, then set it aside (dead-letter queue) so the line keeps moving.
+// Fix: retry a few times, then route it to a dead-letter queue so the partition keeps moving.
 try {
     process(record);
 } catch (Exception e) {
@@ -1200,9 +1190,9 @@ try {
 }
 ```
 
-**Duplicate delivery — the "did that go through?" double-tap.** At-least-once means a redelivery can happen after a crash. The record isn't corrupt; it's just *repeated*. The fix isn't in Kafka — it's making **your** handler idempotent (dedup by a business key), exactly as in [§8](#8-delivery-semantics).
+**Duplicate delivery.** At-least-once means a redelivery can happen after a crash. The record isn't corrupt; it's just *repeated*. The fix isn't in Kafka — it's making **your** handler idempotent (dedup by a business key), exactly as in [§8](#8-delivery-semantics).
 
-**Reordering — parallel unpacking scrambles the sequence.** Kafka only guarantees order *within a partition*, and only if you read it single-threaded. The moment you thread-pool a partition's records ([§11](#11-scaling-consumers--concurrency) Lever 2), "cancelled" can finish before "placed." Key by entity for ordering, and don't parallelize a partition's records if their order matters.
+**Reordering.** Kafka only guarantees order *within a partition*, and only if you read it single-threaded. The moment you thread-pool a partition's records ([§11](#11-scaling-consumers--concurrency) Lever 2), "cancelled" can finish before "placed." Key by entity for ordering, and don't parallelize a partition's records if their order matters.
 
 #### Q: A broker died — did I lose data or messages?
 

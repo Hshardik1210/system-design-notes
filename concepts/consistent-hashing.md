@@ -2,7 +2,7 @@
 
 > **Problem it solves:** with plain `hash(key) % N`, adding/removing a node remaps **almost all keys** → cache misses / massive data movement. Consistent hashing remaps only **~1/N of keys**.
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (a clock/ring-of-servers analogy, annotated pseudo-Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated pseudo-Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -31,13 +31,13 @@ Add a 5th server → now hash(key) % 5
 
 > **Modulo sharding is brittle:** changing `N` reshuffles nearly all keys. Bad for elastic clusters and caches.
 
-### Plain-English: why `hash % N` breaks
+### Why `hash % N` breaks
 
-**Analogy: a coat-check with numbered pegs.** Imagine a cloakroom with 4 pegs (servers). The rule for where each coat (key) goes is "peg number = ticket number **mod 4**." Coat #10 → peg 2, coat #11 → peg 3, and so on. Simple and fast.
+With 4 servers, the rule for where each key goes is `server = hash(key) % 4`. A key with hash 10 → server 2, hash 11 → server 3, and so on. Simple and fast.
 
-Now a 5th peg is added and the rule becomes "**mod 5**." Coat #10 that used to live on peg 2 now maps to peg 0. Coat #11 moves from peg 3 to peg 1. **Almost every coat has to be physically moved** to a different peg, because you changed the number you divide by, which changes the answer for nearly every ticket.
+Now a 5th server is added and the rule becomes `% 5`. The key with hash 10 that used to map to server 2 now maps to server 0; hash 11 moves from server 3 to server 1. **Almost every key now maps to a different server**, because you changed the divisor, which changes the result for nearly every key.
 
-For a cache, "moving the coat" means the data isn't where you look for it → a **cache miss** → the request falls through to the database. Do that for *every* key at once and the database gets slammed by millions of misses the instant you add one server.
+For a cache, a key mapping to a different server means the data isn't where you look for it → a **cache miss** → the request falls through to the database. Do that for *every* key at once and the database is hit by millions of misses the instant you add one server.
 
 ```
 4 servers:  server = hash(key) % 4
@@ -90,9 +90,9 @@ lookup(key):
 
 > Only **~K/N keys** move when a node joins/leaves (vs ~all with modulo).
 
-### Plain-English: the ring is a clock face of servers
+### The ring is a clock face of servers
 
-**Analogy: a 12-hour clock where servers stand at certain hours.** Picture a giant clock face. Instead of numbers 1–12, the positions go from 0 all the way around to a huge number (2³², i.e. ~4.3 billion) and then wrap back to 0 — so it's a **circle, not a line**. Both **servers** and **keys** get a spot on this clock:
+Picture a clock face. Instead of numbers 1–12, the positions run from 0 up to a huge number (2³², i.e. ~4.3 billion) and then wrap back to 0 — so it's a **circle, not a line**. Both **servers** and **keys** get a position on this clock:
 
 - To place a **server**, hash its name → you get a number → that's where it stands on the clock.
 - To place a **key**, hash the key → you get a number → that's where the key sits.
@@ -170,13 +170,13 @@ Benefits:
 - On removal, a server's load spreads across **many** neighbors, not one.
 - Lets you weight heterogeneous servers (a bigger box gets more vnodes).
 
-### Plain-English: why one server needs many spots on the clock
+### Why one server needs many spots on the clock
 
 **The problem, concretely.** With only 3 or 4 servers placed *once* each, the clock is lumpy. Random hashing rarely spaces them evenly — one server might end up owning a huge arc (say half the clock) just by luck, while another owns a sliver. So one machine gets swamped and another idles. Worse, if the machine owning the big arc dies, **its entire load dumps onto the single next server clockwise**, which may then also fall over (a cascade).
 
 **The fix — virtual nodes (vnodes).** Instead of placing each physical server at one spot, place it at **many** spots (typically ~100–200), by hashing `serverName#1`, `serverName#2`, ... Each spot is a "virtual node" but they all point back to the same real machine.
 
-**Analogy: one referee wearing many numbered jerseys, standing in many places.** Instead of referee S1 standing at a single spot on the field, S1 clones into 150 jerseys scattered all over. Now the field is covered evenly by all referees mixed together. If S1 leaves, its 150 spots vanish from 150 *different* places around the clock, so the keys they owned get redistributed to **150 different neighbors** — a little to each — instead of all landing on one poor server.
+Placing each physical server at 150 spots scatters its positions across the clock. If that server leaves, its 150 spots vanish from 150 *different* places around the clock, so the keys they owned are redistributed to **150 different neighbors** — a little to each — instead of all landing on one server.
 
 ```
 Physical S1 → S1#1, S1#2, ... S1#150   (150 points scattered around the ring)
@@ -244,9 +244,9 @@ After:   ... S1 ──[some keys now go to S4]── S4 ──[rest go to S2]─
 
 👉 Only the keys in the arc **between S1 and S4** move (from S2 → S4). All other keys stay put.
 
-### Plain-English: who gains and who loses keys
+### Who gains and who loses keys
 
-**Analogy: a new coffee cart opens on the ring road.** Commuters (keys) always stop at the *next* cart clockwise. A new cart (S4) opens between S1 and S2. Only the commuters who were driving past S1 and continuing on to S2 now stop at S4 instead — because S4 is now the first cart they reach. Everyone whose next stop was S1, or S3, or was already past S2, is completely unaffected. S2 "loses" exactly the slice of road now covered by S4; nobody else changes.
+Each key belongs to the *next* server clockwise. A new server (S4) is added between S1 and S2. Only the keys that were between S1 and S2 — which used to belong to S2 — now belong to S4, because S4 is now the first server clockwise for them. Keys owned by S1, S3, or anything already past S2 are completely unaffected. S2 loses exactly the arc now covered by S4; nothing else changes.
 
 ```
 Before:   S1 ─────────── keys in this whole arc go to S2 ───────────► S2
@@ -317,13 +317,13 @@ Plain consistent hashing can still overload one node if a **key is hot** or arcs
 
 > **Interview add-on:** "consistent hashing places replicas on the next RF distinct nodes clockwise (Dynamo/Cassandra); bounded-load variants cap per-node load to handle skew; rendezvous/jump hash are simpler alternatives."
 
-### Plain-English: replicas, hot spots, and the alternatives
+### Replicas, hot spots, and the alternatives
 
 #### Replication — "keep 3 copies" using the same clock
 
 So far each key had one owner. Real databases keep **RF copies** (RF = replication factor, often 3) so data survives a machine dying. The trick reuses the ring: the primary is the first server clockwise, and the copies are simply **the next distinct physical servers clockwise** after it.
 
-**Analogy: a relay of mailboxes.** You drop your letter in the first mailbox clockwise (primary). Its two clockwise neighbors also keep a photocopy (replicas). If the first mailbox burns down, the letter still exists in the next two.
+So a key's data lives on the first server clockwise (primary) plus the next two distinct servers clockwise (replicas). If the primary fails, the data still exists on the next two.
 
 ```java
 List<String> replicasFor(String key, int rf) {
@@ -347,7 +347,7 @@ List<String> replicasFor(String key, int rf) {
 
 Vnodes even out *arcs*, but a **single hot key** (one product everyone hammers on Black Friday) still lands on one server and can overwhelm it. **Consistent hashing with bounded loads** caps each server at `(1+ε)·average` load; if a key's target server is already "full", the key **spills to the next server clockwise** that has room.
 
-**Analogy: overflow parking.** Each lot has a max capacity. If your assigned lot is full, you drive to the next lot clockwise. No single lot ever overflows past its cap; the excess is shared with neighbors.
+In other words, each server has a capacity cap. If a key's assigned server is already at capacity, the key is placed on the next server clockwise that has room. No single server exceeds its cap; the excess spreads to neighbors.
 
 #### The alternatives, in one breath
 
@@ -375,7 +375,7 @@ lookup(key):    e = ring.ceilingEntry(hash(key)); return e ?? ring.firstEntry()
 
 > `ceilingEntry` = first node clockwise; wrap around to `firstEntry` if past the end.
 
-### Plain-English: reading the implementation sketch
+### Reading the implementation sketch
 
 The whole data structure is a **sorted map** (`TreeMap` in Java, `SortedDict`/balanced BST elsewhere) whose keys are positions on the clock and whose values are server names. That's it — the "ring" is not a fancy structure, just a sorted list of `(position, server)` you can binary-search.
 

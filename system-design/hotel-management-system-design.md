@@ -2,7 +2,7 @@
 
 > **Core challenge:** let guests **search available rooms for a date range**, **book without overbooking**, and handle **payments, check-in/out, cancellations, and inventory** across many hotels. The signature problem is **availability + concurrent booking correctness over date ranges** — never sell the same room twice, across *every* night.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -38,9 +38,9 @@ Search hotels/rooms for [checkIn, checkOut] → select room type → hold → pa
 
 Unlike movie seats (a single instant) or Airbnb (a unique listing), hotels sell **room types** (Deluxe, Suite) — a **count of interchangeable rooms** — and availability must hold for **every night** in the range. That count-per-night model is the twist.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
-Imagine you run a hotel-booking site like MakeMyTrip / Booking.com. A guest tells you: *"I want a room in Goa from July 10 to July 13."* Your job is to:
+A hotel-booking site like MakeMyTrip / Booking.com. A guest tells you: *"I want a room in Goa from July 10 to July 13."* Your job is to:
 
 - **Show** them which hotels have a free room **for all three of those nights**.
 - **Take their money** and **guarantee** the room is theirs.
@@ -48,17 +48,14 @@ Imagine you run a hotel-booking site like MakeMyTrip / Booking.com. A guest tell
 
 So the whole system is a giant, careful **"is a room free, and can I lock it for you"** machine. Everything else — search, payments, check-in — hangs off that one hard question.
 
-### Plain-English: why is a hotel harder than it sounds?
+### Why is a hotel harder than it sounds?
 
-Beginners assume "a room is either free or taken." Two twists make hotels special:
+You might assume "a room is either free or taken." Two twists make hotels special:
 
 - **Twist 1 — you book a *type*, not a specific room.** You don't ask for "room 412"; you ask for "a Deluxe room." The hotel has, say, 10 identical Deluxe rooms. As long as **at least one** is free, you're fine. So we track a **count** ("8 of 10 Deluxe booked"), not individual rooms.
 - **Twist 2 — a booking spans *multiple nights*.** "July 10–13" means you need a Deluxe free on the **10th AND the 11th AND the 12th**. If even one of those nights is sold out, the whole stay is impossible.
 
-```
-Analogy: booking a hotel = reserving the SAME parking spot type for 3 days straight.
-It's only yours if the spot is free on day 1 AND day 2 AND day 3 — miss one, no deal.
-```
+The stay is bookable only if a room of that type is free on *every* night of the range — if any single night is sold out, the whole booking fails.
 
 Here's the count-per-night idea as a tiny table — one row per (room type, night):
 
@@ -91,7 +88,7 @@ You *can*, and small B&Bs do. But at scale it's wasteful and slow: guests don't 
 - Highly available search; scale for peaks (holidays, events).
 - Accurate **dynamic pricing** (seasonal/demand).
 
-### Plain-English: "functional vs non-functional" in hotel terms
+### "Functional vs non-functional" in hotel terms
 
 - **Functional = *what* the app lets you do** (the features): search hotels, see a price, book, pay, cancel, check in. If you can list it as a button on the screen, it's functional.
 - **Non-functional = *how well* it must behave** (the qualities): "never double-book," "search stays fast even on New Year's Eve," "prices are correct." No button — but if these fail, the product is broken even though every button "works."
@@ -118,7 +115,7 @@ Bookings ~ modest write rate, but STRONGLY consistent (money + no overbooking)
 
 > Browse dominates → ES read model + cache. Booking is low-volume but must be exact. Inventory is the big table (hotel × room type × night).
 
-### Plain-English: reading the back-of-the-envelope math
+### Reading the back-of-the-envelope math
 
 These numbers aren't trivia — each one points at a design decision.
 
@@ -128,11 +125,7 @@ These numbers aren't trivia — each one points at a design decision.
 | **~1B inventory rows/year** | 1M hotels × ~3 room types × 365 nights. That's the biggest table by far. | **Partition** it and **prune** past dates (last week's availability is useless — delete it). |
 | **Bookings = low rate, strongly consistent** | Money changes hands, and a wrong answer means a real person is stranded. | Keep booking on a proper **RDBMS** with transactions — correctness over raw speed. |
 
-```
-Analogy: a hotel lobby.
-Hundreds of people wander in to LOOK at brochures (search) — cheap, keep lots of brochures around.
-Only a few walk to the desk to actually PAY and get a key (booking) — slow, careful, one at a time.
-```
+Reads dominate: for every booking there are hundreds of searches. So optimize reads (a fast, replicated index) and keep the rarer booking writes careful, exact, and serialized.
 
 #### Q: Why prune past-date inventory? Isn't deleting data risky?
 
@@ -155,32 +148,30 @@ Client → API Gateway
 
 - **CQRS:** search = ES read model (rebuilt via CDC from inventory); booking = RDBMS write model with the atomic count updates.
 
-### Plain-English: who does what (the services), like hotel staff
+### Who does what (the services)
 
-Each box is a specialist, exactly like a hotel's departments. A guest never talks to them directly — they talk to the **front desk (API Gateway)**, which routes the request.
+Each box is a specialist service. A client never talks to them directly — it talks to the **API Gateway**, which routes each request to the right service.
 
-| Service | Hotel-staff analogy | Job |
-| --- | --- | --- |
-| **API Gateway** | Front desk / concierge | Single entry point; sends each request to the right department. |
-| **Search Service** | The brochure rack + travel agent | Fast "what's available in Goa?" answers, from a pre-built index (Elasticsearch). Allowed to be slightly stale. |
-| **Inventory Service** | The master availability ledger | The one source of truth for "how many Deluxe rooms are left each night." Guards against overbooking. |
-| **Booking Service** | The reservations clerk | Runs the reserve → pay → confirm steps; undoes them if payment fails. |
-| **Payment Service** | The cashier | Talks to the card gateway; records who paid what. |
-| **Admin** | The hotel manager | Sets room counts and nightly prices. |
-| **Kafka** | The internal announcements board | When something happens ("Reservation confirmed!"), it posts a note; other services (search index, email, analytics) read it and react. |
+| Service | Job |
+| --- | --- |
+| **API Gateway** | Single entry point; sends each request to the right service. |
+| **Search Service** | Fast "what's available in Goa?" answers, from a pre-built index (Elasticsearch). Allowed to be slightly stale. |
+| **Inventory Service** | The one source of truth for "how many Deluxe rooms are left each night." Guards against overbooking. |
+| **Booking Service** | Runs the reserve → pay → confirm steps; undoes them if payment fails. |
+| **Payment Service** | Talks to the card gateway; records who paid what. |
+| **Admin** | Sets room counts and nightly prices. |
+| **Kafka** | Event backbone: when something happens ("Reservation confirmed!"), it publishes an event; other services (search index, email, analytics) consume it and react. |
 
 #### Q: What is CQRS, in one plain sentence?
 
 **CQRS = use two different data stores: one tuned for *reading*, one tuned for *writing*.** Here, **reads** (search) hit Elasticsearch — fast, handles huge browse traffic, can be a few seconds behind. **Writes** (booking) hit the RDBMS — exact, transactional, never overbooks. When inventory changes in the RDBMS, that change is streamed (via **CDC** — Change Data Capture — over Kafka) into Elasticsearch to keep search fresh-ish.
 
 ```
-Analogy:
-  RDBMS (write side)  = the accountant's precise master ledger (slow, always correct)
-  Elasticsearch (read side) = the daily printed "rooms available" flyer at the front desk
-        (super quick to glance at, but reprinted only every few minutes, so it can lag)
+RDBMS (write side)        = the exact, transactional source of truth (always correct)
+Elasticsearch (read side) = a fast read copy, rebuilt continuously, so it can lag by seconds
 ```
 
-The flyer might briefly say "rooms available" for a hotel that just sold out — that's fine, because the **accountant re-checks for real** the moment you actually try to pay (§10 "exact re-check at booking").
+The search index might briefly show "rooms available" for a hotel that just sold out — that's fine, because the **booking path re-checks the exact counts** the moment you actually try to pay (§10 "exact re-check at booking").
 
 ---
 
@@ -204,7 +195,7 @@ Deluxe, total = 10
 - **Why count-per-night, not per-room?** Guests don't care *which* Deluxe room — only that one is free. Tracking a **count** avoids assigning a specific room until check-in and keeps the hot path a simple integer update.
 - A physical `rooms` table exists for **check-in assignment** and maintenance, decoupled from availability.
 
-### Plain-English: the domain, as Java classes
+### The domain, as Java classes
 
 Let's turn the nouns of a hotel into objects. Note how `RoomType` holds a **count** and the per-night availability lives in its own object — this mirrors the `room_inventory` table.
 
@@ -310,7 +301,7 @@ book(hotel, roomType, checkIn, checkOut, guest):
 
 > **Key insight:** same correctness primitive as BookMyShow's seat lock, but applied to a **count per night across a date range** — **all nights succeed or none** (check `rows_affected == nights`, else roll back).
 
-### Plain-English: the double-booking problem, and the one trick that fixes it
+### The double-booking problem, and the one trick that fixes it
 
 **The scary scenario:** it's the last Deluxe room for July 10. Two guests, Alice and Bob, both tap "Book" at the *exact* same millisecond.
 
@@ -342,7 +333,7 @@ Bob's UPDATE runs next:    10 < 10 is FALSE → nothing changes.  (0 rows change
 
 No lost room, no manual locking — the `WHERE booked_count < total_count` **is** the lock. This is called an **atomic conditional update** (a form of **compare-and-set / optimistic concurrency**).
 
-### Plain-English: booking a *range* — all nights or nothing
+### Booking a *range* — all nights or nothing
 
 A stay is many nights, so we run that conditional increment for **every** night at once, inside one transaction, then check: *did all of them succeed?*
 
@@ -431,7 +422,7 @@ if everyone shows up (rare) → "walk" the guest: rebook them at a nearby hotel 
 - The conditional update becomes `WHERE booked_count < total_count + overbook_buffer`.
 - Trade-off: higher occupancy/revenue vs occasional walk cost — a deliberate business decision, not a bug.
 
-### Plain-English: wait — I thought overbooking was the bug we're preventing?
+### Wait — I thought overbooking was the bug we're preventing?
 
 This trips everyone up. There are **two different meanings**:
 
@@ -440,13 +431,7 @@ This trips everyone up. There are **two different meanings**:
 | **Accidental** (§6) | A software race sells the *same* room twice by mistake. | ❌ A bug. Must never happen. |
 | **Intentional** (this section) | The hotel *chooses* to sell, say, 105 rooms when it has 100, betting some will cancel. | ✅ A deliberate revenue strategy. |
 
-```
-Analogy: airlines. A flight has 180 seats but they sell ~190 tickets,
-because they KNOW ~10 people always miss the flight. Usually it works out.
-On the rare day everyone shows up → they bump someone (pay them to take a later flight).
-Hotels do the same: on a rare full night they "WALK" the guest — book & pay for a room
-at a nearby hotel + an apology. It costs a little, but the extra bookings earn far more.
-```
+Airlines do the same: a 180-seat flight may sell ~190 tickets because ~10 people reliably miss it, and on the rare full flight they bump someone. Hotels **"walk"** the guest on a rare full night — book and pay for a room at a nearby hotel plus compensation. The walk cost is small; the extra bookings earn far more.
 
 The knob is a single number, `overbook_buffer`, and it plugs right into the same guard from §6 — that's the elegance:
 
@@ -476,15 +461,9 @@ PENDING_PAYMENT ─pay ok→ CONFIRMED ─check-in→ CHECKED_IN ─check-out→
 
 - Every fail/cancel path **decrements `booked_count` for each night** (compensation).
 
-### Plain-English: a reservation's life story
+### The reservation lifecycle
 
-A reservation is never "just booked" — it moves through **stages**, and only certain moves are legal. That's a **state machine**: a fixed set of states + rules for which state can go to which.
-
-```
-Analogy: a hotel booking is like a package delivery status —
-"Ordered → Shipped → Out for delivery → Delivered." You can't jump from "Ordered" to "Delivered",
-and once "Delivered" you can't go back to "Shipped". Reservations have the same guardrails.
-```
+A reservation is never "just booked" — it moves through **stages**, and only certain moves are legal. That's a **state machine**: a fixed set of states + rules for which state can go to which. A reservation can't jump from `PENDING_PAYMENT` straight to `COMPLETED`, and terminal states have no way back.
 
 The states, in plain words:
 
@@ -534,7 +513,7 @@ void cancel(Reservation r) {
 
 #### Q: Why have `PENDING_PAYMENT` at all — why not create the reservation only after payment?
 
-Because you must **hold the room during payment**. If you waited until payment succeeded to touch inventory, two people could both "succeed" paying for the last room simultaneously. So we grab the room *first* (`PENDING_PAYMENT` + increment), then collect money. If money never comes, the state flips to `EXPIRED` and the room is released. It's the reservation equivalent of putting an item in your cart *reserving stock* while you check out.
+Because you must **hold the room during payment**. If you waited until payment succeeded to touch inventory, two people could both "succeed" paying for the last room simultaneously. So we grab the room *first* (`PENDING_PAYMENT` + increment), then collect money. If money never comes, the state flips to `EXPIRED` and the room is released — you hold the room first and collect payment second.
 
 ---
 
@@ -544,15 +523,9 @@ Because you must **hold the room during payment**. If you waited until payment s
 - Decouples the booking hot path (count math) from housekeeping/maintenance state.
 - Handles upgrades, adjoining-room requests, and maintenance blocks without touching availability counts.
 
-### Plain-English: "you booked a Deluxe; which room key do you actually get?"
+### "You booked a Deluxe; which room do you actually get?"
 
-Remember the twist: when you booked, the system only decided *"one of the 10 Deluxe rooms is yours"* — it never picked room **412** vs **415**. That choice is **deferred all the way to check-in**.
-
-```
-Analogy: booking a rental car. Online you reserve "a midsize sedan," not a specific VIN.
-When you arrive at the counter, the clerk hands you whichever midsize is clean & ready.
-You didn't care which one — you cared that ONE would be there.
-```
+Remember the twist: when you booked, the system only decided *"one of the 10 Deluxe rooms is yours"* — it never picked room **412** vs **415**. That choice is **deferred all the way to check-in**, when a specific room of that type that's clean and ready is assigned. You only ever needed *one* to be available, not a particular one.
 
 Assignment at the desk, in code:
 
@@ -598,7 +571,7 @@ Mixing them would drag maintenance/cleaning logic onto the booking hot path and 
 - **Availability at search is approximate/cached** — you can't check exact counts for every hotel per query. Denormalize a compact per-hotel availability summary (e.g., min free count over the next N days per room type) into the index; **re-check exact counts at booking**.
 - Cache popular `city + date` searches; rebuild the index from inventory via **CDC/Kafka**.
 
-### Plain-English: why search is "approximate," and why that's fine
+### Why search is "approximate," and why that's fine
 
 When someone searches "Goa, July 10–13, 2 guests," you might match **thousands** of hotels. Running the exact §5 "check every night for every room type" query against the booking database for *every* hotel on *every* keystroke would melt it.
 
@@ -610,11 +583,7 @@ Instead of exact per-night counts, the index stores a cheap hint per hotel/room 
 If minFree = 0 → definitely full, hide it. Otherwise show it as "available".
 ```
 
-```
-Analogy: a supermarket's website says "In stock" for milk.
-It doesn't guarantee the exact carton is on the shelf when you arrive —
-it's a fast, good-enough hint. The real check happens at the checkout counter (= booking).
-```
+The index gives a fast, good-enough hint ("available"); the exact, authoritative check happens at booking time.
 
 The two-step "approximate then exact" flow:
 
@@ -678,7 +647,7 @@ CREATE TABLE outbox ( id BIGINT PRIMARY KEY, event_type VARCHAR(50), payload JSO
 
 > **Tables to consider:** hotels, room_types, rooms, **room_inventory** (the key one), reservations, payments, refunds, cancellation_policies, guests, reviews, outbox, pricing_rules.
 
-### Plain-English: what each table is *for* (and the two sneaky ones)
+### What each table is *for* (and the two sneaky ones)
 
 Most tables are obvious nouns. Here's the mental map, then the two that confuse beginners:
 
@@ -737,7 +706,7 @@ POST /v1/reservations/{id}/check-in    POST /v1/reservations/{id}/check-out
 PUT  /v1/hotels/{id}/inventory   { roomTypeId, date, totalCount, price, overbookBuffer }
 ```
 
-### Plain-English: the API is just the booking journey as URLs
+### The API is just the booking journey as URLs
 
 Read the endpoints top-to-bottom and they retrace a guest's trip:
 
@@ -776,15 +745,11 @@ Guest  BookingSvc  Inventory  Payment  Kafka
   (payment fail/timeout → compensation: decrement each night; reservation=EXPIRED)
 ```
 
-### Plain-English: what a "saga" is, and why we need one
+### What a "saga" is, and why we need one
 
 A booking touches **several services** — Inventory, Payment, then messaging. In a single database you'd wrap them in one transaction and "all or nothing" comes free. But these are **separate services** (separate databases), so there's no single transaction spanning them. A **saga** is the workaround: do the steps **one at a time**, and if a later step fails, run **compensating actions** to undo the earlier ones.
 
-```
-Analogy: booking a vacation across 3 separate companies — flight, hotel, car.
-No single "cancel everything" button exists. If the car rental fails AFTER you booked flight + hotel,
-you must go back and CANCEL the flight and CANCEL the hotel yourself. That manual undo = compensation.
-```
+Across separate services there's no single "cancel everything" transaction. If a later step fails after earlier ones already committed, you must explicitly undo the earlier ones — that manual undo is **compensation**.
 
 The booking saga, happy path vs failure:
 
@@ -830,7 +795,7 @@ Scope. The §6 transaction is **inside one database** (all the per-night increme
 | Search shows sold-out hotel | Search is approximate; exact re-check at booking rejects it |
 | Multi-night partial availability | All-or-nothing (any full night fails the whole range) |
 
-### Plain-English: the edge cases, retold as everyday hotel moments
+### The edge cases, as concrete hotel scenarios
 
 These aren't abstract — each is a thing that genuinely happens at a front desk:
 
@@ -873,7 +838,7 @@ int refundFor(Reservation r, CancellationPolicy policy, Instant now) {
 | **Decorator / Chain** | Price = base + season + taxes + fees − discount | Stack pricing |
 | **Repository / Factory** | Data access; notification/payment creation | Testable, extensible |
 
-### Plain-English: the patterns, each in one line + where it bites
+### The patterns, each in one line + where it applies
 
 Patterns sound academic; here each is tied to a concrete hotel moment:
 
@@ -918,7 +883,7 @@ Each pattern here earns its place by absorbing a *specific* real-world messiness
 - **Overbooking buffer** (business choice) raises occupancy; **walk policy** handles the rare over-capacity night.
 - **Dynamic pricing** job updates `room_inventory.price` per night by demand/season.
 
-### Plain-English: how it survives growth and failure
+### How it survives growth and failure
 
 The two big scaling worries and their fixes:
 
@@ -932,11 +897,7 @@ Shard by hotel_id:
    Shard C: hotels 2M..3M     ┘
 ```
 
-```
-Analogy: a hotel CHAIN with independent front desks per property.
-Booking the Goa Marriott only involves the Goa desk — the Delhi desk is irrelevant.
-So splitting the workload by hotel keeps every booking a local, self-contained operation.
-```
+Sharding by hotel keeps every booking self-contained: all nights of a booking live on the same shard, so the "increment each night, all-or-nothing" write stays a plain local transaction.
 
 #### Q: Why shard by `hotel_id` specifically, and not by, say, `guest_id` or `date`?
 

@@ -2,7 +2,7 @@
 
 > **Core challenge:** ingest huge video files, **transcode** them into many resolutions/formats, and **stream** them to millions of viewers **smoothly** (adaptive bitrate), **globally**, with **low startup latency** and **content protection**. It's dominated by **transcoding + storage + a global CDN** — the database is tiny. Reads (views) ≫ writes (uploads) by orders of magnitude.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated code, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -41,7 +41,7 @@ Watch  → player fetches a manifest, then segments (adaptive bitrate) from the 
 
 The "database" holds small **metadata**; the real system is a **media processing pipeline + global CDN**. Two very different workloads: **write path** (upload/transcode — heavy compute, rare) and **read path** (streaming — massive bandwidth, constant).
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
 Imagine you run YouTube (or Netflix). Someone in Mumbai records a 10-minute 4K video on their phone and uploads it. Minutes later, a million people around the world — on a slow train Wi-Fi, a fast home fibre line, a 4K TV, an old phone — all want to press **play** and watch it **instantly, smoothly, no buffering**.
 
@@ -50,13 +50,13 @@ The whole system exists to bridge those two moments:
 1. **Upload / process (the write path):** one giant raw file comes in. It's rare (compared to views), but it's *heavy* — you have to chop it up and re-encode it into dozens of versions. This is **transcoding**.
 2. **Watch / deliver (the read path):** millions of people pull the video at once, each at whatever quality their internet can handle *right now*. This is **adaptive bitrate streaming over a CDN**, and it's where 99.9% of the traffic (terabits per second) lives.
 
-So the mental picture is a factory + a delivery network:
+So the system has two stages — processing and delivery:
 
-> **Upload → (factory) transcode into many sizes + cut into small chunks → (warehouses) store & copy near viewers → (delivery) player grabs the right-sized chunks from the nearest warehouse and plays them one after another.**
+> **Upload → transcode into many sizes + cut into small segments → store and replicate near viewers → player fetches the right-sized segments from the nearest CDN edge and plays them one after another.**
 
-Almost everything in this doc is "how do we do that factory step efficiently" and "how do we deliver bytes to millions of people cheaply and smoothly."
+Almost everything in this doc is "how do we do the processing step efficiently" and "how do we deliver bytes to millions of people cheaply and smoothly."
 
-### Plain-English: why not just stream the raw uploaded file?
+### Why not just stream the raw uploaded file?
 
 First instinct: store the file the creator uploaded, and when someone hits play, send them that file. Why that falls apart:
 
@@ -105,9 +105,9 @@ Transcode compute:
 
 **Takeaways:** **bandwidth dominates** → the design is a **CDN problem**; the origin/DB barely sees traffic. Transcoding is heavy but parallelizable. Storage is enormous → tiering + efficient codecs matter.
 
-### Plain-English: why "bandwidth dominates" (and what a bit rate even is)
+### Why "bandwidth dominates" (and what a bit rate even is)
 
-**Analogy: a water utility.** A few reservoirs (your storage/origin) hold the water. The number that actually stresses the system isn't how many reservoirs you have — it's how many **taps are open at once** and how fast water flows through the **pipes** to homes. Video streaming is the same: the hard part isn't storing the videos, it's the **firehose of bytes** flowing out to every viewer simultaneously.
+The number that stresses the system isn't how much video you store — it's how many streams are **open at once** and how many bytes per second flow out to all those viewers simultaneously. The hard part isn't storing the videos; it's sustaining the outbound bandwidth to every viewer at the same time.
 
 - **Bitrate** = how many bits per second a video needs to play smoothly. 1080p ≈ **5 Mbps** means "to watch this in 1080p, 5 megabits must arrive every second, forever, or you buffer."
 - Now multiply by viewers. **10 million** people watching 1080p at once = 10,000,000 × 5 Mbps = **50 Tbps** (terabits per second) leaving your system *continuously*.
@@ -148,9 +148,9 @@ Because you keep **many renditions** of the same video — 144p, 240p, 480p, 720
 - **Retries + DLQ:** a failed segment re-transcodes; poison uploads → DLQ + alert.
 - **Pipeline stages** (validate → segment → encode → package → thumbnail → publish) = classic **Pipeline** pattern.
 
-### Plain-English: what "transcoding" actually means
+### What "transcoding" actually means
 
-**Analogy: a print shop.** A photographer hands you one huge, pristine RAW photo. Before it's useful, the shop makes many versions: a small thumbnail for the web, a medium JPEG for email, a big print-quality file, each in the format the customer's device can open. **Transcoding is exactly that, but for video** — take one master file and produce many re-encoded versions at different resolutions/qualities/formats.
+Take one master file and produce many re-encoded versions at different resolutions/qualities/formats — the same idea as generating a small, medium, and large copy of an image, but for video. Each output is a full re-encode tuned for a different device and network.
 
 > **Transcode = decode the video back into raw frames, then re-encode it into a different resolution / bitrate / codec.** You do it many times per upload to build the "encoding ladder" (§5).
 
@@ -253,11 +253,9 @@ A **ladder** = the set of (resolution, bitrate) "rungs" the player can choose fr
 - **Keyframe (IDR) alignment across renditions**: every rendition starts a segment at the same keyframe so the player can **switch quality at segment boundaries** seamlessly.
 - **Segment duration trade-off:** shorter (2s) = faster quality switching + lower live latency, but more requests/overhead; longer (6–10s) = more efficient, higher latency.
 
-### Plain-English: ladder, codec, keyframe — three words demystified
+### Ladder, codec, keyframe — three words demystified
 
-**Analogy: a coffee shop menu.** The **encoding ladder** is the menu of sizes — Small, Medium, Large, XL. The player is a customer who orders the biggest size it can "afford" (bandwidth). If the customer's budget shrinks mid-order, they downgrade to a smaller size for the next round.
-
-- **Ladder = the list of (resolution, bitrate) options** you pre-made for a video. Each "rung" is one quality version.
+- **Ladder = the list of (resolution, bitrate) options** you pre-made for a video. Each "rung" is one quality version. The player selects the highest rung its bandwidth can sustain, and steps down a rung if bandwidth drops mid-playback.
 - **Codec = the *compression method* used to shrink the video** (H.264, VP9, AV1). Think of it like ZIP vs RAR vs 7z for video: same movie, different squeezing algorithm. Newer codecs (AV1) squeeze harder (smaller files, less bandwidth) but take more CPU to make and aren't supported on every old device — so you keep H.264 around as the "everyone can play it" fallback.
 - **Bitrate = size of the size.** 1080p at 5 Mbps vs 1080p at 3 Mbps: same pixel dimensions, but the 3 Mbps one is more compressed (slightly worse looking, cheaper to deliver).
 
@@ -297,9 +295,9 @@ So Netflix picks the optimal (resolution, bitrate) rungs *per title* (even per s
 - Segments are **immutable** → cache forever (long TTL) at the CDN.
 - **Storage tiering:** hot/popular in fast storage; cold long-tail → cheaper/archival tiers. Content-addressed dedup for identical uploads.
 
-### Plain-English: two kinds of storage, and why they're separate
+### Two kinds of storage, and why they're separate
 
-**Analogy: a library.** The **books themselves** (heavy, bulky) sit on warehouse shelves (blob/object store). A small **card catalog** (title, author, shelf number) sits at the front desk (the database). You never stuff the books into the card catalog — you'd never find anything and it'd be huge.
+Keep the bulky video bytes in a blob/object store, and keep the small facts about each video (title, owner, status, view count) in a database. You never put the media bytes in the database — it would be enormous and impossible to query.
 
 | Thing | Where it lives | Why |
 | --- | --- | --- |
@@ -348,9 +346,9 @@ Startup: fetch a low rung first (fast start) → ramp up as buffer fills
 - Enables **seek** (jump to a segment), **resume** (start at saved position), and **rebuffer-free** playback.
 - ABR logic lives in the **player** (client-side) using throughput + buffer heuristics (sometimes ML).
 
-### Plain-English: the manifest is a menu; the player is a smart shopper
+### The manifest and the player's ABR loop
 
-**Analogy: ordering food by the plate.** Instead of one giant buffet delivered at once, you order **small dishes one at a time**. First you read the **menu** (the *manifest*) — it lists every dish (segment) available in each size (quality). Then you order the next dish in the size you can currently stomach, taste how fast it's coming, and adjust your next order up or down.
+Instead of one giant file, the video is delivered as **small segments requested one at a time**. The player first downloads the **manifest**, which lists every segment available in each quality. It then requests the next segment at the quality its network can currently sustain, measures how fast it arrives, and adjusts the next request up or down.
 
 - **Manifest** = a text file listing the segment URLs for each quality. The player downloads it first. Two flavors: HLS `.m3u8` and DASH `.mpd`.
 - **The player is in charge** (ABR = Adaptive BitRate). It watches two things every few seconds — how fast segments are arriving (**throughput**) and how much video it has buffered ahead (**buffer level**) — and picks the quality for the *next* segment.
@@ -440,9 +438,9 @@ Only the **player** knows the *live* truth: its real download speed this second,
 - **Progress heartbeats** feed "continue watching" + analytics + view counting.
 - **Signed URLs** (expiring tokens) stop people from sharing/hotlinking segment links.
 
-### Plain-English: what happens the instant you press play
+### What happens the instant you press play
 
-**Analogy: a concert.** Before you get in, the box office checks your **ticket** (are you allowed in? — auth + entitlement). It hands you a **map** to your seat (the manifest) and a **wristband** that expires tonight (the signed URL). You then walk straight to the nearest **gate** (CDN edge), not back to the box office, and the security scanner (DRM) verifies your wristband before letting you watch.
+One call to the Playback API checks that the user is allowed to watch (auth + entitlement), then returns the manifest URL plus a short-lived signed URL and the DRM license endpoint. The player then talks directly to the nearest CDN edge for bytes and to the DRM license server for the decryption key — never back through your backend for the actual video.
 
 Step by step, with a tiny bit of code for the "one call" the player makes:
 
@@ -512,23 +510,21 @@ Edge miss       → fetch from a regional "shield" cache → else origin (blob) 
 
 > **Key point:** popularity is extremely skewed — a tiny fraction of videos drive most views. Cache/pre-position those at the edge and the origin barely gets touched.
 
-### Plain-English: a CDN is a chain of nearby fridges
+### How a CDN delivers bytes (edge → shield → origin)
 
-**Analogy: buying milk.** You don't drive to the dairy farm (the **origin**) every time you want milk. There's a corner shop 2 minutes away (an **edge** cache). If the corner shop is out, it restocks from a regional distributor (the **shield/regional** cache), which restocks from the farm. Almost every purchase is served by the corner shop — the farm rarely gets a direct visit.
-
-A **CDN (Content Delivery Network)** is exactly that for video bytes: thousands of servers (edges) placed physically close to users worldwide, each holding copies of popular segments.
+A **CDN (Content Delivery Network)** is a layer of caches between the viewer and the origin: thousands of edge servers placed physically close to users worldwide, each holding copies of popular segments, backed by a regional shield tier, backed by the origin. A request is almost always served by the nearby edge; the origin is touched rarely, only on cache misses.
 
 ```
 you press play
       │
       ▼
-nearest edge (corner shop)  ── HIT? ──► serve segment instantly  (this is >95% of the time)
+nearest edge cache          ── HIT? ──► serve segment instantly  (this is >95% of the time)
       │ MISS
       ▼
 regional "shield" cache     ── HIT? ──► serve + copy back to the edge
       │ MISS
       ▼
-origin (blob store, the farm) ─────────► serve + copy back up the chain
+origin (blob store)         ─────────► serve + copy back up the chain
 ```
 
 - **How you reach the *nearest* edge:** **GeoDNS / Anycast**. When your player looks up the video hostname, the network answers with the IP of the edge closest to you (by geography/latency). Same URL, different nearby server depending on where you are.
@@ -564,9 +560,9 @@ Player must present a valid device DRM → license server checks entitlement →
 No valid license → segments are useless (encrypted). Keys never live in the manifest.
 ```
 
-### Plain-English: DRM is a locked box + a separate key
+### DRM: encrypted segments + a separate key
 
-**Analogy: a hotel safe.** The video segments are locked inside a safe (**encrypted with AES**). Even if a thief copies the entire safe (downloads all the segments), it's useless without the combination. The **combination (decryption key)** is handed out separately, only after the front desk verifies you're a paying guest (**entitlement**), and only to the room's own secure lock (**hardware-backed decryption**), never written on the door.
+The segments are **encrypted with AES**. Even if someone downloads all of them, they're useless without the **decryption key**, which is issued separately — only after the license server verifies the user is entitled, and only into the device's secure hardware module. The key never appears in the manifest or plain network traffic.
 
 - **Encryption at rest:** segments are stored and served scrambled. Downloading them yields garbage without the key.
 - **License server:** after the entitlement check (§8), it issues the **decryption key** to the player's *secure* module. The key **never** appears in the manifest or plain network traffic.
@@ -610,9 +606,9 @@ Live: broadcaster → RTMP ingest → real-time transcode → package (short seg
 
 - Live trades some quality/efficiency for **latency**; segments are tiny + pushed early.
 
-### Plain-English: cooking to order vs a pre-made menu
+### Live vs VOD: the time-pressure difference
 
-**Analogy: a bakery.** **VOD** (video-on-demand) is like selling *pre-baked* bread — you bake everything in advance (transcode the whole file offline), stack it on shelves (cache it), and hand it over instantly. **Live** is like a chef cooking *to order* while customers watch — the food (video) is being made *right now*, second by second, and it has to reach the table hot and fast; you can't pre-bake tomorrow's game.
+**VOD** (video-on-demand) transcodes the whole file offline, ahead of time, caches every rendition, and serves it instantly. **Live** has to transcode the stream *as it arrives*, second by second, and push it out fast — you can't pre-encode content that's still being recorded.
 
 The core difference is **time pressure**:
 
@@ -641,11 +637,9 @@ Even in a live stream, recent segments are kept around so viewers can **pause/re
 - **Recommendations** = ML (watch history, similarity, trending, per-user models) → candidate generation → ranking → cache. Netflix optimizes for **retention**; YouTube for **engagement/watch-time**. Treat the model as a black box; emphasize the pipeline + caching.
 - **Continue watching / watchlist** from progress heartbeats.
 
-### Plain-English: the "small brain" beside the video pipeline
+### Metadata, search, and recommendations
 
 Everything so far was about *pixels*. This section is the **text-and-facts** side: titles, descriptions, search, "you might also like." It's a normal web-app problem bolted onto the media system, and it's *tiny* in data compared to the video bytes.
-
-**Analogy: a library's front desk + catalog.** The metadata service is the card catalog; search is the librarian who finds books by keyword; recommendations are the "readers who liked X also liked Y" shelf.
 
 - **Metadata service** — small facts (title, tags, cast, duration). Stored in a DB, then **heavily cached** because it's read constantly and rarely changes.
 - **Search** — you can't ask a normal DB "find videos with 'cooking' in the title/tags, filtered by language, sorted by relevance" efficiently. A **search engine (Elasticsearch)** builds an inverted index for that. It's kept in sync with the catalog via **CDC** (Change Data Capture — when the DB changes, the change flows to the search index).
@@ -675,9 +669,9 @@ Playback heartbeats → Kafka → stream aggregator → per-video counters (OLAP
 - **Approximate for display** (fast, cached), **exact for monetization** (batch reconciliation from raw events) — Lambda-style.
 - Likes/subscriptions similarly **async-aggregated**; approximate cached counts are fine.
 
-### Plain-English: counting views is the same trick as ad clicks
+### Counting views is the same pattern as ad clicks
 
-**Analogy: a stadium turnstile count.** You don't keep a list of every person's name; you keep a **tally** that goes up as people enter. And you have a rule for what "counts" as entering (walked all the way through, not just poked their head in). Views work the same way — this is the **exact same pattern as [ad-click aggregation](ad-click-aggregation-system-design.md)**: don't store one row per play and recount; **pre-aggregate a running count** as heartbeats stream in.
+Don't store one row per play and recount — keep a **running counter** that increments as heartbeats stream in, with a rule for what qualifies as a "view" (watched past some threshold, not an accidental play). This is the **exact same pattern as [ad-click aggregation](ad-click-aggregation-system-design.md)**: pre-aggregate the count instead of scanning raw events on every read.
 
 ```
 playback heartbeats → Kafka (append-only log) → stream aggregator (counts per video)
@@ -749,9 +743,9 @@ CREATE TABLE playlist_items ( playlist_id BIGINT, video_id BIGINT, position INT,
 
 > **Tables to consider:** videos, video_renditions, transcoding_jobs, users, channels, subscriptions, watch_history, comments, likes, playlists, playlist_items, captions, entitlements/licenses (paid), search_index (ES), view aggregates (OLAP). Media bytes live in blob/CDN.
 
-### Plain-English: notice what's NOT in these tables
+### Notice what's NOT in these tables
 
-Scan the schema and the biggest thing is what's **missing**: there is **no column holding video bytes**. The `videos` table stores a `thumbnail_url` and a status; `video_renditions` stores a `manifest_url` and a `storage_path` — all just **pointers** to where the real bytes live in blob/CDN. The database is the *index card*, never the *film reel* (§6).
+Scan the schema and the biggest thing is what's **missing**: there is **no column holding video bytes**. The `videos` table stores a `thumbnail_url` and a status; `video_renditions` stores a `manifest_url` and a `storage_path` — all just **pointers** to where the real bytes live in blob/CDN. The database stores pointers, never the video bytes themselves (§6).
 
 Walking the key tables in plain terms:
 

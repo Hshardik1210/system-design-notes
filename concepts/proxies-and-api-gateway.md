@@ -2,7 +2,7 @@
 
 > **In one line:** **Forward proxy** protects the *client*, **reverse proxy** protects the *server*, **API gateway** = reverse proxy + brains 🧠.
 
-> **How to read this doc:** each section gives the dense summary first, then a **Plain-English** deep dive (a concrete analogy, a small annotated config/example, and the exact confusions beginners hit). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** each section gives the dense summary first, then a **deep dive** (an annotated config/example and the exact confusions beginners hit). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -50,19 +50,17 @@ Client → Forward Proxy → Internet (Server)
 
 > **Mental model:** *"Client says: please fetch this for me."*
 
-### Plain-English: Forward Proxy
+### Forward Proxy in detail
 
-**Analogy: a personal assistant who makes calls FOR you.**
+A forward proxy makes outbound requests **on behalf of the client**. Instead of connecting to the internet directly, the client sends its request to the proxy, and the proxy makes the request to the destination. The destination sees the **proxy's** IP, not the client's. The proxy can also block certain destinations (e.g. a company policy denylist) and cache responses so repeated requests don't re-fetch.
 
-You (the client) don't call the outside world directly. You hand the request to your assistant (the forward proxy), and *they* make the call on your behalf. The person on the other end sees the **assistant's** name and number, not yours. The assistant can also refuse to place certain calls ("company policy says no gambling sites"), and can remember answers so they don't have to ask twice (caching).
-
-So a forward proxy sits **on your side**, faces **outward**, and is something **you (or your network) chose to route through**.
+So a forward proxy sits **on the client's side**, faces **outward**, and is something **the client (or its network) chose to route through**.
 
 ```
-You  →  Assistant (forward proxy)  →  Outside world
-        ^ speaks for YOU
-        ^ hides who you are
-        ^ can block / cache / log your outgoing requests
+Client  →  Forward proxy  →  Outside world
+           ^ acts for the CLIENT
+           ^ hides the client's identity
+           ^ can block / cache / log outgoing requests
 ```
 
 **A concrete config — a browser told to route through a company proxy:**
@@ -112,17 +110,15 @@ Client → Reverse Proxy → Backend Servers
 
 > **Mental model:** *"Server says: talk to me through this gateway."*
 
-### Plain-English: Reverse Proxy
+### Reverse Proxy in detail
 
-**Analogy: a receptionist who routes callers TO the right desk.**
-
-Now flip the direction. Visitors (clients) arrive at a big office building. They don't wander the halls hunting for the right person — they talk to the **receptionist at the front desk** (the reverse proxy). The receptionist decides which desk to send each visitor to, can turn away troublemakers, and never reveals the building's internal layout (which floor, which room). Every visitor thinks they're "talking to the company," but really they're talking to the front desk, which quietly forwards them.
+A reverse proxy is the reverse direction: it sits in front of the backend servers and accepts requests **on their behalf**. Clients connect to the reverse proxy as if it were the server; it decides which backend handles each request, can reject bad traffic, and never exposes the internal layout (how many servers there are or where they live). Clients think they're "talking to the server," but they're really talking to the reverse proxy, which forwards the request inward.
 
 So a reverse proxy sits **on the server's side**, faces **inward**, and is something the **server owner** set up. Clients don't even know it's there.
 
 ```
-Many clients  →  Receptionist (reverse proxy)  →  the right backend server
-                 ^ speaks for the SERVERS
+Many clients  →  Reverse proxy  →  the right backend server
+                 ^ acts for the SERVERS
                  ^ hides how many servers there are / where they live
                  ^ can load-balance, cache, terminate SSL, block bad traffic
 ```
@@ -152,7 +148,7 @@ server {
 }
 ```
 
-The client only ever sees `api.myapp.com` (the front desk). It has no idea there are three servers behind it, or that they run plain HTTP internally. Add a fourth server to the `upstream` block and clients notice nothing.
+The client only ever sees `api.myapp.com` (the reverse proxy). It has no idea there are three servers behind it, or that they run plain HTTP internally. Add a fourth server to the `upstream` block and clients notice nothing.
 
 #### Q: How is this different from a forward proxy — they're both "a proxy"?
 
@@ -196,19 +192,17 @@ Client → API Gateway → Microservices
 
 > **Mental model:** *"Smart entry point for all APIs."*
 
-### Plain-English: API Gateway
+### API Gateway in detail
 
-**Analogy: a *smart* receptionist who checks your ID, decides where to send you, and combines errands.**
+A plain reverse proxy just forwards a request to the right backend. An **API gateway** is a reverse proxy that also handles API-management concerns:
 
-A plain reverse proxy is a receptionist who just points you to the right desk. An **API gateway** is that same receptionist after a promotion — now they also:
+- **Authentication** — reject requests without a valid token before they reach any backend.
+- **Rate limiting** — cap how often each client can call, so one client can't overload the backends.
+- **Routing** — read the request path and send it to the right service — `/orders` to the Order service, `/payments` to the Payment service.
+- **Aggregation** — call several backend services and combine the results into one response, instead of the client making several calls itself.
+- **Request transformation** — reshape the request/response into the format each backend expects.
 
-- **Check your ID at the door** (authentication) — no valid badge, no entry.
-- **Enforce a "one question per minute" rule** (rate limiting) — so one loud visitor can't hog the whole desk.
-- **Read the sign on your form and send you to the right department** (routing) — `/orders` to the Order team, `/payments` to the Payments team.
-- **Run several errands for you and hand back one combined answer** (aggregation) — instead of you visiting three desks yourself.
-- **Translate your form into the format each department expects** (request transformation).
-
-So: **API Gateway = reverse proxy + a brain that handles cross-cutting concerns (auth, limits, routing, shaping) in one place**, so every backend service doesn't have to re-implement them.
+So: **API Gateway = reverse proxy + a layer that handles cross-cutting concerns (auth, limits, routing, shaping) in one place**, so every backend service doesn't have to re-implement them.
 
 **A concrete config — a gateway route with auth + rate limit + routing (Kong-style):**
 
@@ -259,15 +253,15 @@ A phone app's home screen might need the user's profile, their recent orders, an
 | Main job | Control outgoing requests | Route incoming traffic | Manage APIs |
 | Intelligence | Low | Medium | High |
 
-### Real-world analogy
+### One-line summary
 
-| Component | Analogy |
+| Component | In one line |
 | --- | --- |
-| **Forward Proxy** | You ask a friend to buy something *for you* |
-| **Reverse Proxy** | A reception desk directing visitors to the right room |
-| **API Gateway** | A smart receptionist who checks ID, decides where to send you, combines requests, and limits access |
+| **Forward Proxy** | Makes outbound requests on behalf of the client, hiding the client |
+| **Reverse Proxy** | Accepts inbound requests on behalf of the servers, hiding the backends |
+| **API Gateway** | A reverse proxy that also does auth, rate limiting, routing, and aggregation |
 
-### Plain-English: sorting out the confusions
+### Sorting out the confusions
 
 All three are "a middleman that forwards requests," which is exactly why they blur together. The trick is to always ask **two questions: (1) which side is it on? (2) how much thinking does it do?**
 
@@ -279,7 +273,7 @@ API gateway     →  SERVER side,  faces in,    hides the CALLEES, HIGH intellig
 
 #### Q: Forward vs reverse proxy — the one-sentence tell?
 
-**A forward proxy speaks for the *client* (an assistant making calls for you); a reverse proxy speaks for the *servers* (a receptionist routing callers to the right desk).** Same technology, opposite side of the conversation. If *you* set it up to reach the outside world → forward. If the *site owner* set it up so you can reach their servers → reverse.
+**A forward proxy acts for the *client* (making outbound requests on its behalf); a reverse proxy acts for the *servers* (accepting inbound requests and routing them to the right backend).** Same technology, opposite side of the conversation. If *you* set it up to reach the outside world → forward. If the *site owner* set it up so you can reach their servers → reverse.
 
 #### Q: Is an API gateway a reverse proxy, or something totally different?
 
@@ -341,33 +335,33 @@ No. A normal mobile app usually has **no forward proxy** at all (that's mostly c
 
 > **Real-world (Netflix-like):** `User → ISP Proxy → API Gateway → Nginx → Microservices`
 
-### Plain-English: follow one request on its journey
+### Follow one request on its journey
 
-Trace a single tap in a food-delivery app — "show my orders" — through all the boxes, with each middleman playing its analogy role:
+Trace a single request — "show my orders" — through all the boxes, with each middleman's job:
 
 ```
-📱 You tap "My Orders"
+📱 Client requests "My Orders"
    │
    │  (only if on a corporate/VPN network)
    ▼
-🧑‍💼 Forward proxy — YOUR assistant. Makes the outbound call for you, hides your IP.
-   │  Most home/mobile users skip this entirely.
+Forward proxy — makes the outbound request for the client, hides its IP.
+   │  Most home/mobile clients skip this entirely.
    ▼
-🧠 API Gateway — the smart receptionist at the company's front door:
-   │   1. Checks your ID (JWT valid? else 401 rejected right here)
-   │   2. Checks you're not spamming (rate limit ok?)
+API Gateway — the main entry point:
+   │   1. Validates the token (JWT valid? else 401 rejected right here)
+   │   2. Checks the rate limit (client not over its quota?)
    │   3. Reads the path /api/orders → route to the Order service
    ▼
-🛎️ Reverse proxy / load balancer — the desk clerk: picks ONE healthy
+Reverse proxy / load balancer — picks ONE healthy
    │   Order-service instance out of many, decrypts SSL, forwards inward.
    ▼
-📦 Order Service → its DB → returns your orders
+📦 Order Service → its DB → returns the orders
    │
    ▼
-   response travels back out the same chain to your phone
+   response travels back out the same chain to the client
 ```
 
-**Reading it in plain words:** your assistant (optional) places the call → the smart receptionist checks your badge, makes sure you're not hammering the desk, and decides which department you need → the desk clerk picks a specific free worker in that department → the worker does the actual job. On the way back, the answer retraces the path to you.
+**In words:** the forward proxy (optional) makes the outbound request → the API gateway validates the token, enforces the rate limit, and decides which service the path maps to → the reverse proxy / load balancer picks a specific healthy instance of that service → the service does the actual work. On the way back, the response retraces the path to the client.
 
 #### Q: The diagram shows gateway *then* reverse proxy — but a gateway *is* a reverse proxy. Isn't that double?
 
@@ -375,7 +369,7 @@ It can be, and that's fine — they play different roles here. The **gateway** f
 
 #### Q: If the gateway already routes, what's left for the reverse proxy to route?
 
-Different granularity. The **gateway** routes by **what you're asking for** (`/api/orders` → the Order *service*). The **reverse proxy / load balancer** then routes among the **identical copies** of that service (Order instance #1 vs #2 vs #3) to balance load and skip unhealthy ones. Gateway = *which team*; load balancer = *which teammate*.
+Different granularity. The **gateway** routes by **what's being requested** (`/api/orders` → the Order *service*). The **reverse proxy / load balancer** then routes among the **identical instances** of that service (Order instance #1 vs #2 vs #3) to balance load and skip unhealthy ones. Gateway = *which service*; load balancer = *which instance*.
 
 ---
 

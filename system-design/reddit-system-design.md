@@ -2,7 +2,7 @@
 
 > **Core challenge:** communities (subreddits) of **posts** and deeply **nested comments**, ranked **feeds** ("hot"/"top"/"new"/"best"), **voting at massive scale**, and personalized home feeds — a **read-heavy** system where **ranking**, **feed generation**, and **vote aggregation** dominate.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java/pseudocode, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java/pseudocode and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -35,9 +35,9 @@ User joins subreddits → posts + votes + comments → home feed = ranked merge 
 
 Read-heavy content platform. The interesting parts: **how the feed is built** (fan-out), **how content is ranked** (hot/top/best), and **vote throughput** (aggregate async, never recount on read).
 
-### Plain-English: what are we even building?
+### What are we even building?
 
-Picture Reddit as a giant set of **notice boards in a community hall.** Each board is a **subreddit** (`r/cooking`, `r/soccer`). People pin **posts** on a board, others scribble **comments** underneath (and comments under comments — deeply nested), and everyone slaps an **upvote** or **downvote** sticker on the stuff they like or hate.
+Reddit is a large set of communities called **subreddits** (`r/cooking`, `r/soccer`). Users create **posts** in a subreddit, others add **comments** underneath (and comments under comments — deeply nested), and everyone can **upvote** or **downvote** posts and comments.
 
 The whole product is really three jobs:
 
@@ -45,13 +45,13 @@ The whole product is really three jobs:
 2. **Feed generation** — your **home feed** is a blended board made of the top posts from *all the boards you follow*. How do we build that per-user mix cheaply for 50M people? (see §5).
 3. **Voting** — millions of stickers slapped per second. Counting them live on every page-load would melt the database, so we count them **in the background** (see §7).
 
-### Plain-English: why "read-heavy" changes everything
+### Why "read-heavy" changes everything
 
 For every 1 person who **writes** (posts/comments/votes), ~100 people just **scroll and read**. So the entire design optimizes the **read path**:
 
 > **Do the expensive work once, ahead of time, and cache the answer — so a read is just "hand back the pre-made list."**
 
-Analogy: a newspaper doesn't re-typeset the front page every time a reader opens it. Editors decide the layout **once**, print thousands of identical copies, and each reader just grabs one. Reddit does the same — it **precomputes** each subreddit's ranked list once and shares it with everyone, instead of re-ranking per visitor. This one idea (precompute + cache, never recompute on read) drives §5, §6, and §7.
+The same subreddit ranked list is served to every visitor, so Reddit **precomputes** it once and shares it, instead of re-ranking per visitor. This one idea (precompute + cache, never recompute on read) drives §5, §6, and §7.
 
 ---
 
@@ -98,20 +98,20 @@ Client → API Gateway
 
 - **CQRS:** read path = precomputed/cached feeds; write path = posts/comments/votes stores. Ranking is a **periodic job**, not per-request.
 
-### Plain-English: the services as a team of specialists
+### The services and their jobs
 
-Don't picture one giant program. Picture a **team where each person has one job**, and they leave notes for each other on a shared bulletin board (**Kafka**) instead of interrupting each other:
+Rather than one giant program, each service has one job, and they communicate through a shared event log (**Kafka**) instead of calling each other directly:
 
-| Service | Real-world analogy | Its one job |
-| --- | --- | --- |
-| **API Gateway** | The front desk / receptionist | Takes every request, routes it to the right specialist |
-| **Post Service** | The librarian | Stores & fetches posts |
-| **Comment Service** | The archivist of threaded replies | Stores the comment tree, fetches subtrees |
-| **Vote Service** | The ballot box | Records "one vote per person," emits an event |
-| **Feed Service** | The newspaper editor | Builds & serves the ranked lists people actually read |
-| **Search / Moderation** | Search desk / the janitors | Find things; remove bad things |
+| Service | Its one job |
+| --- | --- |
+| **API Gateway** | Takes every request, routes it to the right service |
+| **Post Service** | Stores & fetches posts |
+| **Comment Service** | Stores the comment tree, fetches subtrees |
+| **Vote Service** | Records "one vote per person," emits an event |
+| **Feed Service** | Builds & serves the ranked lists people actually read |
+| **Search / Moderation** | Find things; remove bad things |
 
-**Kafka = the shared bulletin board.** When something happens ("a vote was cast", "a post was created"), the service that did it **pins a note** on Kafka and immediately moves on. Other services (aggregators, ranking jobs, search indexers) read those notes **later, at their own pace.** Nobody waits on anybody.
+**Kafka = the shared event log.** When something happens ("a vote was cast", "a post was created"), the service that did it **publishes an event** to Kafka and immediately moves on. Other services (aggregators, ranking jobs, search indexers) consume those events **later, at their own pace.** Nobody waits on anybody.
 
 #### Q: What is CQRS and why split "read" from "write"?
 
@@ -120,7 +120,7 @@ CQRS = **Command Query Responsibility Segregation** — a fancy way of saying **
 - **Write path (Command):** you cast a vote / make a post. Goes to the "source of truth" databases. Careful, correct, but not built for millions of readers.
 - **Read path (Query):** you scroll your feed. Served from **precomputed, cached lists** (Redis), never by re-querying and re-ranking the raw tables.
 
-Analogy: a restaurant **kitchen** (write side: raw ingredients, cooking) is separate from the **buffet counter** (read side: ready-to-grab dishes). Diners take from the buffet (fast); they never walk into the kitchen and cook their own plate. The ranking job is the chef **restocking the buffet on a schedule** — see §6.
+The write side stores the raw source-of-truth data; the read side serves precomputed results built from it. Reads never touch the write-side tables directly. The ranking job rebuilds the read-side lists on a schedule — see §6.
 
 ---
 
@@ -136,7 +136,7 @@ Two feeds: a **subreddit feed** and a **personalized home feed** (merge of subsc
 
 > **Reddit-style (the key insight):** unlike Twitter (per-user push), Reddit precomputes a **per-subreddit ranked hot list** that is **shared by all subscribers** — so a huge sub is computed **once**, not fanned out to millions. The home feed **merges** the user's subscribed subs' cached lists + caches the result. This sidesteps the celebrity/huge-sub write-amplification problem. (See [Fan-Out / Fan-In](../concepts/fan-out-fan-in.md).)
 
-### Plain-English: "fan-out" and why the Reddit trick is clever
+### "Fan-out" and why the Reddit approach is clever
 
 **"Fan-out"** just means: when one thing happens, how many places do we have to go update? Two extremes:
 
@@ -149,9 +149,9 @@ Two feeds: a **subreddit feed** and a **personalized home feed** (merge of subsc
 r/soccer's hot list  ──►  computed ONCE  ──►  cached  ──►  read by ALL 30M subscribers
 ```
 
-Analogy: `r/soccer` is a **newspaper**. The editor lays out the "top stories" page **once** and prints identical copies. It would be insane to hand-write a personalized front page for each of 30M readers (that's push). It's also wasteful to make each reader re-rank all the stories themselves at the newsstand (that's pull). Print once, share the copy.
+`r/soccer`'s hot list is identical for everyone, so it's ranked **once** and the result is shared. Rebuilding a personalized ranked list for each of 30M subscribers would be push; making each reader re-rank all posts on every visit would be pull. Computing once and sharing the result beats both.
 
-Your **home feed** is then just a **"custom bundle of newspapers"**: grab the top slice of each subreddit you follow, merge-and-rank those slices, and cache the little merged result for you.
+Your **home feed** is then just a per-user merge: grab the top slice of each subreddit you follow, merge-and-rank those slices, and cache the small merged result.
 
 ```java
 // HOME FEED = merge the already-cached per-sub hot lists (cheap!)
@@ -212,7 +212,7 @@ hot = log10(max(|ups − downs|, 1)) × sign(ups − downs) + (epoch_seconds −
 
 - **Wilson score** (for comments): the lower bound of a confidence interval on the upvote ratio → a comment with 5/5 upvotes doesn't outrank 900/1000 (accounts for sample size). Better than raw `ups − downs` or ratio.
 
-### Plain-English: decoding the "hot" formula
+### Decoding the "hot" formula
 
 The scary formula is really just **two ideas added together**: "how liked is it?" **plus** "how fresh is it?"
 
@@ -223,7 +223,7 @@ hot = log10(max(|ups − downs|, 1)) × sign(ups − downs)   +   (epoch_seconds
 
 **Part 1 — Popularity, but with diminishing returns (`log10`).**
 
-`log10` compresses big numbers. Think of it like **volume knobs**, not a straight line:
+`log10` compresses big numbers — each additional point needs 10× more votes than the last, rather than growing linearly:
 
 | Net votes | `log10` | What it means |
 | --- | --- | --- |
@@ -259,12 +259,12 @@ double hot(long ups, long downs, Instant createdAt) {
 
 #### Q: "Top" vs "Hot" vs "Best" — when do I use which?
 
-| Sort | Plain meaning | Analogy |
-| --- | --- | --- |
-| **Hot** | popular *right now* (votes + freshness) | the "trending" shelf |
-| **New** | newest first, ignore votes | a live feed, chronological |
-| **Top** | most votes in a time window (day/week/all) | "hall of fame for this week" |
-| **Best** (comments) | high approval, *adjusted for how few votes it has* | a movie rated 5/5 by 3 people vs 4.6/5 by 10,000 |
+| Sort | Plain meaning |
+| --- | --- |
+| **Hot** | popular *right now* (votes + freshness) |
+| **New** | newest first, ignore votes |
+| **Top** | most votes in a time window (day/week/all) |
+| **Best** (comments) | high approval, *adjusted for how few votes it has* (5/5 from 3 people shouldn't beat 4.6/5 from 10,000) |
 
 #### Q: What is the "Wilson score" for comments, in plain terms?
 
@@ -303,7 +303,7 @@ vote(user, target, +1/-1):
 - **Vote fuzzing** (Reddit does this) — displayed counts are slightly randomized to deter vote-manipulation bots.
 - Cache scores in Redis; ranking jobs refresh per-sub hot lists on an interval.
 
-### Plain-English: why we never count votes on the read path
+### Why we never count votes on the read path
 
 Naive idea: to show a post's score, `SELECT COUNT(*) FROM votes WHERE target = post AND value = +1`. On a viral post with **2 million votes**, that counts 2M rows — **every single time anyone loads the page**. Thousands of people are loading it at once. The database dies.
 
@@ -313,7 +313,7 @@ Naive idea: to show a post's score, `SELECT COUNT(*) FROM votes WHERE target = p
 2. **In the background (async):** a worker reads the notes and nudges a stored **counter** up or down.
 3. **On read:** just read the **already-stored counter.** No counting, ever.
 
-Analogy: an election. You don't recount all ballots every time a reporter asks for the tally. Each vote drops in the box (step 1); counters tally in the back room (step 2); reporters read the posted number (step 3).
+This is how a running total works: you don't re-sum every vote on each request. Each vote is recorded (step 1); a background process maintains the totals (step 2); reads return the stored total (step 3).
 
 ```java
 // STEP 1 — casting a vote. Fast, tiny, touches ONE row. No totals computed here.
@@ -329,7 +329,7 @@ void castVote(long userId, String targetType, long targetId, int value) {  // va
     //            flip +1 to -1        → delta = -2   (remove the up, add the down)
     //            re-click same vote   → delta =  0   (no change)
 
-    // pin a note on Kafka and RETURN immediately. We do NOT update counts here.
+    // publish to Kafka and RETURN immediately. We do NOT update counts here.
     kafka.send("VOTE_CAST", new VoteEvent(targetType, targetId, delta, value, previous));
 }
 ```
@@ -357,7 +357,7 @@ long displayScore(long targetId) {
 
 #### Q: "Adjust by delta" — why not just recompute the total?
 
-Because recomputing means counting millions of rows again. **Delta = only the change caused by THIS vote.** A new upvote is `+1`; flipping your upvote to a downvote is `-2` (you remove one up *and* add one down). We only ever *nudge* the running counter, like a scoreboard operator pressing "+1", never re-tallying the crowd.
+Because recomputing means counting millions of rows again. **Delta = only the change caused by THIS vote.** A new upvote is `+1`; flipping your upvote to a downvote is `-2` (you remove one up *and* add one down). We only ever *nudge* the running counter by the delta, never re-tally all votes.
 
 #### Q: Isn't the displayed count now slightly wrong / delayed?
 
@@ -383,9 +383,9 @@ Comments form a **tree** (replies to replies, arbitrarily deep). Storage options
 - **Rank siblings** by best/top/new (Wilson for best).
 - Comment counts + scores aggregated async like votes.
 
-### Plain-English: storing a tree in a flat table
+### Storing a tree in a flat table
 
-A comment thread is a **family tree**: a top comment, its replies, replies-to-replies, arbitrarily deep. But a SQL table is **flat rows**. How do we fit a tree into flat rows? Three schemes:
+A comment thread is a **tree**: a top comment, its replies, replies-to-replies, arbitrarily deep. But a SQL table is **flat rows**. How do we fit a tree into flat rows? Three schemes:
 
 ```
 Comment tree we want to store:
@@ -405,7 +405,7 @@ comment_id | parent_id | body
 6          | 1         | Too salty for me
 ```
 
-Simple (just a `parent_id` pointer). Problem: to fetch the whole subtree under #1 you must walk **level by level** — "who are #1's children? → #5, #6. Who are #5's children? → #9…" That's many queries (or a fancy recursive query). Like asking "list all of Grandma's descendants" when everyone only knows their *own* parent.
+Simple (just a `parent_id` pointer). Problem: to fetch the whole subtree under #1 you must walk **level by level** — "who are #1's children? → #5, #6. Who are #5's children? → #9…" That's many queries (or a recursive query), because each row only knows its own parent.
 
 **Option B — Materialized path: each comment stores its FULL address (the winner ✅).**
 
@@ -417,7 +417,7 @@ comment_id | path    | body
 6          | 1/6     | Too salty for me
 ```
 
-The `path` is like a **file-system folder path** (`/1/5/9`) or a book's section number (`3.2.1`). To get everything under comment #1, you don't recurse — you just do a **prefix match**:
+The `path` encodes the full ancestry (`1/5/9`), like a file-system path. To get everything under comment #1, you don't recurse — you just do a **prefix match**:
 
 ```sql
 SELECT * FROM comments
@@ -447,7 +447,7 @@ List<Comment> loadSubtree(long postId, String rootPath) {
 
 #### Q: Why "lazy-load" — why not just fetch the whole tree?
 
-A popular post can have **50,000 comments** nested 20 levels deep. Loading and rendering all of it would be huge and slow, and you'd never read most of it. So Reddit loads only the **top-level comments + a couple levels**, each collapsed with a **"load more replies (137)"** button. You fetch deeper branches **only when a user clicks** — like expanding folders in a file explorer one at a time instead of opening every folder at once.
+A popular post can have **50,000 comments** nested 20 levels deep. Loading and rendering all of it would be huge and slow, and you'd never read most of it. So Reddit loads only the **top-level comments + a couple levels**, each collapsed with a **"load more replies (137)"** button. You fetch deeper branches **only when a user clicks**, instead of loading the entire tree upfront.
 
 ```java
 // Initial load: top-level comments, ranked by "best", capped depth. Cheap.
@@ -466,7 +466,7 @@ List<Comment> loadMore(long postId, String parentPath) {  // parentPath = "1/5"
 #### Q: How are sibling comments ordered, and what happens when one is deleted?
 
 - **Siblings** (comments at the same level) are ranked by **best** (Wilson score, §6), or top/new if you switch sorts.
-- **Deleting** a comment that has replies uses a **tombstone**: the body becomes `[deleted]` but the **row (and its `path`) stays**, so the replies underneath don't become orphans and the tree structure survives. Like whiting-out a name on a family tree without erasing the branch.
+- **Deleting** a comment that has replies uses a **tombstone**: the body becomes `[deleted]` but the **row (and its `path`) stays**, so the replies underneath don't become orphans and the tree structure survives.
 
 ---
 
@@ -512,9 +512,9 @@ CREATE TABLE awards ( award_id BIGINT PRIMARY KEY, target_id BIGINT, giver_id BI
 
 > **Tables to consider:** users, subreddits, subscriptions, posts, comments, votes, moderation, awards, media_refs, precomputed feeds (Redis), search index (ES).
 
-### Plain-English: reading the schema like a story
+### Reading the schema
 
-Each table is just a **spreadsheet**; the design story is *which columns are precomputed and which indexes make reads fast.*
+For each table, the thing to note is *which columns are precomputed and which indexes make reads fast.*
 
 | Table | In one sentence | The clever bit |
 | --- | --- | --- |
@@ -536,14 +536,14 @@ Yes — it's **deliberate denormalization.** In a "pure" design you'd derive the
 CREATE INDEX idx_posts_sub_hot ON posts(subreddit_id, hot_rank DESC);
 ```
 
-An index is like the **tab dividers in a binder** — it keeps rows pre-sorted so the DB can jump straight to them instead of scanning everything. This one keeps each subreddit's posts **pre-sorted by `hot_rank`**, so "give me r/soccer's hottest posts" is an instant top-N read, not a sort-the-whole-sub operation. The `idx_comments_post_path` index does the same for the "fetch subtree by path prefix" query in §8.
+An index keeps rows pre-sorted so the DB can jump straight to them instead of scanning everything. This one keeps each subreddit's posts **pre-sorted by `hot_rank`**, so "give me r/soccer's hottest posts" is an instant top-N read, not a sort-the-whole-sub operation. The `idx_comments_post_path` index does the same for the "fetch subtree by path prefix" query in §8.
 
 #### Q: Why is some data in SQL but feeds/scores live in Redis?
 
 Different tools for different jobs:
 
 - **SQL (source of truth):** durable, correct, the real record of posts/comments/votes.
-- **Redis (fast serving layer):** the precomputed feeds (`feed:sub:{id}:hot` as a **sorted set**) and cached `score:{id}`. It's a "buffet counter" (§4) — rebuilt from SQL if lost, so it can be fast and slightly lossy.
+- **Redis (fast serving layer):** the precomputed feeds (`feed:sub:{id}:hot` as a **sorted set**) and cached `score:{id}`. It's a fast serving layer (§4) — rebuilt from SQL if lost, so it can be fast and slightly lossy.
 
 A Redis **sorted set** is perfect for a hot list: it keeps ids automatically ordered by a score (the `hot_rank`), so "top 100 posts" is a single fast range read.
 
@@ -624,7 +624,7 @@ User → FeedSvc:
 - **Partition** posts/comments by subreddit or time; archive cold content; shard votes by target.
 - **Eventual consistency:** vote counts / feed freshness lag briefly — acceptable.
 
-### Plain-English: where caching lives and why it saves us
+### Where caching lives and why it saves us
 
 Caching = **keep the answer close and pre-made so you don't redo work.** In this system there are a few layers of "pre-made answers," each avoiding an expensive operation:
 
@@ -634,7 +634,7 @@ Caching = **keep the answer close and pre-made so you don't redo work.** In this
 | `feed:home:{userId}` | your merged home feed (short TTL) | re-merging your subs on every scroll |
 | `score:{targetId}` | a post/comment's current score | counting millions of `votes` rows |
 
-Analogy: a coffee shop with a **pastry case up front** (cache) vs baking each croissant to order (recompute). 99% of customers grab from the case instantly; the oven (database) only runs on a schedule in the back.
+Most reads hit a pre-made cached result instantly; the database (the expensive recompute) only runs on a schedule in the background.
 
 #### Q: If feeds are cached, how do new posts/votes ever show up?
 

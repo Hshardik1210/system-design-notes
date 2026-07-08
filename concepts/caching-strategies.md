@@ -2,7 +2,7 @@
 
 > **In one line:** caching trades **freshness for speed** by keeping hot data close to the consumer. The hard parts are **which read/write pattern**, **eviction**, and **invalidation** ("the second hardest problem in CS").
 
-> **How to read this doc:** dense summary first, then a **Plain-English** deep dive. Each section starts with the compact reference (tables, pseudo-code) for quick revision, then a plain-English part with a real-world analogy, annotated code, and Q&A for the confusions that trip up beginners. Skim the summaries to review; read the Plain-English parts to actually understand.
+> **How to read this doc:** dense summary first, then a **deep dive**. Each section starts with the compact reference (tables, pseudo-code) for quick revision, then a deep dive with annotated code and Q&A for the confusions that trip up beginners. Skim the summaries to review; read the deep dives to actually understand.
 
 ---
 
@@ -38,11 +38,11 @@
 | Distributed | **Redis / Memcached** |
 | Database | query cache, buffer pool |
 
-### Plain-English: what a cache really is
+### What a cache really is
 
-**Analogy: your kitchen counter vs the grocery store.** The grocery store (the **database**) has *everything*, but it's a 20-minute drive away. Your kitchen counter (the **cache**) holds only the few things you use constantly — salt, coffee, the good knife. It's tiny, but reaching for it takes a second instead of a car trip. You don't put the *entire* store on your counter; you keep the **hot, frequently-used** stuff close and drive to the store only for the rare item.
+The **database** holds *everything*, but it's slow to reach (disk, possibly over the network). A **cache** holds only the data you access most often, in fast storage (RAM) close to whoever is asking. It's small, so you don't put the entire dataset in it — you keep the **hot, frequently-used** data there and go to the database only for the rest.
 
-That's the whole idea: a cache is a small, fast copy of the data you touch most often, sitting closer to whoever is asking for it.
+That's the whole idea: a cache is a small, fast copy of the data you touch most often, sitting closer to the consumer.
 
 ```
 without cache:   request → database (slow: disk seek, maybe over the network) → answer
@@ -50,13 +50,13 @@ with cache:      request → cache (fast: RAM)  → answer         ← "cache hi
                  request → cache MISS → database → put copy in cache → answer  ← "cache miss"
 ```
 
-- **Cache hit** = the data was on the counter. Fast.
-- **Cache miss** = you had to drive to the store (DB), then you leave a copy on the counter for next time.
+- **Cache hit** = the data was in the cache. Fast.
+- **Cache miss** = the data wasn't cached, so you read from the DB and leave a copy in the cache for next time.
 - **Hit ratio** = fraction of requests that were hits. A cache is only worth it if this is high — which is why you cache **read-heavy, expensive-to-compute, rarely-changing** data (see the one-liner above).
 
 #### Q: If RAM is so much faster, why not put *everything* in the cache?
 
-Because RAM is **small and expensive** compared to disk. Your database might hold terabytes; your Redis instance holds gigabytes. The counter can't fit the whole store. So you keep only what pays off — the data that's asked for over and over. Rarely-read data would just take up space (and get evicted anyway — see §4).
+Because RAM is **small and expensive** compared to disk. Your database might hold terabytes; your Redis instance holds gigabytes. It can't fit the whole dataset. So you keep only what pays off — the data that's asked for over and over. Rarely-read data would just take up space (and get evicted anyway — see §4).
 
 #### Q: Is a cache the same thing as a database?
 
@@ -88,12 +88,12 @@ read(key):
 - ✅ App code is simpler.
 - ❌ Needs cache provider support; still has cold-miss latency.
 
-### Plain-English: cache-aside vs read-through
+### Cache-aside vs read-through
 
-**Analogy: the assistant who fetches files.** You need a document.
+Both load data into the cache on a miss; the difference is **who owns that logic**.
 
-- **Cache-aside** = *you* do the work. You check your desk drawer (cache). If it's there, great. If not, **you** walk to the file room (DB), grab it, and **you** put a copy in your drawer for next time. The drawer doesn't know anything about the file room — *you* wire the two together.
-- **Read-through** = you have an **assistant** (the cache library). You only ever ask the assistant. If the assistant doesn't have it, *the assistant* silently walks to the file room, fetches it, keeps a copy, and hands it to you. You never talk to the file room directly.
+- **Cache-aside** = the **application** manages the cache. It checks the cache; on a miss, the app reads from the DB and writes the value back into the cache. The cache itself knows nothing about the DB — the app wires the two together.
+- **Read-through** = the **cache library** manages loading. The app only ever asks the cache; on a miss, the cache itself fetches from the DB, stores the value, and returns it. The app never talks to the DB directly.
 
 Same end result; the difference is **who owns the "on miss, load from DB" logic** — your app code (cache-aside) or the cache layer itself (read-through).
 
@@ -101,10 +101,10 @@ Cache-aside, annotated:
 
 ```java
 Object read(String key) {
-    Object v = cache.get(key);          // 1. check the drawer
+    Object v = cache.get(key);          // 1. check the cache
     if (v == null) {                    // 2. cache MISS
-        v = db.get(key);                //    walk to the file room (DB)
-        cache.set(key, v, TTL_SECONDS); //    leave a copy in the drawer, with an expiry (TTL)
+        v = db.get(key);                //    read from the DB
+        cache.set(key, v, TTL_SECONDS); //    store a copy in the cache, with an expiry (TTL)
     }
     return v;                           // 3. hit or freshly-loaded → return it
 }
@@ -116,7 +116,7 @@ Read-through — notice your app never mentions the DB:
 Object read(String key) {
     // the cache library is configured with a "loader" that knows how to fetch from the DB.
     // on a miss it calls that loader itself, stores the result, and returns it.
-    return cache.get(key);   // that's it — the assistant handles the miss internally
+    return cache.get(key);   // that's it — the cache library handles the miss internally
 }
 ```
 
@@ -171,20 +171,20 @@ write(key, v):
 | Write-back | cache → async DB | weak (until flush) | data loss |
 | Write-around | DB only | strong | read miss after write |
 
-### Plain-English: the three ways to handle a write
+### The three ways to handle a write
 
-**Analogy: writing an important note.** You keep a **sticky note on your monitor** (cache) and a **permanent logbook in the safe** (DB). When something changes, where do you write it?
+When data changes, where do you write it — the cache, the DB, or both?
 
-- **Write-through** = write the sticky note **and** the logbook, right now, before moving on. Both always agree. Slower (two writes every time), but nothing is ever out of sync, and you never lose the note.
-- **Write-back (write-behind)** = write only the sticky note now, and promise to copy it into the logbook **later** (batched). Super fast — but if the office burns down (cache crashes) before you copy it over, that note is **gone forever**.
-- **Write-around** = skip the sticky note entirely; write straight into the logbook (DB). The sticky note only gets filled in later, the next time you happen to *read* that item. Good for data you write once and rarely read back.
+- **Write-through** = write the cache **and** the DB synchronously, before returning. Both always agree. Slower (two writes every time), but nothing is ever out of sync, and you never lose the write.
+- **Write-back (write-behind)** = write only the cache now, and flush to the DB **later** (batched). Very fast — but if the cache crashes before the flush, that write is **lost**.
+- **Write-around** = skip the cache entirely; write straight to the DB. The cache is only populated later, the next time that item is *read*. Good for data you write once and rarely read back.
 
 Write-through, annotated:
 
 ```java
 void write(String key, Object v) {
-    cache.set(key, v);   // 1. update the sticky note (cache)
-    db.set(key, v);      // 2. update the logbook (DB) — SYNCHRONOUSLY, before returning
+    cache.set(key, v);   // 1. update the cache
+    db.set(key, v);      // 2. update the DB — SYNCHRONOUSLY, before returning
     // both are now consistent; caller waited for both
 }
 ```
@@ -243,9 +243,9 @@ Not necessarily — write-through keeps the cache **consistent**, but it caches 
 
 > Redis supports `maxmemory-policy` (e.g. `allkeys-lru`, `volatile-lru`).
 
-### Plain-English: eviction vs expiry (they're different!)
+### Eviction vs expiry (they're different!)
 
-**Analogy: the crowded fridge.** Your fridge (cache) is full and you just bought more food. Something has to come out to make room. **Eviction** = "the fridge is full, kick something out **now** to fit the new item." That's a *space* problem. **Expiry (TTL)** = "this milk has a use-by date; toss it once it's past, full fridge or not." That's a *time* problem. They often work together but solve different things.
+The cache is full and a new item needs to go in. Something has to be removed. **Eviction** = "the cache is full, remove something **now** to fit the new item." That's a *space* problem. **Expiry (TTL)** = "this entry has a time limit; remove it once it's past, full cache or not." That's a *time* problem. They often work together but solve different things.
 
 - **Eviction policy** answers: *when I'm out of room, WHICH item do I remove?*
 - **TTL** answers: *how long is any item allowed to live before it's considered stale?*
@@ -291,26 +291,26 @@ Ways to keep cache from serving stale data:
 
 > **Common pattern:** on update, **delete** the key (don't update it) → next read repopulates via cache-aside. Avoids race conditions between concurrent writers.
 
-### Plain-English: keeping the copy honest
+### Keeping the copy honest
 
-**Analogy: the printed price tag vs the real price.** The DB is the real, current price at the register. The cache is the **printed tag on the shelf**. When the price changes in the system, the shelf tag is now **lying** until someone updates it. Invalidation is the whole discipline of "how do we stop the shelf tag from lying?" — and it's famously hard because you have to catch *every* place a tag exists, every time the price changes.
+The DB holds the current value; the cache holds a copy. When the DB value changes, the cached copy is now **stale** until it's updated or removed. Invalidation is the discipline of keeping cached copies from serving stale data — and it's famously hard because you must catch *every* cached copy, every time the underlying data changes.
 
 Four approaches, from laziest to most precise:
 
 ```java
-// 1. TTL — the tag auto-expires. Simplest. Accepts "wrong for at most N seconds."
+// 1. TTL — the entry auto-expires. Simplest. Accepts "stale for at most N seconds."
 cache.set("price:123", 499, /* ttl */ 60);   // re-checked at least once a minute
 
-// 2. Delete-on-write — when the price changes, RIP the tag off the shelf.
+// 2. Delete-on-write — when the price changes, delete the cached entry.
 void updatePrice(long id, int newPrice) {
     db.set("price:" + id, newPrice);   // update source of truth first
     cache.delete("price:" + id);       // then remove stale copy → next read reloads fresh
 }
 
-// 3. Event-driven — the register broadcasts "price 123 changed"; every shelf listens and drops its tag.
+// 3. Event-driven — a change event is published; every cache subscribes and deletes the entry.
 onPriceChangedEvent(id -> cache.delete("price:" + id));   // via Kafka / CDC
 
-// 4. Versioned keys — never edit a tag; print a NEW one and point people at it.
+// 4. Versioned keys — never edit an entry; write a NEW key and point reads at it.
 String key = "price:123:v" + currentVersion(123);   // bump version = instant "invalidate all"
 ```
 
@@ -454,17 +454,17 @@ cache.set(key, v == null ? NULL_SENTINEL : v, ttl)
 
 ---
 
-### Plain-English: telling the "many misses" problems apart
+### Telling the "many misses" problems apart
 
-The scary cache failures all look similar ("suddenly the DB is on fire") but have **different causes and fixes**. Analogies make them stick:
+These cache failures all look similar (a sudden spike of DB load) but have **different causes and fixes**:
 
-| Problem | One-line analogy | Root cause |
+| Problem | What happens | Root cause |
 | --- | --- | --- |
-| **Thundering herd / stampede** | 1,000 people rush the *one* popular counter the instant it opens | **one** hot key expired |
-| **Avalanche** | the *whole mall* opens all its shutters at 10:00 sharp → floor floods | **many** keys expire together (or cache dies) |
-| **Penetration** | people keep asking for a product that **doesn't exist**, so you check the stockroom every time | requests for keys absent from cache *and* DB |
-| **Hot key** | everyone crowds the *one* cashier who has the celebrity autograph | one key gets a disproportionate share of traffic |
-| **Big key** | one customer's cart is a truckload; scanning it blocks the whole checkout lane | a single cached value is huge |
+| **Thundering herd / stampede** | one hot key expires; a flood of requests all recompute it at once | **one** hot key expired |
+| **Avalanche** | many keys expire at the same moment → broad miss surge | **many** keys expire together (or cache dies) |
+| **Penetration** | requests for keys that don't exist anywhere always reach the DB | requests for keys absent from cache *and* DB |
+| **Hot key** | one key receives a disproportionate share of all traffic | one key gets a disproportionate share of traffic |
+| **Big key** | one cached value is huge; reading it blocks other operations | a single cached value is huge |
 
 #### Q: Stampede vs avalanche — what's the real difference?
 
@@ -517,9 +517,9 @@ A cache makes the system **eventually consistent** by nature:
 - **Read-heavy + tolerant of staleness** → cache aggressively (browse/catalog).
 - **Strong-consistency needs** (money, inventory) → **don't cache the write decision**; the DB stays the source of truth. (e.g. you can cache *availability* for display, but the actual reservation/lock must be decided by the DB.)
 
-### Plain-English: why a cache means "eventually consistent"
+### Why a cache means "eventually consistent"
 
-**Analogy: the concert ticket board.** A big screen outside the venue shows "SEATS AVAILABLE." That screen (cache) is refreshed every few seconds, not on every sale. So for a moment it can say "available" *after* the last seat actually sold. That's fine for **browsing** ("looks like there might be seats!"), but you'd never let the screen **decide the sale** — the real seat assignment happens at the box office (the DB), which locks the seat so two people can't buy the same one. The screen is a *display copy*; the box office is the *truth*.
+Consider a seat-availability display that reads a cached count refreshed every few seconds, not on every sale. For a moment it can show "available" *after* the last seat actually sold. That's fine for **browsing** (showing an approximate count), but you'd never let that cached value **decide the sale** — the actual reservation goes through the DB, which locks the seat so two people can't buy the same one. The cache is a *display copy*; the DB is the *source of truth*.
 
 That gap — cache says X, DB already moved to Y — is exactly what "**eventually consistent**" means: the copies converge *eventually*, but for a short window they can disagree.
 

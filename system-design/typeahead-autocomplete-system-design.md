@@ -2,7 +2,7 @@
 
 > **Core challenge:** as a user types, return the **top-k most relevant completions** in **a few milliseconds**, for **every keystroke**, at massive query volume. The heart is a **prefix data structure (trie)** with **precomputed top-k per prefix**, plus a pipeline that continuously **updates rankings** from search logs.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (the Google search box analogy, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -35,7 +35,7 @@ Type "net" → suggest ["netflix", "network", "netgear"] ranked by popularity, i
 
 Extremely **read-heavy**, latency-critical. **Precompute the top-k completions for each prefix** so a query is a single lookup, not a search.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
 Picture the **Google search box**. You start typing `net` and — before you finish — a little dropdown appears:
 
@@ -53,7 +53,7 @@ That dropdown is the whole system. Two things make it hard:
 
 So the entire system is a giant, super-fast **"given these first few letters, what are people most likely about to type?"** machine. Everything else is just "how do we answer that in milliseconds, billions of times, and keep the answers up to date."
 
-### Plain-English: why not just query a database with `LIKE 'net%'`?
+### Why not just query a database with `LIKE 'net%'`?
 
 First instinct: keep all queries in a table and, for each keystroke, run:
 
@@ -100,7 +100,7 @@ Rebuild: aggregate billions of log lines → hourly/daily trie build → atomic 
 
 > The read path must be **in-memory** (a trie lookup is a few pointer hops); the write path is a **batch/stream aggregation** that rebuilds the ranked trie.
 
-### Plain-English: reading the numbers
+### Reading the numbers
 
 - **`5B searches/day → ~5–10× that in autocomplete lookups`** — you type `netflix` (7 letters), and each keystroke (after debounce) is a lookup. One search = several lookups, so the autocomplete system is busier than search itself. That's why the read path has to be trivially cheap.
 - **`trie nodes in the billions`** — with hundreds of millions of distinct queries, the letter-by-letter tree of all of them is enormous. Too big for one machine's RAM → we **shard by prefix** (§9) and store only the **top-k per node**, not every descendant.
@@ -122,15 +122,13 @@ Search logs → Kafka → Aggregator (batch/stream: frequency + decay) → Trie 
 
 - **Read path** (serving) and **write path** (offline build) are fully separate (**CQRS**).
 
-### Plain-English: two completely separate machines
-
-**Analogy: a printed phone book (or a restaurant's laminated menu).**
+### Two completely separate machines
 
 There are really **two jobs** here, and the design keeps them in totally different places:
 
 #### Part A — The reader (serving path): answering keystrokes
 
-When you type, the request goes to a **Suggestion Service** that holds the whole ranked trie **in memory** and just walks a few letters and reads back the pre-written list. Like flipping a printed phone book to the `Net` page — the book was typeset weeks ago; you're only *reading* it. No computing, no sorting, no database query. That's why it's fast.
+When you type, the request goes to a **Suggestion Service** that holds the whole ranked trie **in memory**, walks a few letters, and reads back the pre-written list. No computing, no sorting, no database query. That's why it's fast.
 
 ```
 you type "net" → API gateway → Suggestion Service (trie already in RAM) → walk n→e→t → read the list → return
@@ -147,7 +145,7 @@ every search gets logged → Kafka → Aggregator counts how often each query ap
    → Suggestion Services load the new snapshot and ATOMICALLY SWAP to it
 ```
 
-Like a new edition of the phone book being typeset overnight and delivered; the moment it arrives, everyone starts reading the new one.
+The new snapshot is built offline and, once ready, every serving node switches to it.
 
 #### Q: Why keep read and write totally separate? (this split is called CQRS)
 
@@ -184,9 +182,9 @@ A **trie (prefix tree)**: each node is a character; a path = a prefix.
 
 > Without cached top-k, answering "net" would DFS the whole subtree under "net" to find the best completions — too slow. Precomputing top-k per node trades build cost + memory for O(prefix) reads.
 
-### Plain-English: what a trie actually is
+### What a trie actually is
 
-**Analogy: a dictionary organized by shared beginnings.** All words starting with `net` live down the same branch. To find them you don't flip through the whole book — you go to the `n` section, then `ne`, then `net`, and everything under there begins with `net`.
+All words starting with `net` live down the same branch. To find them you don't scan every stored query — you follow `n`, then `ne`, then `net`, and everything under that node begins with `net`.
 
 A **trie** ("try", from re-**trie**-val) is exactly that as a tree:
 
@@ -205,7 +203,7 @@ A **trie** ("try", from re-**trie**-val) is exactly that as a tree:
 
 To find completions of `net`, you walk `n → e → t` — **3 hops, no matter how many millions of queries exist** — then look at everything hanging below `net`. That "cost depends only on the length of what you typed, not on how big the dataset is" property is the whole reason a trie fits here.
 
-### Plain-English: the killer trick — store the top-k *at each node*
+### The killer trick — store the top-k *at each node*
 
 Walking to `net` is cheap. But then *finding the best 10 completions under `net`* would mean exploring the entire subtree (netflix, network, netgear, netbanking, netcat, ...) and sorting them — slow, and we'd redo it every keystroke. Millions of times per second, that's fatal.
 
@@ -297,9 +295,9 @@ GET /autocomplete?q=net
 - **Client debounce** (fire after ~50–100ms of no typing, not every keystroke) cuts QPS massively.
 - **Cache/CDN** the hottest prefixes' responses.
 
-### Plain-English: debounce — don't ask on every single keystroke
+### Debounce — don't ask on every single keystroke
 
-**Analogy: waiting for someone to finish their sentence before answering.** If you fire a request for `n`, then `ne`, then `net`, then `netf`... you send a request per letter, and the `n`/`ne` answers are thrown away the instant the next letter arrives. Wasteful.
+If you fire a request for `n`, then `ne`, then `net`, then `netf`... you send a request per letter, and the `n`/`ne` answers are thrown away the instant the next letter arrives. Wasteful.
 
 **Debounce** = wait until the user *pauses* typing (say 50–100ms of no new keystroke) before sending the request. Fast typists produce **one** request for the whole word instead of seven.
 
@@ -316,7 +314,7 @@ input.addEventListener("keyup", () => {
 
 This alone can cut autocomplete QPS by 3–5×, before the server does anything.
 
-### Plain-English: caching the hottest prefixes
+### Caching the hottest prefixes
 
 Some prefixes are searched *constantly* — `a`, `f`, `the`, `you`. Their top-k basically never changes between rebuilds, yet millions of people ask for them. Rather than walk the trie every time, keep those answers in a **Redis / edge (CDN) cache** keyed by prefix.
 
@@ -355,7 +353,7 @@ Search logs → Kafka → aggregate query frequencies (streaming or batch, with 
 - **Atomic swap** = no read locks, no partial state — readers see either the old or new trie.
 - **Filter** offensive/spam/PII queries before adding.
 
-### Plain-English: where do the suggestions even come from?
+### Where do the suggestions even come from?
 
 **They come from what everyone actually searched.** Nobody hand-writes "netflix should be the top suggestion for `net`." The system *learns* it: netflix is searched millions of times, so it floats to the top of the `net` list. Autocomplete is a mirror of the crowd's recent searches.
 
@@ -424,9 +422,9 @@ void offerToNode(TrieNode node, Suggestion cand) {
 
 Because `netflix` sits under `n`, `ne`, `net`, `netf`, ... it gets offered to each of those nodes, so **every prefix ends up knowing its own best completions**. (Real builders use a bounded min-heap per node instead of sort-then-trim, but the idea is identical.)
 
-### Plain-English: atomic swap — replacing the trie without downtime
+### Atomic swap — replacing the trie without downtime
 
-**Analogy: swapping in a freshly printed phone book.** You don't erase and rewrite the old book page-by-page while people are reading it (they'd see half-updated garbage). You print the **whole new edition** off to the side, then in one instant say "everyone use this one now."
+You don't mutate the live trie in place while people are reading it (they'd see half-updated, inconsistent state). You build the **whole new trie** off to the side, then in one instant switch everyone to it.
 
 The serving node holds a **pointer** to the current trie. Building happens on a *new* trie; when it's fully ready, we flip the pointer in one atomic step:
 
@@ -474,7 +472,7 @@ Kafka is the **buffer/pipe** that absorbs the search-log firehose (producer-cons
 
 - Fuzzy matching is expensive on a plain trie → often a separate **spell-correction / n-gram** stage, or a small edit-distance search over the trie.
 
-### Plain-English: ranking by popularity (with a twist for you)
+### Ranking by popularity (with a twist for you)
 
 The **global** trie ranks purely by crowd popularity + recency (§7). But Google's box often shows *you* something different — because it mixes in **your** history. That's **personalization**: blend a small per-user layer with the global list at read time.
 
@@ -496,7 +494,7 @@ List<Suggestion> personalized(String prefix, String userId) {
 
 Key point: **we don't build a whole trie per user** (billions of them — impossible). We keep one shared global trie and layer a *small* per-user signal on top at read time. Personalization is a thin blend, not a separate index.
 
-### Plain-English: typo tolerance (fuzzy matching)
+### Typo tolerance (fuzzy matching)
 
 A plain trie is **exact** — type `netfli`, walk `n→e→t→f→l→i`, done. But type `nteflix` (swapped letters) and the walk dies at `nt` → zero suggestions. Humans mistype constantly, so we need **fuzzy** matching.
 
@@ -539,11 +537,11 @@ Shard the trie by prefix (first 1–2 chars):  a-c → node1, d-f → node2, ...
 - **Skew:** some prefixes are far more popular (`"a"`, `"the"`) → finer sharding or more replicas for hot shards.
 - **Memory:** store only **top-k per node** (not full descendant lists); compress with radix/DAWG; keep the serving set to popular queries (long tail can DFS on miss or be omitted).
 
-### Plain-English: the trie is too big for one machine
+### The trie is too big for one machine
 
 Hundreds of millions of distinct queries → **billions of trie nodes** → many gigabytes. That won't fit (comfortably) in one server's RAM, and one server couldn't handle the QPS anyway. So we **split the trie across machines by prefix**.
 
-**Analogy: a library split across buildings by the first letter.** Books starting `A–C` in building 1, `D–F` in building 2, etc. When you want a `net...` book, you go straight to the building that holds `N`.
+Split by the first letter(s) of the prefix: prefixes `a–c` on node 1, `d–f` on node 2, etc. A request for `net...` goes straight to the node that owns `n`.
 
 ```
 Shard by first 1–2 characters of the prefix:
@@ -570,7 +568,7 @@ String shardFor(String prefix) {
 
 Because a single autocomplete request only cares about **one** prefix (`net`), and everything it needs (`net`, `netf`, `netfl`, ...) lives under the **same branch**. Shard by prefix and the whole answer is on **one** shard — no fan-out, no combining results from multiple machines. Random sharding would scatter one prefix's data everywhere and force every request to hit many shards.
 
-### Plain-English: the skew problem (hot prefixes)
+### The skew problem (hot prefixes)
 
 Sharding by prefix creates an uneven load: tons of people type `a`, `the`, `you`; almost nobody types `qz`. So the shard owning popular prefixes gets **hammered** while others idle — the **hot key / skew** problem.
 
@@ -580,7 +578,7 @@ Fixes:
 - **Finer sharding of hot ranges** — split a hot first-letter into deeper buckets (`a` → `aa`, `ab`, `ac`, ...) so its load spreads across more machines.
 - **Cache the hot prefixes** (§6) — the busiest prefixes are served from Redis/CDN, taking pressure off the shard entirely.
 
-### Plain-English: shrinking memory (radix / DAWG)
+### Shrinking memory (radix / DAWG)
 
 Two big memory savers beyond "top-k only":
 
@@ -614,7 +612,7 @@ CREATE TABLE query_frequency ( query TEXT PRIMARY KEY, count BIGINT, decayed_sco
 
 > **Stores to consider:** raw search logs (Kafka + warehouse/lake), `query_frequency` aggregate, versioned trie snapshots (blob), Redis cache for hot prefixes, optional per-user history store for personalization.
 
-### Plain-English: which store does which job?
+### Which store does which job?
 
 The confusing part is that there are **several** stores, each for a different phase. Map them to the two paths (§4):
 

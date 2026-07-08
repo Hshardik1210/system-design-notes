@@ -2,7 +2,7 @@
 
 > **In one line:** **Outbox** makes event publishing reliable (DB ↔ messaging); **Saga** keeps data consistent across multiple services. Combined with **Idempotency**, they make distributed systems actually work.
 
-> **How to read this doc:** each section gives the dense summary/interview version first, then a **Plain-English** deep dive (simple language, a concrete real-world analogy, annotated example code/SQL, and the exact confusions that trip people up while learning). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** each section gives the dense summary/interview version first, then a **deep dive** (annotated example code/SQL, and the exact confusions that trip people up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -59,23 +59,18 @@ Your service does two things: (1) save the order in DB, (2) publish `OrderCreate
 
 > Write everything to the **DB first**, then publish reliably **from there**.
 
-### Plain-English: the dual-write problem
+### The dual-write problem
 
-**The core mess in one picture.** Your service needs to do TWO things whenever an order is placed:
+Your service needs to do TWO things whenever an order is placed:
 
 1. Save the order in its own database.
-2. Tell the rest of the company ("payment", "inventory") by publishing an `OrderCreated` message to Kafka.
+2. Notify the rest of the system ("payment", "inventory") by publishing an `OrderCreated` message to Kafka.
 
-These are **two separate machines** (a database and a message broker). There is no magic button that does "both, or neither." So whenever you do them one after another, a crash in the gap leaves you half-done. **Writing to two systems with no shared transaction = the dual-write problem.**
+These are **two separate systems** (a database and a message broker). There is no single operation that does "both, or neither." So whenever you do them one after another, a crash in the gap leaves you half-done. **Writing to two systems with no shared transaction = the dual-write problem.**
 
-**Real-world analogy — the letter and the "to-mail" list.** Imagine you run a small office:
+Concretely: if the process is interrupted after the DB write but before publishing, the order exists but no event goes out. If you publish first but the DB write fails, consumers act on an order that was never saved. **Two separate actions, no safety net.**
 
-- You write a letter (= save the order in the DB).
-- You then walk to the mailbox and post it (= publish the event to Kafka).
-
-If you get interrupted after writing but before posting, the letter exists but never goes out. If you somehow post a copy but the original burns, the recipient acts on a letter you don't have a record of. **Two separate actions, no safety net.**
-
-The outbox trick: **on your desk you keep ONE drawer.** When an order comes in, in a single motion you drop *both* the letter AND a slip on the "to-mail" list into that same drawer, then close it (= one DB transaction: insert into `orders` + insert into `outbox`). Because it is one drawer closed once, you can never end up with the letter but no to-mail slip, or vice versa. **Later**, a mail clerk (the background relay) checks the "to-mail" list and actually posts the letters. Posting can be slow or retried, but nothing is ever lost, because the intent to send was saved *atomically* with the business data.
+The outbox trick: write **both** the business row AND an event row into the **same database** in one transaction (insert into `orders` + insert into `outbox`). Because it's a single transaction, you can never end up with the order but no event row, or vice versa. **Later**, a background relay reads the outbox and publishes the events to Kafka. Publishing can be slow or retried, but nothing is ever lost, because the intent to send was saved *atomically* with the business data.
 
 #### Q: Why can't I just publish to Kafka inside my DB transaction?
 
@@ -135,7 +130,7 @@ The DB transaction guarantees atomicity:
 
 👉 No inconsistency possible.
 
-> **Simple analogy:** Outbox = "write the message in a notebook before sending the email." Even if the email fails, the message is still saved.
+> **In short:** Outbox = persist the event in the DB before publishing it. Even if publishing fails, the event is still saved and can be retried.
 
 ### Downsides & alternatives
 
@@ -159,7 +154,7 @@ The DB transaction guarantees atomicity:
 
 > For most systems the **transactional outbox** is the pragmatic default; reach for CDC only at high scale.
 
-### Plain-English: the outbox table + relay, in code
+### The outbox table + relay, in code
 
 There are only two moving pieces: (1) the **write** that saves business data and the event together in one transaction, and (2) the **relay** (background worker) that later reads the outbox and publishes.
 
@@ -400,11 +395,11 @@ Polling/Tick  = "keep checking continuously"
 CDC           = "react instantly to change"
 ```
 
-### Plain-English: why two workers fight, and how SKIP LOCKED fixes it
+### Why two workers fight, and how SKIP LOCKED fixes it
 
-**Analogy — clerks and a shared to-do list.** Picture the "to-mail" drawer again, but now **three mail clerks** all reach in at once. If nothing stops them, all three grab the *same* letter and post it three times. In outbox terms: multiple relay workers `SELECT ... WHERE status = 'PENDING'`, all see the same rows, and all publish them → duplicates and wasted work.
+If multiple relay workers run at once, they all `SELECT ... WHERE status = 'PENDING'`, see the same rows, and all publish them → duplicates and wasted work.
 
-`FOR UPDATE SKIP LOCKED` is the rule "**each clerk takes rows nobody else is currently holding**":
+`FOR UPDATE SKIP LOCKED` is the rule "**each worker takes only rows nobody else is currently holding**":
 
 ```sql
 SELECT * FROM outbox
@@ -418,7 +413,7 @@ LIMIT 10;
 - `FOR UPDATE` = "I'm claiming these rows; lock them until my transaction ends."
 - `SKIP LOCKED` = "don't wait for rows someone else already claimed — just move on to the next free ones."
 
-So worker A grabs rows 1–10, worker B *skips* those (they're locked) and grabs 11–20, worker C grabs 21–30. **No clerk ever picks a letter another clerk is already holding → no double-publish from the workers themselves.**
+So worker A grabs rows 1–10, worker B *skips* those (they're locked) and grabs 11–20, worker C grabs 21–30. **No worker ever picks a row another worker is already holding → no double-publish from the workers themselves.**
 
 #### Q: Without SKIP LOCKED, wouldn't `FOR UPDATE` alone be safe?
 
@@ -469,15 +464,15 @@ on event:
 
 👉 This is exactly the **idempotency** pattern from your other notes, applied at the **consumer** side.
 
-### Plain-English: "at-least-once" and the idempotent consumer
+### "At-least-once" and the idempotent consumer
 
 **What the three guarantees really mean, plainly:**
 
-- **At-most-once** = "I'll try to tell you, but I might drop the message." Never duplicates, but can *lose* events. Unacceptable when the event matters (an order!).
-- **At-least-once** = "I promise you'll hear it — maybe more than once." Never loses, but can *repeat*. **This is what the outbox gives you.**
-- **Exactly-once** = "you'll hear it once, guaranteed." The dream — but impossible to truly achieve across a DB and a broker, because you can't atomically publish *and* mark `SENT`.
+- **At-most-once** = the event is delivered zero or one times. Never duplicates, but can *lose* events. Unacceptable when the event matters (an order!).
+- **At-least-once** = the event is delivered one or more times. Never loses, but can *repeat*. **This is what the outbox gives you.**
+- **Exactly-once** = delivered once, guaranteed. Ideal — but impossible to truly achieve across a DB and a broker, because you can't atomically publish *and* mark `SENT`.
 
-**Analogy — the mail clerk who forgets.** The clerk posts a letter, then reaches for the "sent ✓" stamp — and drops dead before stamping it. A new clerk arrives, sees the slip still says PENDING, and posts the letter *again*. The recipient now gets the same letter twice. Nothing was lost (good), but there's a duplicate (the price we pay).
+The duplicate happens as described above: the worker publishes, then crashes before marking the row `SENT`; on restart the row is still `PENDING`, so it publishes again. Nothing is lost (good), but a duplicate arrives (the price we pay).
 
 **The fix lives at the reader, not the sender.** Since we can't stop duplicates from being *sent*, we make them *harmless to receive*. Every event carries a unique `event_id`; the consumer remembers which ids it has already handled and ignores repeats:
 
@@ -596,24 +591,24 @@ Payment Service   → DB3
 
 > **One-liner:** "2PC gives atomicity but blocks and doesn't scale; Saga trades atomicity for availability and uses compensations to reach eventual consistency."
 
-### Plain-English: what a saga is and why we need it
+### What a saga is and why we need it
 
 **The problem, plainly.** In a single app with one database, "create order + reserve inventory + charge payment" can all sit inside one `BEGIN ... COMMIT`. If payment fails, the database *automatically* undoes the order and the inventory — free rollback. But once those three steps live in **three different services with three different databases**, there is no shared transaction and no automatic undo. If step 3 fails, steps 1 and 2 have already **committed for real** in their own databases. You're stuck with a half-finished order.
 
-**Analogy — booking a trip yourself.** You want a flight, a hotel, and to pay:
+Take the order saga concretely:
 
-1. Book the flight. ✅ (confirmed, real booking)
-2. Book the hotel. ✅ (confirmed, real booking)
-3. Pay. ❌ — your card is declined.
+1. Create order. ✅ (committed in the Order service DB)
+2. Reserve inventory. ✅ (committed in the Inventory service DB)
+3. Charge payment. ❌ — the card is declined.
 
-There is no cosmic "undo my whole trip" button. The flight and hotel are *already booked*. To get back to a clean state you must **explicitly cancel each thing you did, in reverse**: cancel the hotel, then cancel the flight. **That deliberate sequence of "do a step, and know how to cancel it" is a saga.** Each step has a paired **compensating action** (its undo):
+There is no global rollback. The order and inventory reservation are *already committed*. To get back to a clean state you must **explicitly undo each completed step, in reverse**: release the inventory, then cancel the order. **That deliberate sequence of "do a step, and know how to undo it" is a saga.** Each step has a paired **compensating action** (its undo):
 
 ```
-Step               Do              Compensation (undo)
------------------  --------------  -------------------
-Book flight        reserve seat    cancel seat
-Book hotel         reserve room    cancel room
-Pay                charge card     refund
+Step                Do               Compensation (undo)
+------------------  ---------------  -------------------
+Create order        create order     cancel order
+Reserve inventory   reserve stock    release stock
+Charge payment      charge card      refund
 ```
 
 #### Q: Why not just use a distributed transaction (2PC)?
@@ -671,9 +666,9 @@ Now: inventory is stuck, order is half-done.
 
 > ⚠️ **Saga does NOT roll back automatically like a DB.** You must explicitly write the compensation logic.
 
-### Plain-English: compensating transactions, in code
+### Compensating transactions, in code
 
-A **compensating transaction** is just "the undo function you write yourself for a step." The trick is that undo runs in **reverse order** — you unwind the most recent successful step first, like backing out of a hallway the way you came in.
+A **compensating transaction** is just "the undo function you write yourself for a step." The trick is that undo runs in **reverse order** — you unwind the most recent successful step first.
 
 ```java
 public void createOrderSaga(OrderRequest req) {
@@ -702,7 +697,7 @@ public void createOrderSaga(OrderRequest req) {
 
 **Key beginner points hiding in here:**
 
-- The `push` order builds a stack, so `pop` naturally gives you **reverse (LIFO) order** — exactly how you unwind a trip (cancel hotel before flight).
+- The `push` order builds a stack, so `pop` naturally gives you **reverse (LIFO) order** — the most recent step is undone first (release inventory before cancelling the order).
 - We only compensate steps that **actually succeeded**. If `reserve` never ran, there's nothing to release.
 - Each compensation is a **real distributed call that can itself fail**, so it must be safe to retry — see §14.
 
@@ -767,7 +762,7 @@ Orchestrator:
 | Coupling   | Loose        | Slightly tighter |
 
 
-> **Real-life analogy:** Booking a trip — book flight → book hotel → pay. If payment fails: cancel hotel → cancel flight. That's Saga.
+> **Recap:** a saga is a sequence of local transactions, each with a compensating action; if a step fails, previously completed steps are undone via their compensations.
 
 ### Orchestrator must persist saga state (crash recovery)
 
@@ -787,14 +782,12 @@ abc123  | CREATE_ORDER  | CHARGE_PAYMENT    | IN_PROGRESS | {...}
 
 > **Choreography equivalent:** there's no central log — each service persists its own state and relies on events being redelivered (Kafka offsets / retries) to recover.
 
-### Plain-English: orchestration vs choreography
+### Orchestration vs choreography
 
 Both get the same job done; they differ in **who holds the plan**.
 
-**Analogy — a dinner party.**
-
-- **Orchestration = a conductor / head chef.** One boss (the *orchestrator*) holds the recipe and tells each station "now you chop", "now you fry", "now plate up." If something burns, the boss decides what to redo or throw out. There's a single brain that always knows the state of the meal.
-- **Choreography = a potluck with rules.** No boss. Each cook watches for a cue ("the starter just went out → I'll start the main") and reacts. Coordination emerges from everyone reacting to *events*, but nobody has the full picture in one place.
+- **Orchestration = a central controller.** One service (the *orchestrator*) holds the whole flow and calls each service in turn: reserve inventory, then charge payment, then confirm. If a step fails, the orchestrator decides what to compensate. A single component always knows the current state.
+- **Choreography = event-driven, no controller.** Each service reacts to events ("`InventoryReserved` arrived → I'll charge payment") and emits its own events. Coordination emerges from services reacting to each other's *events*, but no single component holds the full picture.
 
 **Orchestration — one service issues commands and handles failure centrally:**
 
@@ -899,9 +892,9 @@ After pivot fails  → RETRY forward (keep retrying until success)
 
 👉 Design sagas so all **compensatable** steps come **before** the pivot, and all **retriable** steps come **after**.
 
-### Plain-English: the pivot = the "point of no return"
+### The pivot = the "point of no return"
 
-**Analogy — buying concert tickets.** Everything before you tap "Pay" is undoable: you can empty your cart, un-reserve the seats, walk away. The **moment the payment goes through is the pivot** — the point of no return. After that, backing out isn't "undo"; it's "we're committed, now just finish the job" — send the confirmation email, issue the e-ticket. Those after-steps *must* eventually succeed, so you keep **retrying** them, not cancelling.
+Everything before the payment is undoable: you can release reserved inventory and cancel the order. The **moment the payment succeeds is the pivot** — the point of no return. After that, backing out isn't "undo"; the saga is committed to completing — confirm the order, send the receipt. Those after-steps *must* eventually succeed, so you keep **retrying** them rather than cancelling.
 
 So each step is one of three kinds:
 

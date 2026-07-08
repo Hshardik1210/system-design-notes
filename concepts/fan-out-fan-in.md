@@ -2,7 +2,7 @@
 
 > **Fan-out** = deliver one thing to **many** places (1 → N). **Fan-in** = combine **many** things into one (N → 1). These two patterns underlie **news feeds, notifications, messaging, and sharded queries**. The famous gotcha is the **celebrity problem**: fanning out one post to 50M followers explodes into 50M writes.
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (analogies, annotated code, and the exact confusions that trip up beginners). Skim the summaries for revision; read the plain-English parts to actually understand *why*.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated code, and the exact confusions that trip up beginners). Skim the summaries for revision; read the deep dives to actually understand *why*.
 
 ---
 
@@ -36,31 +36,29 @@ FAN-IN (N → 1):   many inputs combined into one
 
 > **Mental hook:** MapReduce = **map is fan-out**, **reduce is fan-in**. Scatter-gather = **fan-out the request, fan-in the responses**.
 
-### Plain-English: the party-invite analogy
+### What fan-out and fan-in mean
 
-Imagine you're throwing a party for **100 guests**.
-
-- **Fan-out (1 → N)** = you write **one** invitation and send a **copy to each of the 100 guests**. One thing (the invite) becomes many deliveries. That's it. "Fan" like a hand-held fan spreading *out* from one point.
-- **Fan-in (N → 1)** = later, **100 RSVPs** come trickling back, and you **collect them into one guest list**. Many things flow *in* to one place and get combined.
+- **Fan-out (1 → N)** = one input is distributed to many destinations. One thing becomes many deliveries — e.g. one tweet copied into N followers' feeds. The name evokes spreading *out* from a single point.
+- **Fan-in (N → 1)** = many inputs are collected into one place and combined — e.g. N responses merged into one result. Many things flow *in* to one point.
 
 ```
-FAN-OUT:   1 invite  ──►  guest 1
-                     ──►  guest 2
-                     ──►  ... (100 copies go out)
+FAN-OUT:   1 input  ──►  destination 1
+                    ──►  destination 2
+                    ──►  ... (N copies go out)
 
-FAN-IN:    RSVP 1  ──┐
-           RSVP 2  ──┼──►  one final guest list (combine the 100 replies)
-           RSVP 3  ──┘
+FAN-IN:    input 1  ──┐
+           input 2  ──┼──►  one combined result (merge the N inputs)
+           input 3  ──┘
 ```
 
-Every fancy term in this doc is a version of that:
+Every pattern in this doc is a version of that:
 
-| Real system thing            | Party version                                            |
-| ---------------------------- | -------------------------------------------------------- |
-| Tweet → 100 followers' feeds | One invite copied to 100 guests (**fan-out**)            |
-| Merge shard results → answer | Collecting 100 RSVPs into one list (**fan-in**)          |
-| Search query → all shards    | Asking 100 helpers "do you have this?" (**fan-out**)     |
-| MapReduce                    | Hand out tasks (map = fan-out), gather results (reduce = fan-in) |
+| System                        | Fan-out / fan-in                                            |
+| ----------------------------- | ----------------------------------------------------------- |
+| Tweet → 100 followers' feeds  | One post copied to 100 feeds (**fan-out**)                  |
+| Merge shard results → answer  | Collecting N shard results into one list (**fan-in**)       |
+| Search query → all shards     | One query sent to N shards (**fan-out**)                    |
+| MapReduce                     | Map splits work (fan-out), reduce combines results (fan-in) |
 
 #### Q: Is fan-out always about *copying*, and fan-in always about *summing*?
 
@@ -107,14 +105,12 @@ Read feed  → fetch recent posts from EVERYONE you follow, then merge + rank (f
 
 > **Read-heavy → push** (do work once on write, reads are cheap). **Write-heavy / celebrity → pull** (don't amplify writes). Most large systems use a **hybrid** (§4).
 
-### Plain-English: "do the work now" vs "do the work later"
+### "Do the work now" vs "do the work later"
 
 The one decision that drives feed design: **when do you build someone's feed?**
 
-**Analogy — a newspaper.** You follow some people, and their posts are the "articles." Two ways to get you your morning paper:
-
-- **Fan-out on write (push)** = the moment an author writes an article, a worker **immediately drops a copy into the mailbox of every subscriber**. When you wake up, your mailbox (feed) is already full — you just grab it. Fast for you, but the author's one article caused thousands of mailbox deliveries.
-- **Fan-out on read (pull)** = nobody pre-delivers anything. When you wake up and ask for your paper, a clerk **runs around to every author you follow, grabs their latest, staples it together, and hands it to you**. The author did almost nothing when writing; *you* pay the cost every time you read.
+- **Fan-out on write (push)** = the moment an author posts, a worker immediately writes a copy of that post into every follower's feed. When a follower opens the app, their feed is already built — they just read it. Fast reads, but one post triggers thousands of feed writes.
+- **Fan-out on read (pull)** = nothing is pre-written. When a user requests their feed, the system fetches the latest posts from every account they follow, merges them, and returns the result. Posting is nearly free; the cost is paid on every read.
 
 ```
 PUSH (write-time work):  author posts → copy into feed_of(followerA), feed_of(followerB), ...
@@ -200,9 +196,9 @@ Celebrity posts (50,000,000 followers) → 50,000,000 feed writes for ONE tweet
 
 > It's really the **hot-key / write-amplification** problem wearing a costume. Same family as a hot DB shard or a viral URL — a single entity with disproportionate fan-out.
 
-### Plain-English: why one tweet can melt the system
+### Why one tweet can melt the system
 
-Back to the party analogy: sending **100** invites by hand is fine. Now imagine you have to send **50 million** invites by hand for **one** party — and you have to *finish before the party starts*. That's the celebrity problem. The act of posting is tiny; the **fan-out it triggers** is monstrous.
+Pushing to **200** followers is fine. Pushing to **50 million** followers for **one** post — and finishing before those followers open the app — is not. That's the celebrity problem. The act of posting is tiny; the **fan-out it triggers** is enormous.
 
 ```
 Normal user (200 followers):     1 tweet →        200 feed writes   → done in milliseconds
@@ -250,16 +246,14 @@ On read (build home feed):
 Hybrid = cheap reads for the 99% (push) + cheap writes for the 1% celebrities (pull) + merge at read
 ```
 
-### Plain-English: use push for most people, pull for the famous few
+### Use push for most accounts, pull for celebrities
 
 The trick is realizing the two approaches fail in **opposite** situations, so you use each where it's strong:
 
 - **Normal accounts** have few followers → pushing is cheap → **push** (so reads stay fast).
 - **Celebrities** have millions of followers → pushing is a disaster → **don't push**; store their post once and **pull** it at read time.
 
-And here's why pulling celebrities is cheap even though pushing them is not: **you personally follow only a handful of celebrities.** So at read time you fetch a few celebrity timelines and merge them into your mostly-pre-built feed. Few pulls per reader ≪ 50M pushes per celebrity.
-
-**Analogy:** your regular friends mail you their news directly (push — it's in your mailbox). But you don't ask the President to mail 300 million people; instead, when *you* want the news, you glance at the front page (pull the celebrity's public timeline). One shared page for everyone, read on demand.
+And here's why pulling celebrities is cheap even though pushing them is not: **each reader follows only a handful of celebrities.** So at read time you fetch a few celebrity timelines and merge them into your mostly-pre-built feed. Few pulls per reader ≪ 50M pushes per celebrity.
 
 #### Annotated code: the hybrid decision
 
@@ -336,9 +330,9 @@ Many services → one log pipeline → one dashboard
 
 > **Pull-model feeds are fan-in too:** gather posts from all followees and merge into one timeline.
 
-### Plain-English: asking many helpers one question, then combining answers
+### How scatter-gather works
 
-**Analogy — finding a book in a huge library.** The library is split across **10 floors** (shards), and you don't know which floor has your book. So you **shout the request to all 10 floors at once** (fan-out the query), each librarian searches *their* floor and hands back what they found, and you **staple the results into one list** (fan-in). That's **scatter-gather**.
+The data is split across **N shards**, and you don't know which shard holds the match. So you send the request to all N shards in parallel (fan-out the query), each shard searches its own partition and returns what it found, and the coordinator merges the partial results into one list (fan-in). That's **scatter-gather**.
 
 ```
              ┌─► shard 1 ─┐
@@ -383,7 +377,7 @@ Both are "N → 1", but the *shape* differs:
 | Example | Elasticsearch search across shards | Ad-click counting, likes/views counters |
 | Timing | Synchronous (you wait for the answer) | Usually asynchronous (events trickle in over time) |
 
-The party analogy still holds: scatter-gather = "ask 10 helpers, staple their answers." Aggregation = "100 RSVPs trickle in all week; keep a running tally."
+In short: scatter-gather issues one request and merges a few partial responses; aggregation continuously folds a stream of independent events into a running total.
 
 ---
 
@@ -399,9 +393,9 @@ The party analogy still holds: scatter-gather = "ask 10 helpers, staple their an
 | **Analytics (ad clicks, counters)** | — | Many events → aggregated rollups |
 | **MapReduce** | Map (split work) | Reduce (combine) |
 
-### Plain-English: spotting fan-out/fan-in in the wild
+### Spotting fan-out/fan-in in the wild
 
-Once you have the party lens, you'll notice these two words everywhere. A quick way to **spot which is which**: ask "**is one thing becoming many, or are many things becoming one?**"
+A quick way to **spot which is which**: ask "**is one thing becoming many, or are many things becoming one?**"
 
 - See **one input creating lots of work / copies / parallel calls**? → **fan-out** (posting to feeds, a query hitting all shards, one event triggering email+SMS+push).
 - See **lots of things being merged / summed / stapled into one**? → **fan-in** (merging shard results, tallying clicks, combining followees' posts into a feed).
@@ -428,7 +422,7 @@ Hybrid:     normal posts pushed (fast reads) + pull ~handful of celebrities at r
 | Pull (fan-out on read) | Low | High | ✅ |
 | **Hybrid** ✅ | Low–medium | Low–medium | ✅ |
 
-### Plain-English: reading the numbers
+### Reading the numbers
 
 The whole table is just "**where does the cost land, and is any single action catastrophic?**"
 

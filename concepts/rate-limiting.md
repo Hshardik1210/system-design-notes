@@ -2,7 +2,7 @@
 
 > **Goal:** cap how many requests a client can make in a time window — to **prevent abuse, protect backends, ensure fair use, and control cost**. The interview question is usually "compare the algorithms."
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (a bouncer-at-a-club analogy, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -27,32 +27,28 @@
 
 > Usually enforced at the **API Gateway / edge**, keyed by `user_id`, `API key`, or `IP`.
 
-### Plain-English: the bouncer at the club door
+### Why rate limit, in detail
 
-**Analogy used throughout this doc: a bouncer standing at a club door.**
+A rate limiter sits at the entry point to your API and enforces a rule like *"at most 100 requests per client per minute."* Requests beyond that are rejected until the window resets. The four motivations expand as:
 
-Your API is the club. Requests are people trying to get in. Without a bouncer, a mob rushes the door all at once, the club gets dangerously overcrowded, and it becomes miserable (or unsafe) for everyone inside. The **bouncer = the rate limiter**: they stand at the entrance and enforce a rule like *"I'm letting at most 100 people in per minute."* Everyone beyond that gets told "sorry, come back later."
+- **Prevent abuse / DoS** — a single client can't flood the API with traffic and starve everyone else.
+- **Protect backends** — downstream systems (the database) have finite capacity; the limiter caps load before it exceeds that and everything melts.
+- **Fair usage** — no single client can consume all the capacity and lock others out.
+- **Cost control** — every request costs money (compute, downstream calls); capping the count caps the bill.
 
-Why a club needs a bouncer maps one-to-one onto why an API needs a rate limiter:
+#### Q: Where is rate limiting enforced?
 
-- **Prevent abuse / DoS** — one rowdy person can't shove 10,000 friends through the door and trample everyone.
-- **Protect backends** — the club (your database) has a fire-code capacity; the bouncer stops you before you exceed it and everything melts.
-- **Fair usage** — no single big group can pack the whole club and lock everyone else out.
-- **Cost control** — every guest costs the club money (drinks, staff); capping the count caps the bill.
-
-#### Q: Where does the bouncer stand — at each room, or the front door?
-
-At the **front door** — the **API Gateway / edge**, before requests reach your actual servers. You want to turn people away *before* they wander into the building and consume resources. Checking at the entrance is cheap; checking after they've already ordered food is not.
+At the **API Gateway / edge**, before requests reach your actual servers. You want to reject excess requests *before* they consume backend resources. Checking at the entry point is cheap; checking after the request has already done work downstream is not.
 
 #### Q: What does "keyed by user_id / API key / IP" mean?
 
-It's *who the bouncer counts you as*. The limit is "100/min **per person**," not "100/min for the whole planet" — otherwise one busy user would use up everyone's allowance. So the bouncer needs a way to recognize each guest:
+It's *who the limit counts against*. The limit is "100/min **per client**," not "100/min globally" — otherwise one busy client would use up everyone's allowance. So you need a field to identify each client:
 
-- **`user_id`** — logged-in users (most accurate: it's really *you*).
+- **`user_id`** — logged-in users (most accurate: it identifies the actual account).
 - **`API key`** — machine/developer clients calling your API.
-- **`IP address`** — anonymous traffic where you don't know who they are yet.
+- **`IP address`** — anonymous traffic where the client isn't yet identified.
 
-The chosen field becomes the **key** for that person's private counter. This is why every algorithm below starts with a `key` like `user:123` — see the per-user keys discussion in §4.
+The chosen field becomes the **key** for that client's private counter. This is why every algorithm below starts with a `key` like `user:123` — see the per-user keys discussion in §4.
 
 ---
 
@@ -75,9 +71,9 @@ EXPIRE key 60
 
 > **Boundary problem:** limit=100/min. 100 requests at 00:59 + 100 at 01:00 = 200 in ~1s.
 
-### Plain-English: the bouncer with a clock that resets every minute
+### A counter that resets every minute
 
-The bouncer has one clicker-counter and a rule: *"I count guests, and at the top of every minute I reset the counter to 0."* Simple. If you're guest #101 before the minute is up, you're rejected; once the clock ticks over to the next minute, the count is wiped and 100 new people can come in.
+Keep one counter per client with a rule: *"count requests, and at the top of every minute reset the counter to 0."* Simple. Request #101 within a minute is rejected; once the clock ticks over to the next minute, the count is wiped and 100 more requests are allowed.
 
 - Each **fixed window** is a whole minute (`10:10:00`–`10:10:59`), and the counter belongs to that minute only.
 - The `key` bakes the minute into it (`user:123:minute:1010`) so each new minute automatically gets a fresh counter, and `EXPIRE key 60` throws away old ones so memory stays tiny.
@@ -96,17 +92,17 @@ boolean allow(String userId, int limit) {
 }
 ```
 
-#### Q: What exactly is the "boundary burst" bug, in bouncer terms?
+#### Q: What exactly is the "boundary burst" bug?
 
-The reset is **brutal and instantaneous**. Picture limit = 100/min:
+The reset is **abrupt and instantaneous**. Take limit = 100/min:
 
 ```
-10:00:59  →  100 guests rush in    (counter hits 100, minute nearly over)
+10:00:59  →  100 requests arrive   (counter hits 100, minute nearly over)
 10:01:00  →  counter RESETS to 0
-10:01:00  →  100 more guests rush in immediately (counter hits 100 again)
+10:01:00  →  100 more requests arrive immediately (counter hits 100 again)
 ```
 
-In about **one second** you let in **200 people** — double the limit — because the two bursts sit on either side of the reset line. The bouncer obeyed "100 per minute" for each minute individually, but the *rolling* one-second view got slammed. The next few algorithms exist mostly to fix this.
+In about **one second** you allowed **200 requests** — double the limit — because the two bursts sit on either side of the reset line. The counter obeyed "100 per minute" for each minute individually, but the *rolling* one-second view got slammed. The next few algorithms exist mostly to fix this.
 
 ---
 
@@ -126,15 +122,15 @@ if count > limit: reject
 | --- | --- |
 | **Exact**, no boundary burst | **Memory-heavy** (stores every timestamp); costly at scale |
 
-### Plain-English: the bouncer who writes down every entry time
+### Logging each request timestamp
 
-Instead of a clicker that resets, this bouncer keeps a **guest list with exact timestamps**: "Alice 10:00:03, Alice 10:00:41, Alice 10:01:12...". When Alice shows up again, the bouncer:
+Instead of a counter that resets, store an exact **timestamp for every request** from a client. When a new request arrives, the limiter:
 
-1. **Crosses out everyone older than one minute ago** (they no longer count — their window has slid past).
-2. **Counts what's left on the list.**
-3. If that's already at the limit, reject; otherwise add Alice's new timestamp.
+1. **Drops every timestamp older than one minute ago** (those requests have slid out of the window).
+2. **Counts what's left.**
+3. If that's already at the limit, reject; otherwise record the new request's timestamp.
 
-Because the "last 60 seconds" is measured **fresh from right now** (not from a fixed clock), there's no reset line to game — so **no boundary burst**. It's the exact, honest answer.
+Because the "last 60 seconds" is measured **fresh from right now** (not from a fixed clock), there's no reset line to game — so **no boundary burst**. It's the exact answer.
 
 ```java
 // Redis sorted set: members = request timestamps, score = same timestamp.
@@ -155,7 +151,7 @@ boolean allow(String userId, int limit, long windowMs) {
 
 #### Q: Why is this "memory-heavy" when the counter version isn't?
 
-Because it stores **one entry per request**, not one number. If a user makes 10,000 requests a minute, the bouncer's list has 10,000 lines for that one user. Multiply by millions of users and the guest list becomes enormous. Fixed/sliding **counters** store just a couple of integers per user regardless of traffic — that's the trade-off: this one is *exact* but *expensive*.
+Because it stores **one entry per request**, not one number. If a user makes 10,000 requests a minute, the store holds 10,000 timestamps for that one user. Multiply by millions of users and it becomes enormous. Fixed/sliding **counters** store just a couple of integers per user regardless of traffic — that's the trade-off: this one is *exact* but *expensive*.
 
 ---
 
@@ -175,13 +171,13 @@ if rate > limit: reject
 
 > Best **balance** of accuracy and cost → common in production (e.g. Cloudflare-style).
 
-### Plain-English: the bouncer who "blends" the last two minutes
+### Blending the last two windows
 
-This is the clever compromise. Keep the cheap fixed-window counters (just two numbers: this minute's count and last minute's count), but **fake a sliding window** by mixing them based on how far into the current minute you are.
+This is the clever compromise. Keep the cheap fixed-window counters (just two numbers: this minute's count and last minute's count), but **approximate a sliding window** by mixing them based on how far into the current minute you are.
 
-Bouncer's reasoning at 10:01:15 (15 seconds = 25% into the current minute), limit = 100:
+Reasoning at 10:01:15 (15 seconds = 25% into the current minute), limit = 100:
 
-> "The current minute has counted some requests already. And I'm only 25% into this minute, so **75% of the previous minute still overlaps** my rolling 60-second view. Estimate = current count + 75% × previous count."
+> "The current minute has counted some requests already. And we're only 25% into this minute, so **75% of the previous minute still overlaps** the rolling 60-second view. Estimate = current count + 75% × previous count."
 
 ```java
 boolean allow(String userId, int limit, long windowMs) {
@@ -224,20 +220,20 @@ on request:
 
 > **Mental model:** you save up tokens when idle and can spend a burst later. Great for APIs that should tolerate short spikes.
 
-### Plain-English: the arcade with a refilling stack of tokens
+### The token bucket, concretely
 
-Forget counting for a second. Picture an arcade. Each guest has a **cup that holds up to 10 tokens** (`capacity`). A machine drips **1 fresh token into the cup every 6 seconds** (`refill rate` = 10/min). Every ride (request) **costs 1 token**. No token in the cup? You wait.
+Each client has a **bucket that holds up to `capacity` tokens** (say 10). Tokens refill at a fixed rate — **1 token every 6 seconds** (`refill rate` = 10/min). Every request **costs 1 token**. No token available? The request is rejected.
 
-- **Idle for a while?** Your cup fills back up to 10. Now you can take **10 rides back-to-back** — that's an allowed **burst**.
-- **Cup empty?** You're throttled down to "1 ride per 6 seconds" — the steady refill rate.
+- **Idle for a while?** The bucket refills back up to 10. Now the client can make **10 requests back-to-back** — an allowed **burst**.
+- **Bucket empty?** The client is throttled to "1 request per 6 seconds" — the steady refill rate.
 
-So the token bucket says *"bursts are fine, up to a saved-up cap, but your long-run average is capped."* That flexibility (tolerate short spikes, cap the average) is exactly what most APIs want, which is why it's the default.
+So the token bucket says *"bursts are fine, up to a saved-up cap, but the long-run average is capped."* That flexibility (tolerate short spikes, cap the average) is exactly what most APIs want, which is why it's the default.
 
 ```java
 class TokenBucket {
-    final double capacity;      // max tokens the cup holds (max burst size)
+    final double capacity;      // max tokens the bucket holds (max burst size)
     final double refillPerMs;   // tokens added per millisecond
-    double tokens;              // tokens currently in the cup
+    double tokens;              // tokens currently in the bucket
     long   lastRefillMs;        // when we last topped up
 
     boolean allow() {
@@ -259,7 +255,7 @@ class TokenBucket {
 }
 ```
 
-Notice we don't run a background timer dripping tokens — we **compute the refill on demand** ("how much time passed × drip rate") the moment a request arrives. That's why it only needs **two fields** (`tokens`, `lastRefillMs`) and is memory-light.
+Notice we don't run a background timer adding tokens — we **compute the refill on demand** ("time elapsed × refill rate") the moment a request arrives. That's why it only needs **two fields** (`tokens`, `lastRefillMs`) and is memory-light.
 
 #### Q: How is this different from a fixed-window counter?
 
@@ -282,11 +278,11 @@ if queue full: reject
 
 > **Token vs Leaky:** Token bucket allows **bursty** output (up to capacity); leaky bucket forces a **smooth, constant** output.
 
-### Plain-English: the bucket with a hole in the bottom
+### The leaky bucket, concretely
 
-Picture an actual bucket with a small **hole in the bottom**. Requests are water poured in from the top; the hole lets water out at a **fixed, constant drip** (say 10/sec, no matter how fast you pour). If you pour too fast, the bucket fills up; once it **overflows** (queue full), the excess spills on the floor (rejected).
+Requests enter a queue (the bucket) and are processed — "leak out" — at a **fixed, constant rate** (say 10/sec, no matter how fast they arrive). If requests arrive faster than that, the queue fills; once it's full, the excess is rejected (overflow).
 
-The key difference from token bucket: what comes **out** is always a steady trickle. Even if 1,000 requests slam in at once, they leave the bucket at exactly 10/sec. This is **traffic shaping** — smoothing a spiky input into a calm, predictable output — useful when the thing downstream (a legacy service, a payment processor) can only handle a steady pace.
+The key difference from token bucket: the **output** rate is always constant. Even if 1,000 requests arrive at once, they leave at exactly 10/sec. This is **traffic shaping** — smoothing a spiky input into a steady, predictable output — useful when the downstream (a legacy service, a payment processor) can only handle a constant pace.
 
 ```java
 class LeakyBucket {
@@ -333,7 +329,7 @@ One-liner: **token bucket allows bursts; leaky bucket erases them.**
 | **Token bucket** | ✅ allowed | good | tiny | **most common for APIs** |
 | Leaky bucket | ❌ (smoothed) | good | low/med | traffic shaping |
 
-### Plain-English: picking one without overthinking it
+### Picking one without overthinking it
 
 The whole table collapses into a few instincts. Two axes matter: **do you want to allow bursts?** and **how much memory / accuracy can you afford?**
 
@@ -374,11 +370,11 @@ Rule of thumb: **token bucket = protect *yourself* while staying responsive; lea
 -- refill based on elapsed time, then try to consume 1 token
 ```
 
-### Plain-English: many bouncers, one shared guest book
+### Sharing counters across instances
 
-Real systems don't have one bouncer — they have **10 bouncers at 10 doors** (many gateway instances behind a load balancer). The problem: if each bouncer keeps their **own** private counter in their head, a user who spreads 10 requests across 10 bouncers looks like "1 request" to each. Everyone waves them through → the real limit is blown 10×.
+Real systems run **many gateway instances** behind a load balancer, not one. The problem: if each instance keeps its **own** private counter, a user who spreads 10 requests across 10 instances looks like "1 request" to each. All get allowed → the real limit is blown 10×.
 
-Fix: all bouncers write into **one shared guest book** that lives in a central place — **Redis**. Now "how many has this user made?" has a single true answer no matter which door you walked up to.
+Fix: all instances read and write **one shared counter** in a central store — **Redis**. Now "how many has this user made?" has a single true answer no matter which instance handled the request.
 
 ```
 [gateway 1] ┐
@@ -388,7 +384,7 @@ Fix: all bouncers write into **one shared guest book** that lives in a central p
 
 #### Q: What's the race condition, and why does Redis fix it?
 
-If two bouncers do "**read** the count, **decide**, **write** the new count" separately, they can both read `99`, both think "room for one more," and both write `100` — letting **two** people in when only one slot was left. That read-modify-write gap is the race.
+If two instances do "**read** the count, **decide**, **write** the new count" separately, they can both read `99`, both think "room for one more," and both write `100` — allowing **two** requests when only one slot was left. That read-modify-write gap is the race.
 
 Redis fixes it by making the check **one atomic step**:
 
@@ -419,7 +415,7 @@ return allowed            -- 1 = allow, 0 = reject
 
 #### Q: What are "per-user keys" exactly?
 
-Each user gets their **own row in the shared guest book**, addressed by a key built from their identity — e.g. `rl:user:123`, `rl:apikey:abc`, or `rl:ip:49.36.x.x`. The bouncer never mixes two users' tallies. That's why every snippet in §2 keys by the user: the limit is *per person*, so the counter must be *per person* too. (If you also want per-endpoint limits, put that in the key: `rl:user:123:/checkout`.)
+Each user gets their **own entry in the shared store**, addressed by a key built from their identity — e.g. `rl:user:123`, `rl:apikey:abc`, or `rl:ip:49.36.x.x`. Two users' tallies are never mixed. That's why every snippet in §2 keys by the user: the limit is *per client*, so the counter must be *per client* too. (If you also want per-endpoint limits, put that in the key: `rl:user:123:/checkout`.)
 
 #### Q: Isn't calling Redis on every request slow?
 
@@ -437,9 +433,9 @@ It adds a **network hop** (~sub-millisecond, but not free). The trade-off:
 - Include headers: `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
 - Prefer **failing fast** over queuing (unless you're shaping traffic with a leaky bucket).
 
-### Plain-English: what the bouncer *says* when they turn you away
+### What the response says when a request is rejected
 
-A good bouncer doesn't just slam the door — they tell you *why* and *when to come back*. That's what these headers do. Instead of a vague error, the client gets a polite, machine-readable "not now, try again in 30 seconds," so a well-behaved client can back off gracefully instead of hammering harder.
+A good rejection doesn't just fail — it tells the client *why* and *when to retry*. That's what these headers do. Instead of a vague error, the client gets a machine-readable "not now, try again in 30 seconds," so a well-behaved client can back off gracefully instead of retrying harder.
 
 ```
 HTTP/1.1 429 Too Many Requests

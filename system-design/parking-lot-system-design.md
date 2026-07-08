@@ -2,9 +2,9 @@
 
 > A classic **object-oriented design (LLD)** problem. Core challenge: model a multi-floor parking lot that handles **different vehicle/spot types**, **assigns spots**, **issues tickets**, and **charges on exit** — with clean, extensible class design. Interviewers grade **your class model and the design patterns you apply**, not scale.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (a real parking-garage analogy, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
-> **The running analogy:** picture a **real multi-floor parking garage at a mall** — you drive up to a **ticket gate**, a barrier arm blocks you, you press a button, a **paper ticket** prints with the time stamped on it, the arm lifts, and you drive in to hunt for a spot. When you leave, you feed the ticket into a machine, it reads the entry time, charges you for how long you stayed, and only then lifts the exit barrier. Almost every class below maps to something physical in that garage.
+> **The running example:** a **multi-floor parking garage** — you drive up to a **ticket gate**, a barrier arm blocks you, you press a button, a **paper ticket** prints with the time stamped on it, the arm lifts, and you drive in to find a spot. When you leave, you feed the ticket into a machine, it reads the entry time, charges you for how long you stayed, and only then lifts the exit barrier. Almost every class below maps to something physical in that garage.
 
 ---
 
@@ -40,9 +40,9 @@
 
 > **Clarify:** flat rate vs hourly? EV charging spots? Reservations? Single vs multi-lot? State assumptions.
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
-Forget code for a second. Walk through what happens at a **real mall parking garage**, and notice that every line item above is just one of these steps:
+Walk through what happens at a parking garage, and notice that every line item above is just one of these steps:
 
 1. A car (or bike, or truck) drives up to the **entry gate**. A camera/attendant figures out what kind of vehicle it is.
 2. The system finds a **free spot that this vehicle actually fits in** (a truck can't squeeze into a motorcycle slot).
@@ -89,7 +89,7 @@ EntryGate issues Ticket; ExitGate processes Payment
 | `ParkingRate` / `FeeCalculator` | Pricing rules |
 | `PaymentProcessor` | Cash/card/UPI |
 
-### Plain-English: mapping each entity to the real garage
+### Mapping each entity to the real garage
 
 The trick to remembering these entities: **every one is a physical thing you can point at in the garage.**
 
@@ -169,7 +169,7 @@ interface FeeStrategy { Money calculate(Ticket t, Instant exit); }
 interface PaymentProcessor { boolean pay(Money amount, PaymentMethod m); }
 ```
 
-### Plain-English: reading the class model piece by piece
+### Reading the class model piece by piece
 
 The compact code above is the whole design squished together. Here is the **same design, spelled out with comments** so you can see *why* each piece looks the way it does.
 
@@ -316,7 +316,7 @@ Inside `ParkingLot.parkVehicle(v)`, which orchestrates the smaller objects: ask 
 
 > **Interview tip:** lead with **Strategy** (assignment + pricing), **Factory** (vehicle/spot creation), **Singleton** (lot), **Observer** (display boards), **State** (spot/ticket). That set covers most follow-ups.
 
-### Plain-English: the patterns, each as a garage story
+### The patterns, each in the garage
 
 "Design patterns" sound scary but each is just a **named, reusable solution to a recurring problem**. Here's each one as a concrete thing in our garage — with the smallest possible code.
 
@@ -333,7 +333,7 @@ class NearestToGateStrategy implements SpotAssignmentStrategy { /* closest free 
 lot.assignment = new NearestToGateStrategy();
 ```
 
-Analogy: same coffee machine, different pods. **Same garage, different rulebook for picking spots.**
+**Same garage, different rulebook for picking spots.**
 
 #### Factory — "one place that builds things"
 
@@ -351,7 +351,7 @@ class VehicleFactory {
 }
 ```
 
-Analogy: the gate attendant glances at your vehicle and grabs the right kind of ticket — you don't build it yourself. Add a bus? Add one line here, not everywhere someone creates a vehicle.
+The gate attendant reads the vehicle type and hands back the right kind of object — callers don't build it themselves. Add a bus? Add one line here, not everywhere someone creates a vehicle.
 
 #### Singleton — "there is only ONE lot"
 
@@ -365,7 +365,7 @@ class ParkingLot {
 }
 ```
 
-Analogy: there's **one physical garage**, so there's one source of truth for "how many spots are free."
+There's **one physical garage**, so there's one source of truth for "how many spots are free."
 
 #### State — "an object behaves differently depending on its status"
 
@@ -387,9 +387,9 @@ void onSpotChanged() {
 }
 ```
 
-Analogy: the "SPACES: 40" LED sign flips the instant a car parks — because it's *listening*, not re-counting every second.
+The "SPACES: 40" LED sign flips the instant a car parks — because it's *listening*, not re-counting every second.
 
-#### Decorator — "stack fee rules like Lego"
+#### Decorator — stack fee rules
 
 Pricing is rarely one rule. It's base fare **+** EV charging **+** weekend surcharge **+** tax. Decorator lets you wrap a base fee with add-ons, each independent.
 
@@ -401,7 +401,7 @@ fee = new TaxDecorator(fee);          // wrap: add tax on top
 // calling fee.calculate(...) now runs all four, outer-to-inner.
 ```
 
-Analogy: a coffee order — espresso, **+**shot, **+**oat milk, **+**caramel. Each topping wraps the last.
+Each add-on wraps the one beneath it, so the fee is built up layer by layer.
 
 > **Composite** (`Lot → Floors → Spots`) just means you can ask "how many free?" at any level and it recurses down — the lot sums its floors, each floor sums its spots. **Facade** (`ParkingLotService`) is a friendly front desk that hides all these moving parts behind a simple `park()` / `unpark()`.
 
@@ -424,7 +424,7 @@ parkVehicle(vehicle):
 
 Assignment strategies (swappable): **best-fit** (smallest compatible spot — maximizes utilization), **nearest to gate**, **by floor preference**, **EV-first for EVs**.
 
-### Plain-English: how a spot actually gets chosen
+### How a spot actually gets chosen
 
 Picture yourself driving in. You want the *nearest* spot your car fits in, and the garage wants to *not waste* a big spot on a small car. That tension is what "assignment strategy" resolves.
 
@@ -501,7 +501,7 @@ fee(ticket, exitTime):
     return total
 ```
 
-### Plain-English: turning "time parked" into "money owed"
+### Turning "time parked" into "money owed"
 
 At exit the machine knows two things: **when you entered** (from the ticket) and **now**. Fee = a function of that gap, your vehicle type, and any extras. The clever bit is making that function *swappable and stackable*.
 
@@ -602,7 +602,7 @@ CREATE TABLE parking_rate ( vehicle_type VARCHAR(20) PRIMARY KEY, rate_per_hour 
 
 > **Tables to consider:** parking_lot, parking_floor, parking_spot, ticket, payment, parking_rate, vehicle (optional registry), display_board_state (optional).
 
-### Plain-English: from classes to tables
+### From classes to tables
 
 If the garage runs across many gate machines (not just one program in memory), the state has to live in a **shared database** so every gate agrees on what's free. The tables are just the classes from §3, flattened into rows.
 
@@ -640,7 +640,7 @@ GET  /v1/availability?type=CAR                        → { free: 42 }
 GET  /v1/tickets/{id}
 ```
 
-### Plain-English: the API is just the gates, over HTTP
+### The API is just the gates, over HTTP
 
 If you wrap the garage as a web service, each endpoint is one physical action:
 
@@ -661,7 +661,7 @@ If you wrap the garage as a web service, each endpoint is one physical action:
 - Availability counters: atomic increment/decrement (or derive from DB).
 - If distributed (multiple gate servers): Redis atomic ops or DB conditional update as the source of truth.
 
-### Plain-English: the "two cars, one spot" race
+### The "two cars, one spot" race
 
 This is *the* concurrency question for this problem, so let's make it vivid.
 

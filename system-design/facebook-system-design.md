@@ -2,7 +2,7 @@
 
 > **Core challenge:** model a huge **bidirectional social graph** (friends), generate a **ranked News Feed** from friends'/groups'/pages' activity, and support posts, reactions, comments, and notifications — read-heavy, at billions of users, with **privacy** enforced on every read. The distinctive parts vs Twitter are the **mutual friend graph** and **rich ML feed ranking**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -43,7 +43,7 @@ Friends (mutual) → post activity → your News Feed = ranked merge of friends'
 
 Read-heavy; the two hard parts are the **friend graph at scale** and **feed generation + ranking**, plus **privacy on every read**.
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
 Picture Facebook the way a normal user experiences it. You have a list of **friends** (people you both agreed to connect with). Each friend **posts** stuff — a photo, a status, a link. When you open the app, you see a **News Feed**: a scrolling list mixing your friends' posts, posts from **groups** you joined, and **pages** you follow, sorted "best first" instead of purely newest-first.
 
@@ -55,9 +55,9 @@ So there are really only three big nouns to keep in your head:
 
 Everything hard about this system comes from **scale** (billions of people, trillions of friendship lines) and from the fact that people **read** far more than they **write** (you scroll for an hour but post once a week).
 
-### Plain-English: why is the friend graph "bidirectional" and why does it matter?
+### Why is the friend graph "bidirectional" and why does it matter?
 
-**Analogy:** Twitter/Instagram follows are like **subscribing to a magazine** — you can follow a celebrity without them following you back. It's a **one-way arrow**. Facebook friendship is like a **handshake** — both people must agree (send request → accept), and once you're friends, you're friends *to each other*. It's a **two-way line**.
+Twitter/Instagram follows are **one-way**: you can follow a celebrity without them following you back. Facebook friendship is **two-way**: both people must agree (send request → accept), and once you're friends, you're friends *to each other*.
 
 ```
 Twitter:   Alice ───follows──►  Celebrity        (one direction, no permission needed)
@@ -107,7 +107,7 @@ Graph: 3B users × ~300 edges ≈ ~1 trillion edges → sharded graph store + he
 
 > Two pressures: a **trillion-edge graph** (read on every feed build → TAO-style cache) and **millions of feed reads/sec** (precompute + rank + cache).
 
-### Plain-English: where do these scary numbers come from?
+### Where do these numbers come from?
 
 The point of this section isn't the exact digits — it's to **prove to yourself that the naive design is impossible**, which forces the real design. Let's walk each line like a back-of-napkin sketch.
 
@@ -115,7 +115,7 @@ The point of this section isn't the exact digits — it's to **prove to yourself
 - **Feed reads ~ millions/sec.** Every time anyone opens the app or scrolls, that's a feed read. Two billion daily users scrolling many times a day = millions of reads *every second*. If each read tried to freshly gather + rank posts from 300 friends, you'd do billions of graph lookups per second. Impossible → so we **precompute** feeds ahead of time and **cache** the result.
 - **Fan-out math.** When you post once, that post has to reach ~300 friends' feeds → **one write becomes ~300 writes**. Usually fine. But a **page with 100M followers** posting once = 100M feed writes for a single action. That explosion is the **celebrity/high-degree problem** (see §6).
 
-**Analogy:** imagine a small-town post office. One person mailing 300 holiday cards is manageable. But if a celebrity tries to hand-deliver a letter to 100 million fans, the post office collapses. Same event ("send a message"), wildly different cost depending on how many recipients.
+The same operation ("deliver a post to followers") has wildly different cost depending on recipient count: fanning out to 300 friends is cheap; fanning out to 100 million followers is not.
 
 #### Q: What does "read-heavy" really mean, and why do we keep repeating it?
 
@@ -143,24 +143,24 @@ Client → API Gateway
           Kafka (POST_CREATED, REACTION, COMMENT → fan-out, ranking features, index, notifications)
 ```
 
-### Plain-English: why so many separate services?
+### Why so many separate services?
 
-**Analogy: a big restaurant.** You don't have one person do everything — you have a host (seats guests), waiters (take orders), chefs (cook), a dishwasher, a cashier. Each has one job, and they hand work to each other. Breaking Facebook into services works the same way: each box does **one thing well**, and they talk to each other. If the "dishwasher" (say, the search indexer) is slow or breaks, the "chefs" (feed) keep cooking.
+Each service does **one thing well** and hands work to the others. If one service (say, the search indexer) is slow or breaks, the others (feed, posts) keep working.
 
 Walking the boxes in plain terms:
 
-- **API Gateway** — the front door / receptionist. Every request from your phone hits it first; it routes you to the right service and checks you're logged in.
-- **Graph Service** — the "who-knows-who" department. Answers "who are Alice's friends?" (§5).
+- **API Gateway** — every request from your phone hits it first; it routes you to the right service and checks you're logged in.
+- **Graph Service** — answers "who are Alice's friends?" (§5).
 - **Post Service** — stores and fetches the actual content of posts.
-- **Fan-out Service** — the mailroom. When you post, it copies the post id into all your friends' feed inboxes (§6).
-- **Feed Service** — the editor that assembles + ranks + serves your News Feed (§6, §7).
-- **Privacy/ACL Service** — the bouncer. Checks "is this viewer allowed to see this post?" on every read (§8).
+- **Fan-out Service** — when you post, it copies the post id into all your friends' feeds (§6).
+- **Feed Service** — assembles + ranks + serves your News Feed (§6, §7).
+- **Privacy/ACL Service** — checks "is this viewer allowed to see this post?" on every read (§8).
 - **Comment/Reaction Service** — handles likes/comments, and counts them **asynchronously** (later, in the background) because there are billions.
 - **Notification / Media / Search** — pings, photo/video storage on a CDN, and the search index.
 
 #### Q: What is Kafka doing sitting in the middle?
 
-**Kafka is a shared to-do list (an event log).** When something happens ("Alice posted", "Bob liked"), the service that noticed it just **drops a note on Kafka and moves on** — it does *not* wait for fan-out, ranking, indexing, and notifications to finish. Other services (workers) pick those notes up and do their part on their own time.
+**Kafka is a shared event log.** When something happens ("Alice posted", "Bob liked"), the service that noticed it just **publishes an event to Kafka and moves on** — it does *not* wait for fan-out, ranking, indexing, and notifications to finish. Other services (workers) consume those events and do their part on their own time.
 
 ```java
 // Post Service just records the event and returns immediately — fast for the user.
@@ -205,14 +205,14 @@ Common queries (served from TAO cache, not MySQL):
 
 > **Interview line:** "sharded adjacency lists (objects + typed associations) behind a **read-through graph cache (TAO-style)** since friend lists are read on every feed build; sharded by id; mutuals = set intersection; suggestions = 2-hop friends-of-friends."
 
-### Plain-English: objects and associations (the whole model in one idea)
+### Objects and associations (the whole model in one idea)
 
-TAO looks intimidating but it's built from just **two Lego bricks**:
+TAO looks intimidating but it's built from just **two primitives**:
 
 - **Objects** = the **things** (nouns). A user, a post, a comment, a page. Each has an id and some fields.
 - **Associations** = the **relationships** (verbs) between two things. "Alice *is friends with* Bob." "Alice *authored* post 99." "Bob *likes* post 99."
 
-**Analogy: a contacts app + a diary of relationships.** Objects are the contact cards (name, photo, birthday). Associations are the sticky notes joining cards: "these two are friends", "this person wrote that post". To answer almost any Facebook question, you either look up a card (object) or follow the sticky notes (associations).
+Objects hold an entity's fields (a user's name, photo, birthday). Associations are the typed links between them: "these two are friends", "this person wrote that post". To answer almost any Facebook question, you either look up an object or follow its associations.
 
 ```java
 // An OBJECT: a typed node with fields.
@@ -239,7 +239,7 @@ graph.addAssoc(alice, "friend", bob);
 graph.addAssoc(bob,   "friend", alice);
 ```
 
-### Plain-English: the four queries TAO is built to answer
+### The four queries TAO is built to answer
 
 Almost every graph question is one of four shapes. TAO exposes exactly these, and the cache makes them fast:
 
@@ -269,12 +269,12 @@ Set<Long> mutual = new HashSet<>(friendIds(alice));
 mutual.retainAll(friendIds(bob));   // keep only ids present in BOTH lists
 ```
 
-### Plain-English: what "read-through / write-through cache" means
+### What "read-through / write-through cache" means
 
-**Analogy: a librarian (cache) in front of a slow basement archive (MySQL).**
+The cache sits in front of MySQL (the durable store):
 
-- **Read-through:** you ask the librarian for a book. If it's on her desk (cache hit), instant. If not (cache miss), *she* walks to the basement, fetches it, **keeps a copy on her desk**, and hands it to you. You never talk to the basement directly.
-- **Write-through:** when you return an edited book, you hand it to the librarian, who updates **both** her desk copy **and** the basement copy, so they never disagree.
+- **Read-through:** on a request, if the value is in the cache (hit), return it instantly. If not (miss), the cache fetches it from MySQL, **stores a copy**, and returns it. Callers never query MySQL directly.
+- **Write-through:** on a change, the cache updates **both** its copy **and** MySQL together, so they never disagree.
 
 ```java
 // READ-THROUGH: cache fetches from MySQL on a miss and remembers it.
@@ -336,14 +336,12 @@ Build feed:
 - Store **post ids** in the feed cache; hydrate content from a shared post cache (a viral post cached once).
 - Because ranking is heavy, feeds are often **pull + rank at read with cached candidates**, or precomputed candidate sets re-ranked at read.
 
-### Plain-English: fan-out on write vs fan-out on read (the central trade-off)
+### Fan-out on write vs fan-out on read (the central trade-off)
 
 This is *the* concept for feeds. The question: **when Alice posts, when do we do the work of getting it into her 300 friends' feeds — right now (at write) or later when each friend opens the app (at read)?**
 
-**Analogy: a newsletter.**
-
-- **Push (fan-out on write)** = the moment you write the newsletter, you **photocopy it and stuff a copy into all 300 subscribers' mailboxes**. When a subscriber checks their mailbox, it's already there — instant. But *you* did 300 copies of work up front, even for subscribers who never check their mail today.
-- **Pull (fan-out on read)** = you write **one** copy and file it. When a subscriber wants to read, *they* go gather the latest from everyone they subscribe to, right then. Cheap for you to publish; expensive every time someone reads.
+- **Push (fan-out on write)** = the moment Alice posts, copy the post id into all 300 friends' feeds. When a friend opens the app it's already there — instant. But that's 300 writes up front, even for friends who never open the app today.
+- **Pull (fan-out on read)** = store **one** copy of the post and nothing else. When a friend opens the app, gather the latest posts from everyone they follow, right then. Cheap to publish; expensive every time someone reads.
 
 ```
 PUSH (fan-out on WRITE):   Alice posts ──► copy id into Bob's feed, Carol's feed, ... (300 writes NOW)
@@ -388,9 +386,9 @@ List<Long> fanOutOnRead(long viewer) {
 | Wasteful when | Friends rarely log in | Content re-fetched on every scroll |
 | Breaks on | **Celebrities** (N = 100M writes per post) | Very active users (rebuild huge feed constantly) |
 
-### Plain-English: the celebrity problem and why hybrid wins
+### The celebrity problem and why hybrid wins
 
-Push is great for a normal person (300 copies, no big deal). But a **page with 100 million followers** posting once would trigger **100 million feed writes** — a single button press melting the mailroom. That's the **celebrity / high-degree problem**.
+Push is great for a normal person (300 copies, no big deal). But a **page with 100 million followers** posting once would trigger **100 million feed writes** — a single button press overwhelming the fan-out pipeline. That's the **celebrity / high-degree problem**.
 
 **The fix = hybrid.** Use push for **normal** accounts (most posts, small fan-out) and pull for a handful of **celebrities/huge pages** (skip the 100M writes; instead, mix their recent posts in *at read time* for the few thousand people currently online).
 
@@ -413,7 +411,7 @@ List<Long> buildFeed(long viewer) {
 }
 ```
 
-**Analogy:** most of your mail is pre-delivered to your mailbox (push). But for the world's most popular magazine, the post office doesn't print 100M copies — it keeps a few and you grab the latest issue from the rack (pull) when you visit. You experience one combined pile of reading; behind the scenes two delivery methods were used.
+So most posts are pre-delivered into feeds (push), but the few very high-degree accounts are not fanned out — their recent posts are pulled in at read time. The reader sees one combined feed; behind the scenes two methods were used.
 
 #### Q: Why store only post **ids** in the feed, not the whole post?
 
@@ -452,11 +450,11 @@ Facebook's feed is **relevance-ranked** (historically "EdgeRank", now ML). Treat
 - Classic **EdgeRank** intuition: `score ≈ affinity × content_weight × time_decay`.
 - Ranking runs on **candidate sets** (bounded), not the whole graph, so it's tractable.
 
-### Plain-English: why rank at all, and what the pipeline does
+### Why rank at all, and what the pipeline does
 
 A purely **newest-first** feed sounds fair but is bad: your best friend's baby photo gets buried under 50 auto-posts from a page you barely follow. **Ranking** = "show the stuff you're most likely to care about near the top."
 
-**Analogy: a smart personal assistant sorting your mail.** They don't just stack it by arrival time — they put the handwritten letter from your best friend on top, bills next, and junk mail at the bottom. The **feature extraction** step is the assistant *noticing* things about each letter (who it's from, how urgent, how you treated similar mail before); the **model** is their learned judgment of what you'll want first.
+Ranking sorts posts by predicted relevance rather than arrival time. The **feature extraction** step computes signals about each post (who it's from, how recent, how you've engaged with similar content before); the **model** turns those signals into a predicted-engagement score used to order the feed.
 
 Walk the 5 stages with a concrete example — you open the app and there are 800 eligible posts:
 
@@ -530,9 +528,9 @@ canView(viewer, post):
 - Enforced at **feed build + post fetch**; a blocked user never sees your content.
 - Privacy filtering happens **during candidate generation** so restricted posts never enter a feed.
 
-### Plain-English: privacy is a bouncer, not a lock on the door
+### Privacy is checked on every read
 
-**Analogy: a nightclub bouncer.** Every post is a room. Every time *anyone* tries to enter (a feed build, a direct link, a search result), the **bouncer checks the guest list right then**. Privacy isn't a one-time setting you trust forever — it's a **check performed on every single read**, because your relationships change (you unfriend, you block) and the same post might be visible to one viewer and forbidden to another.
+Privacy isn't a one-time setting you trust forever — it's a **check performed on every single read** (feed build, direct link, search result), because your relationships change (you unfriend, you block) and the same post might be visible to one viewer and forbidden to another.
 
 The four scopes, in plain words:
 
@@ -542,7 +540,7 @@ The four scopes, in plain words:
 - **ONLY_ME** — just the author (a private draft/diary).
 
 ```java
-// The bouncer. Returns true only if THIS viewer may see THIS post, right now.
+// Access check. Returns true only if THIS viewer may see THIS post, right now.
 boolean canView(long viewer, Post post) {
     if (isBlocked(post.authorId, viewer)) return false;   // blocked people see nothing, always first
 
@@ -556,7 +554,7 @@ boolean canView(long viewer, Post post) {
 }
 ```
 
-### Plain-English: why filter during candidate generation (not after ranking)
+### Why filter during candidate generation (not after ranking)
 
 You filter **as early as possible** so a forbidden post never even enters the pipeline. If you filtered *after* ranking, a bug in the ranking/pagination code could leak a restricted post — the safest design is: it was never a candidate in the first place.
 
@@ -590,11 +588,11 @@ If the code is ever unsure (unknown scope, missing data, an error), it defaults 
 - **Comments** = tree (materialized path), lazy-loaded, ranked (top/newest).
 - Shares create a new post referencing the original.
 
-### Plain-English: why counts are "async" and "approximate"
+### Why counts are "async" and "approximate"
 
 When a post goes viral, **millions of people hit Like within seconds**. If every Like did `UPDATE posts SET like_count = like_count + 1 WHERE post_id = 99`, all those writes fight over **one row** (the classic hot-row problem — same as a viral ad in a click-counter). It would melt.
 
-**Analogy: counting concert-goers.** You don't make each person update a giant scoreboard the instant they walk in (chaos at the gate). Instead, each turnstile keeps its own tally, and every few seconds those tallies are added to the big board. The board is a second or two behind reality — and that's totally fine for a Like count.
+Instead of every Like updating the shared counter immediately, reactions are recorded individually and their counts are aggregated in batches every few seconds. The displayed count is a second or two behind reality — and that's totally fine for a Like count.
 
 So we **record the reaction** (durable, exact) but **update the displayed count in the background**:
 
@@ -612,17 +610,17 @@ void aggregate(List<ReactionEvent> batch) {
     Map<Long,Long> deltas = new HashMap<>();
     for (var e : batch) deltas.merge(e.postId(), 1L, Long::sum);   // 5000 likes → one +5000
     deltas.forEach((postId, delta) ->
-        countCache.incrBy("likes:" + postId, delta));              // update the "big board" in bulk
+        countCache.incrBy("likes:" + postId, delta));              // update the cached count in bulk
 }
 ```
 
 The displayed number is **eventually consistent** — it might read "1,204,900" while the true value is "1,205,050" for a second. Nobody cares about ±150 on a million-like post, and we avoided the hot row. The **exact** truth still lives in `reactionStore` if we ever need to recount (e.g., you toggling your own like on/off must be exact).
 
-### Plain-English: comments as a tree (materialized path)
+### Comments as a tree (materialized path)
 
-Comments have **replies**, replies have **replies** — that's a **tree**, not a flat list. The neat trick to store a tree in a plain SQL table is a **materialized path**: each comment stores the "address" of its ancestors as a string.
+Comments have **replies**, replies have **replies** — that's a **tree**, not a flat list. The neat trick to store a tree in a plain SQL table is a **materialized path**: each comment stores the full ancestry as a string.
 
-**Analogy: chapter numbering in a book.** Section `2.3.1` instantly tells you it lives under `2.3`, which lives under `2`. The path *is* the position in the tree.
+This works like hierarchical section numbering: `2.3.1` sits under `2.3`, which sits under `2`. The path *is* the position in the tree.
 
 ```
 Post 99
@@ -703,15 +701,15 @@ CREATE TABLE notifications ( notif_id BIGINT PRIMARY KEY, user_id BIGINT, type V
 
 > **Tables to consider:** users, friendships, posts, reactions, comments, groups, group_members, pages, page_follows, blocks, notifications, precomputed feeds (Redis), media_refs, privacy/ACL, search index. Chat = separate messaging system.
 
-### Plain-English: reading the schema table by table
+### Reading the schema table by table
 
-Don't memorize columns — understand **why each table exists** and the one clever bit in each. Think of tables as **filing cabinets**, one per kind of thing:
+Don't memorize columns — understand **why each table exists** and the one clever bit in each. Each table holds one kind of thing:
 
-| Table | Plain-English purpose | The clever bit |
+| Table | Purpose | The clever bit |
 | --- | --- | --- |
 | `users` | One card per person | `email UNIQUE` so no two accounts share an email |
 | `friendships` | The friend graph, as rows | Stores **both directions** + a `status` (PENDING/ACCEPTED/BLOCKED) — one table models the whole friend-request lifecycle |
-| `posts` | The content | Denormalized `like_count`/`comment_count` **cached on the row** so the feed doesn't recount; `privacy` + `audience` drive the bouncer (§8) |
+| `posts` | The content | Denormalized `like_count`/`comment_count` **cached on the row** so the feed doesn't recount; `privacy` + `audience` drive the visibility check (§8) |
 | `reactions` | Who liked what | PK `(user_id, post_id)` → you can only react **once** per post (toggle) |
 | `comments` | The comment trees | `path` = materialized path (§9) for cheap threaded reads |
 | `blocks` | Hard walls | Checked first in `canView` |

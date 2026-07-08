@@ -2,7 +2,7 @@
 
 > The "horizontal" knowledge interviewers cross-examine in almost every system design round: **SQL vs NoSQL, ACID vs BASE, replication, partitioning/sharding**.
 
-> **How to read this doc:** each section gives the dense summary first, then a **Plain-English** deep dive (analogies, annotated SQL, and the exact confusions that trip people up while learning). Skim the summaries for revision; read the Plain-English parts to actually understand.
+> **How to read this doc:** each section gives the dense summary first, then a **deep dive** (annotated SQL, and the exact confusions that trip people up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -49,12 +49,10 @@
 
 > ⚠️ "NoSQL = no schema" is misleading — you still design around **access patterns** (query-first modeling), often denormalizing.
 
-### Plain-English: SQL vs NoSQL
+### SQL vs NoSQL in detail
 
-**Analogy: a spreadsheet vs a pile of sticky notes.**
-
-- **SQL** is like a strict **spreadsheet** (Excel). Every row has the *same* columns. Before you add data, you must decide the columns (`name`, `email`, `age`). Everything is neat, related, and you can ask precise questions across sheets ("join the Orders sheet to the Customers sheet").
-- **NoSQL** is like a box of **sticky notes / JSON blobs**. Each note can look different — one has a phone number, the next doesn't. Super flexible and easy to spread across many boxes (machines), but *you* are responsible for keeping related notes consistent.
+- **SQL** enforces a strict, fixed schema. Every row in a table has the *same* columns, which you define up front (`name`, `email`, `age`). Data is structured and related, and you can run precise queries across tables (joining Orders to Customers).
+- **NoSQL** allows flexible, per-record structure. One document can have a phone number, the next may not. This is flexible and easy to spread across many machines, but *you* are responsible for keeping related records consistent.
 
 In SQL you shape your data first, then query it however you like. In NoSQL you decide your queries first, then shape the data to make those queries fast.
 
@@ -106,11 +104,11 @@ Match the family to the shape of your access pattern: **Key-Value** (Redis) for 
 
 > **One-liner:** ACID favors **correctness**; BASE favors **availability + scale**. CAP forces the trade-off (§5).
 
-### Plain-English: what is a transaction, and what does ACID guarantee?
+### What is a transaction, and what does ACID guarantee?
 
 **A transaction is a group of steps that must all happen together, or not at all.**
 
-**Analogy: transferring ₹100 from your account to a friend's.** It's two steps: (1) subtract ₹100 from you, (2) add ₹100 to your friend. If step 1 works but the server crashes before step 2, your ₹100 just *vanished*. A transaction says: "treat these two steps as **one indivisible action** — either both land, or neither does."
+**Example: transferring ₹100 from your account to a friend's.** It's two steps: (1) subtract ₹100 from you, (2) add ₹100 to your friend. If step 1 works but the server crashes before step 2, your ₹100 just *vanished*. A transaction says: "treat these two steps as **one indivisible action** — either both land, or neither does."
 
 ```sql
 BEGIN;                                              -- start the transaction
@@ -144,7 +142,7 @@ BASE is the opposite philosophy for huge distributed systems:
 - **Soft state** — data can be "in flux" while replicas sync up.
 - **Eventual consistency** — if writes stop, all replicas *eventually* agree.
 
-**Analogy:** ACID is a bank ledger (must be exact, right now). BASE is a **social media like-count** — if you see 1,002 likes and your friend briefly sees 1,001, nobody cares, and the system stays fast and always-online. You trade instant correctness for **availability and scale**.
+ACID suits a bank ledger (must be exact, right now). BASE suits something like a **social media like-count** — if you see 1,002 likes and your friend briefly sees 1,001, nobody cares, and the system stays fast and always-online. You trade instant correctness for **availability and scale**.
 
 ---
 
@@ -166,15 +164,15 @@ BASE is the opposite philosophy for huge distributed systems:
 
 > Default for Postgres = Read Committed; MySQL InnoDB = Repeatable Read.
 
-### Plain-English: isolation levels and the anomalies they stop
+### Isolation levels and the anomalies they stop
 
-Isolation levels answer one question: **"while my transaction is running, how much of other people's half-finished work am I allowed to see?"** More isolation = safer but slower (more locking); less isolation = faster but you risk weird reads.
+Isolation levels answer one question: **while my transaction is running, how much of other transactions' uncommitted work am I allowed to see?** More isolation = safer but slower (more locking); less isolation = faster but you risk anomalous reads.
 
-**Analogy: reading a Google Doc while a coworker is editing it.**
+The three anomalies:
 
-- **Dirty read** — you read a sentence your coworker typed but *hasn't saved*; they hit undo. You acted on text that never really existed.
-- **Non-repeatable read** — you read a cell, look away, read the **same cell** again, and the number changed (they edited and saved in between).
-- **Phantom read** — you count "5 rows match 'status = open'", look again, and now there are **6 rows** (they added a new matching row). The rows you already saw didn't change — the *set* grew.
+- **Dirty read** — you read a row another transaction has written but *not yet committed*; if it rolls back, you acted on data that never really existed.
+- **Non-repeatable read** — you read a row, then read the **same row** again later in the same transaction, and the value changed (another transaction updated and committed it in between).
+- **Phantom read** — you run a query that matches 5 rows, run the **same query** again, and now 6 rows match (another transaction inserted a matching row). The rows you already saw didn't change — the result *set* grew.
 
 The levels are just how many of these you're willing to tolerate, cheapest → safest:
 
@@ -234,11 +232,11 @@ Reads  → Followers (scale reads)
 
 > **Read-your-writes fix:** route a user's reads to the leader for a short window, or read from a replica known to be caught up.
 
-### Plain-English: replication and the "I don't see my own comment" bug
+### Replication and the "I don't see my own comment" bug
 
 **Replication = keeping identical copies of your data on multiple machines** so that if one dies you don't lose data, and so many machines can share the read load.
 
-**Analogy: a head chef and line cooks.** The **leader** (head chef) is the only one allowed to *change* the recipe book. Whenever it changes, it shouts the update to the **followers** (line cooks), who copy it down. Anyone can *read* from a line cook's copy (spreading the reading around), but only the head chef *writes*.
+In leader–follower replication, the **leader** is the only node that accepts writes. Whenever data changes, it propagates the change to the **followers**, which copy it. Reads can be served from any follower (spreading read load), but only the leader accepts writes.
 
 ```
 Writes → Leader          (single source of truth for changes)
@@ -291,14 +289,14 @@ During a **network partition (P)** you must choose:
 
 Captures the everyday trade-off CAP ignores: even without partitions, replication forces **latency vs consistency**.
 
-### Plain-English: CAP without the jargon
+### CAP in concrete terms
 
 CAP is about what happens when your machines **can't talk to each other** (a **network partition** — a cable is cut, a data center is unreachable). In that moment you're forced to choose between two bad options.
 
-**Analogy: two bank branches whose phone line just went dead.** A customer wants to withdraw ₹1,000. Neither branch can confirm the other's balance.
+Suppose two replicas of your database can no longer reach each other, and a request arrives that they can't coordinate on:
 
-- **CP (choose Consistency)** — the branch says *"sorry, I can't verify right now, come back later."* It refuses to risk a wrong answer. Correct, but **unavailable**. → seat booking, payments.
-- **AP (choose Availability)** — the branch says *"sure, here's your money"* and hopes to reconcile later. Always answers, but two branches might both hand out the *same* ₹1,000. Available, but **possibly inconsistent**. → social feeds, product browsing.
+- **CP (choose Consistency)** — the replica **refuses the request or errors** rather than risk returning a wrong answer. Correct, but **unavailable**. → seat booking, payments.
+- **AP (choose Availability)** — the replica **answers with its local data** and reconciles later. Always responds, but two replicas may diverge and briefly disagree. Available, but **possibly inconsistent**. → social feeds, product browsing.
 
 ```
 Network partition happening?
@@ -336,7 +334,7 @@ A **`users` table with 100M rows** on one server means **slow queries**, **DB ov
 | Scaling | Limited (vertical) | **Horizontal** |
 | Complexity | Low | High |
 
-> **Analogy:** partitioning = drawers in **one cupboard**; sharding = **cupboards in different rooms**.
+> **In short:** partitioning splits data *within one database*; sharding splits data *across multiple databases/machines*.
 
 ### Vertical vs horizontal
 
@@ -474,21 +472,19 @@ Partitioned by order_date, filter user_id → N partitions × lookup  ❌ slower
 
 > **Mental model:** partitioning = **organize** data; sharding = **scale** data. Reach for partitioning first; shard only when a single DB can't cope.
 
-### Plain-English: partitioning vs sharding in one picture
+### Partitioning vs sharding in one picture
 
-**Analogy: a giant filing cabinet that got too full.**
-
-- **Partitioning** = adding **labeled drawers to the same cabinet** (2023, 2024, 2025). Same office, same person, just organized so you open one drawer instead of digging through everything. Still limited by that one cabinet's size.
-- **Sharding** = buying **more cabinets and putting them in different rooms** (and different buildings). Now you have near-unlimited space, but to find a file you must first know *which room* to walk to.
+- **Partitioning** = splitting a table into pieces **within one database** (e.g. by year: 2023, 2024, 2025). Same server, just organized so a query touches one partition instead of the whole table. Still limited by that one server's capacity.
+- **Sharding** = splitting data **across multiple databases on different machines**. Now you have near-unlimited capacity, but to find a row you must first know *which shard* holds it.
 
 ```
-Partitioning:   [ one DB ]  →  drawer A | drawer B | drawer C     (organize)
-Sharding:        [DB 1]  [DB 2]  [DB 3]  on different machines     (scale)
+Partitioning:   [ one DB ]  →  partition A | partition B | partition C     (organize)
+Sharding:        [DB 1]  [DB 2]  [DB 3]  on different machines             (scale)
 ```
 
 #### Q: What is a "shard key" and why does the choice matter so much?
 
-The **shard key** is the field the system uses to decide *which cabinet a row lives in* (e.g. `user_id`). It matters because:
+The **shard key** is the field the system uses to decide *which shard a row lives on* (e.g. `user_id`). It matters because:
 
 - **If your query includes the shard key** → the router walks straight to the one shard. Fast.
 - **If it doesn't** → the system must ask *every* shard and merge results ("scatter-gather"). Slow.
@@ -519,7 +515,7 @@ Because a join needs all the rows *in one place* to match them up. Within one DB
 100 users, 10 connections → 10 run in parallel, rest queue     ✅ fast
 ```
 
-> **Restaurant analogy:** DB = kitchen, connections = waiters, requests = customers. 10 waiters → 10 customers served at once; the 11th waits for a free waiter.
+> **In short:** the pool holds a fixed set of connections; requests borrow one, use it, and return it. With 10 connections, 10 requests run at once; the 11th waits for one to free up.
 
 ### It's configurable & dynamic (not always exactly "10")
 
@@ -573,11 +569,11 @@ spring.datasource.hikari.maximum-pool-size=10
 
 > **Mental model:** pool = **capacity**, connections = **shared resources**, requests = **borrow → use → return**. Connections are **reused**, never created per-request.
 
-### Plain-English: why a pool instead of just connecting each time?
+### Why a pool instead of connecting each time?
 
-**Analogy: a shared toolbox on a worksite.** Every task needs a drill. You *could* drive to the store, buy a drill, use it once, and throw it away every single time — absurdly slow and wasteful. Instead the site keeps a small set of drills in a box: you **grab one, use it, put it back** for the next person. That box is the connection pool; the drills are database connections.
+Opening a fresh DB connection per request is expensive — each one is a real TCP handshake plus authentication, often tens of milliseconds. Under load, doing that on every request would crush both your app and the DB.
 
-Opening a fresh DB connection is expensive — it's a real TCP handshake plus authentication, often tens of milliseconds. Under load, doing that per request would crush both your app and the DB.
+A connection pool avoids this by keeping a small set of already-open connections. A request **borrows one, uses it, and returns it** for the next request to reuse — no per-request setup cost.
 
 #### Q: If more connections = more parallelism, why not set the pool huge?
 
@@ -591,7 +587,7 @@ An oversized pool also just makes requests queue *inside the DB* instead of insi
 
 #### Q: What's a "connection leak"?
 
-Borrowing a connection and **forgetting to return it** (usually a missing "close" in error handling). Each leak permanently removes one drill from the box. Slowly the pool empties, then *every* request hangs forever waiting for a connection that never comes back — a classic silent production outage. Always return connections in a `finally`/`try-with-resources` block.
+Borrowing a connection and **forgetting to return it** (usually a missing "close" in error handling). Each leak permanently removes one connection from the pool. Slowly the pool empties, then *every* request hangs forever waiting for a connection that never comes back — a classic silent production outage. Always return connections in a `finally`/`try-with-resources` block.
 
 ---
 
@@ -606,11 +602,11 @@ Borrowing a connection and **forgetting to return it** (usually a missing "close
 
 > Rule of thumb: **normalize for correctness, denormalize for read performance** at scale.
 
-### Plain-English: normalization, denormalization, and keys
+### Normalization, denormalization, and keys
 
 **Normalization = store each fact exactly once, and point at it instead of copying it.**
 
-**Analogy: a class of students and their school.** The naive approach writes the full school name and address next to *every* student. If the school moves, you must edit 500 rows and will inevitably miss some (now your data disagrees with itself). Normalization instead keeps **one** `schools` row and has each student store just the school's **id**.
+**Example: students and their school.** The naive approach writes the full school name and address next to *every* student. If the school moves, you must edit 500 rows and will inevitably miss some (now your data disagrees with itself). Normalization instead keeps **one** `schools` row and has each student store just the school's **id**.
 
 ```sql
 -- Normalized: the school's details live in ONE place.
@@ -637,7 +633,7 @@ FROM students s JOIN schools sch ON s.school_id = sch.id;
 
 They're the **rules the database enforces for you** so bad data can't get in:
 
-- **Primary key** — the unique "name tag" for a row (like `user_id`). No two rows share it; it's never null. It's how other tables refer to this row.
+- **Primary key** — the unique identifier for a row (like `user_id`). No two rows share it; it's never null. It's how other tables refer to this row.
 - **Foreign key** — a column that must point to an existing row in another table (`student.school_id` must match a real `schools.id`). This is **referential integrity** — you can't have an order for a customer who doesn't exist.
 - **Unique constraint** — no duplicates allowed in this column (e.g. one account per `email`).
 - **NOT NULL / CHECK** — "this field is required" / "this value must satisfy a rule" (e.g. `age >= 0`).

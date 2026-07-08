@@ -2,7 +2,7 @@
 
 > Companion to **Food Ordering & Delivery — System Design**. **Part A: High-Level Design (HLD)** — architecture. **Part B: Low-Level Design (LLD)** — **all tables**, **full API contracts**, **class design**, **design patterns**, state machines, algorithms, sequences.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (Swiggy/Zomato/DoorDash analogies, annotated Java/SQL/API, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand. Running analogy throughout: **you order food on an app, the restaurant cooks it, and a driver delivers it.**
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java/SQL/API, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -35,7 +35,7 @@
 - **Consistency:** **strong** for orders/payments; **eventual** for discovery, tracking, ratings.
 - Order core ≈ e-commerce; the unique layer is **hyperlocal discovery + real-time dispatch + live tracking**. Full rationale in the main design note.
 
-### Plain-English: what are we building, and what does "consistency" mean here?
+### What are we building, and what does "consistency" mean here?
 
 Picture the Swiggy/Zomato app. The whole journey is: **you search for nearby restaurants → add food to a cart → place + pay → the restaurant accepts and cooks → a driver picks it up → you watch the bike move on a map → it arrives → you rate it.** That's the entire system. Everything below is just "how do we build each of those steps so it scales to millions of hungry people."
 
@@ -69,28 +69,28 @@ Customer/Restaurant/Rider apps → API Gateway
               Kafka (event backbone: ORDER_PLACED, ORDER_READY, RIDER_ASSIGNED, DELIVERED)
 ```
 
-### Plain-English: one big app, split into many small specialists
+### One big app, split into many small specialists
 
-Instead of one giant program doing everything, we split the work into **microservices** — small programs that each do one job well. Think of a big restaurant chain's back office: one team handles menus, another handles payments, another dispatches drivers. Each has its own filing cabinet (database) and they talk to each other by passing notes.
+Instead of one giant program doing everything, we split the work into **microservices** — small programs that each do one job well. Each service owns its own database and they communicate by sending each other messages/events rather than sharing data directly.
 
-**Analogy for each box:**
+**What each box does:**
 
-| Box | Real-world job | Why it's separate |
+| Box | Responsibility | Why it's separate |
 | --- | --- | --- |
-| **API Gateway** | The front desk / receptionist | One entrance; checks your login, routes you to the right department |
-| **Discovery/Search** | "What's open near me?" board | Needs fast location + text search (special tools) |
-| **Catalog/Menu** | The menu binders | Read a lot, changes rarely → cache it |
-| **Cart** | Your tray before you pay | Temporary, throwaway → fast memory (Redis) |
-| **Order** | The order manager who tracks each ticket | The heart; owns the order's life story (state machine) |
-| **Payment** | The cashier | Must be exact (money) |
-| **Dispatch** | The dispatcher matching drivers to orders | Needs "who's nearby?" fast |
-| **Location** | GPS receiver for every driver | Floods of pings → memory, not disk |
-| **Tracking** | The live map you stare at | Pushes updates to your phone |
-| **Notification** | The person texting you "order accepted!" | |
+| **API Gateway** | Single entry point | One entrance; checks auth, routes to the right service |
+| **Discovery/Search** | "What's open near me?" | Needs fast location + text search (special tools) |
+| **Catalog/Menu** | Menus, prices, availability | Read a lot, changes rarely → cache it |
+| **Cart** | Pre-checkout cart | Temporary, throwaway → fast memory (Redis) |
+| **Order** | Order lifecycle | The heart; owns the order's state machine |
+| **Payment** | Charges/refunds | Must be exact (money) |
+| **Dispatch** | Matching drivers to orders | Needs "who's nearby?" fast |
+| **Location** | Driver GPS ingest | Floods of pings → memory, not disk |
+| **Tracking** | Live status/location push | Pushes updates to your phone |
+| **Notification** | Multi-channel updates | Texts/emails/pushes "order accepted!" |
 
 #### Q: What is Kafka (the "event backbone") doing at the bottom?
 
-Kafka is a **shared bulletin board / announcement system**. When something important happens ("ORDER_PLACED"), the Order service pins a note to the board and moves on — it does *not* call every other service one by one. Whoever cares (Dispatch, Notification, Analytics) reads the note and reacts. This way the Order service doesn't need to know or wait for everyone downstream; it just announces "an order was placed!" and gets back to work. (More in §A4.)
+Kafka is an **event log / message broker**. When something important happens ("ORDER_PLACED"), the Order service **publishes an event** and moves on — it does *not* call every other service one by one. Whoever cares (Dispatch, Notification, Analytics) subscribes and reacts. This way the Order service doesn't need to know or wait for everyone downstream; it just publishes the event and gets back to work. (More in §A4.)
 
 #### Q: Why so many separate databases instead of one?
 
@@ -112,9 +112,9 @@ Different jobs need different tools. Money needs a strict ledger (RDBMS). "Resta
 | Notification | multi-channel updates | (see Notification note) |
 | Rating | reviews + aggregate | RDBMS |
 
-### Plain-English: who owns what (and why "owns" matters)
+### Who owns what (and why "owns" matters)
 
-Each service **owns** a slice of the data — it's the only one allowed to directly write to that slice. Everyone else must ask it. This is like departments in a company: only HR edits your salary record; the marketing team can't reach into HR's cabinet and change it, they have to file a request.
+Each service **owns** a slice of the data — it's the only one allowed to directly write to that slice. Everyone else must go through its API. This keeps write authority in one place: no other service can reach into another's database and change it; it must send a request.
 
 **Concrete walk-through of one order's journey across services:**
 
@@ -146,14 +146,14 @@ Not necessarily. "RDBMS" is the *type* of store (a SQL relational database). Eac
 | Location/Order → Customer app | **WebSocket push** |
 | Services → Payment/Maps gateway | **Sync HTTP** (behind circuit breaker) |
 
-### Plain-English: "wait for the answer" vs "leave a note and move on"
+### Sync vs async communication
 
 There are two ways for services to talk:
 
-- **Sync (synchronous)** = you **wait** for the reply, like a **phone call**. "Did the payment go through? …I'll hold." You can't continue until you hear back. Use it when you genuinely need the answer *now* (did the card charge succeed?).
-- **Async (asynchronous)** = you **fire off a message and move on**, like a **text message** or pinning a note on Kafka. You don't wait; the other side handles it whenever. Use it when the caller doesn't need to block (notifying the restaurant, telling analytics).
+- **Sync (synchronous)** = the caller **blocks and waits** for the reply. You can't continue until you hear back. Use it when you genuinely need the answer *now* (did the card charge succeed?).
+- **Async (asynchronous)** = the caller **sends a message and moves on** (e.g. publishing to Kafka). You don't wait; the other side handles it whenever. Use it when the caller doesn't need to block (notifying the restaurant, telling analytics).
 
-**Analogy:** placing the order is a phone call to the cashier — you stare at the spinner until it says "Payment successful, order placed." But telling the kitchen, the dispatcher, and the SMS system is done by **pinning tickets on a board** — you don't stand there waiting for the kitchen to say "got it."
+Placing the order is sync — the app waits until payment returns "success, order placed." But notifying the kitchen, the dispatcher, and the SMS system is async — the order flow doesn't wait for any of them to acknowledge.
 
 ```java
 // SYNC — you wait for the result because you NEED it to proceed
@@ -189,19 +189,19 @@ External services (the bank's payment gateway, Google Maps) sometimes get slow o
 | Cart, sessions, rate limits | Redis |
 | Event backbone | Kafka |
 
-### Plain-English: picking the right container for each kind of data
+### Picking the right store for each kind of data
 
-Different data has different "shape" and access needs, so we store each in the tool built for it. Kitchen analogy: you keep knives on a magnetic strip, spices in a rack, and frozen goods in a freezer — same kitchen, different storage because the *needs* differ.
+Different data has different "shape" and access needs, so we store each in the tool built for it — the same reason you don't force transactions, full-text search, and high-frequency geo writes into one engine.
 
-| Data | Tool | Why (the analogy) |
+| Data | Tool | Why |
 | --- | --- | --- |
-| **Orders / payments** | RDBMS (SQL) | A **strict ledger/accountant's book** — supports transactions ("all-or-nothing"), never loses money |
-| **Menu / catalog** | RDBMS + Redis cache | A **printed menu** — rarely changes, read constantly → keep a fast photocopy (cache) |
-| **Discovery index** | Elasticsearch | A **smart search engine** — "cheap veg biryani near me, open now, rated 4+" is a fuzzy multi-filter search |
-| **Rider positions** | Redis GEO | A **live radar screen** — must answer "who's within 3 km?" in milliseconds, updated constantly |
-| **Location history** | Time-series / warehouse | A **flight recorder** — kept for later analysis, not for live use |
-| **Cart / sessions** | Redis | A **sticky note** — temporary, fast, disposable |
-| **Event backbone** | Kafka | The **bulletin board** for announcements between services |
+| **Orders / payments** | RDBMS (SQL) | Needs ACID transactions ("all-or-nothing"); a ledger that never loses money |
+| **Menu / catalog** | RDBMS + Redis cache | Rarely changes, read constantly → keep a fast cached copy |
+| **Discovery index** | Elasticsearch | "cheap veg biryani near me, open now, rated 4+" is a fuzzy multi-filter search |
+| **Rider positions** | Redis GEO | Must answer "who's within 3 km?" in milliseconds, updated constantly |
+| **Location history** | Time-series / warehouse | Kept for later analysis, not for live use |
+| **Cart / sessions** | Redis | Temporary, fast, disposable |
+| **Event backbone** | Kafka | Event log carrying messages between services |
 
 #### Q: What is "ACID" and why do orders/payments need it?
 
@@ -209,31 +209,31 @@ Different data has different "shape" and access needs, so we store each in the t
 
 #### Q: What does "sharded by region/customer" mean for orders?
 
-**Sharding** = splitting one huge table across many databases so no single machine holds everything. Analogy: instead of one nationwide order-book that everyone fights over, each **city** keeps its own order-book. Mumbai's orders live on the Mumbai shard, Delhi's on the Delhi shard. This spreads the load and keeps each database small and fast. The "shard key" (region or customer) decides which shard a given order lands on.
+**Sharding** = splitting one huge table across many databases so no single machine holds everything. For example, instead of one nationwide orders table, each city's orders live on their own shard — Mumbai's on the Mumbai shard, Delhi's on the Delhi shard. This spreads the load and keeps each database small and fast. The "shard key" (region or customer) decides which shard a given order lands on.
 
 #### Q: What's "rebuilt via CDC" for the discovery index?
 
-**CDC = Change Data Capture.** The source of truth for restaurants/menus is the RDBMS. Elasticsearch is a *copy* optimized for search. CDC is the mechanism that **automatically streams every change** (new restaurant, price update, sold-out toggle) from the RDBMS into Elasticsearch so the search index stays fresh — instead of someone manually re-uploading everything. Think of it as a live feed that mirrors edits from the master book into the searchable copy.
+**CDC = Change Data Capture.** The source of truth for restaurants/menus is the RDBMS. Elasticsearch is a *copy* optimized for search. CDC is the mechanism that **automatically streams every change** (new restaurant, price update, sold-out toggle) from the RDBMS into Elasticsearch so the search index stays fresh — instead of someone manually re-uploading everything. It's a live feed that mirrors edits from the source RDBMS into the searchable copy.
 
 ## A6. Tech Stack
 
 Java/Spring Boot or Go · PostgreSQL (sharded) · Redis (GEO + cache) · Elasticsearch · Kafka · WebSocket service (Go/Node) · Maps/routing (Google Maps/OSRM) · Payment gateway (Razorpay/Stripe) · Kubernetes.
 
-### Plain-English: what each tool is, in one line
+### What each tool is, in one line
 
 - **Java/Spring Boot or Go** — the programming languages/frameworks the services are written in (the "workers" doing the logic).
 - **PostgreSQL** — the SQL database = the strict ledger for orders/payments.
-- **Redis** — an in-memory (super fast) store used for carts, caches, and the "who's nearby" geo radar.
+- **Redis** — an in-memory (super fast) store used for carts, caches, and the "who's nearby" geo index.
 - **Elasticsearch** — the search engine for restaurant discovery.
-- **Kafka** — the announcement bulletin board between services.
-- **WebSocket service** — keeps a live, always-open pipe to your phone so the map/status can be *pushed* instantly (vs your phone repeatedly asking "any update? any update?").
+- **Kafka** — the event log/message backbone between services.
+- **WebSocket service** — keeps a live, always-open connection to your phone so the map/status can be *pushed* instantly (vs your phone repeatedly polling "any update?").
 - **Maps/routing (Google Maps/OSRM)** — computes driving routes and ETAs.
-- **Payment gateway (Razorpay/Stripe)** — the external company that actually charges cards/UPI.
-- **Kubernetes** — the "operations manager" that runs many copies of each service, restarts crashed ones, and scales them up during dinner rush.
+- **Payment gateway (Razorpay/Stripe)** — the external provider that actually charges cards/UPI.
+- **Kubernetes** — the orchestrator that runs many copies of each service, restarts crashed ones, and scales them up during dinner rush.
 
 #### Q: What is a WebSocket, and why not just refresh the page?
 
-Normally your phone asks the server "any news?" over and over (polling) — wasteful and laggy. A **WebSocket** is a **phone line left off the hook**: once opened, the server can speak to your phone *the instant* something changes (order accepted, driver moved) without being asked. That's how the live tracking map and status updates feel real-time.
+Normally your phone asks the server "any news?" over and over (polling) — wasteful and laggy. A **WebSocket** is a persistent, always-open two-way connection: once opened, the server can push to your phone *the instant* something changes (order accepted, driver moved) without being asked. That's how the live tracking map and status updates feel real-time.
 
 #### Q: Why list two options (Java **or** Go, Razorpay **or** Stripe)?
 
@@ -473,9 +473,9 @@ CREATE INDEX idx_outbox_unpublished ON outbox(created_at) WHERE published = FALS
 
 > **Table checklist:** users, addresses, restaurants, restaurant_hours, restaurant_zones, menu_categories, menu_items, item_customizations, delivery_partners, rider_shifts, carts, cart_items, orders, order_items, order_status_history, order_assignments, payments, refunds, wallets, coupons, coupon_redemptions, reviews, outbox. Live rider location = **Redis GEO** (not a table).
 
-### Plain-English: the tables are just the app's filing cabinets
+### What each table stores
 
-Every table is a **spreadsheet/filing cabinet** for one kind of thing. If you screenshot the app, you can point at what each table stores:
+Each table holds one kind of thing. Mapping tables to what you see in the app:
 
 | Table group | What you see in the app |
 | --- | --- |
@@ -563,9 +563,9 @@ RIDER_ASSIGNED · ORDER_PICKED_UP · ORDER_DELIVERED · ORDER_CANCELLED
 PAYMENT_SUCCESS · PAYMENT_FAILED · REFUND_INITIATED
 ```
 
-### Plain-English: APIs are the buttons in the app
+### The API surface
 
-An **API** is just the list of "buttons" each app can press on the server. There are three apps (Customer, Restaurant, Rider), so three sets of buttons, plus internal Kafka "events" (announcements, not buttons a human presses).
+An **API** is the list of operations each app can invoke on the server. There are three apps (Customer, Restaurant, Rider), so three sets of endpoints, plus internal Kafka events (published between services, not invoked by a user).
 
 **Reading an endpoint:** `POST /v1/orders` means "the Customer app sends (POST = create) a request to the `/orders` address to make a new order." `GET` = read, `POST` = create, `PATCH`/`PUT` = update, `DELETE` = remove. The `/v1/` is the version, so we can change things later without breaking old apps.
 
@@ -686,9 +686,9 @@ interface OrderRepository { Optional<Order> findByKey(String k); Order insert(Or
 interface NotificationPort { void notify(long userId, String type, Map<String,Object> data); }
 ```
 
-### Plain-English: turning the app into Java objects
+### Turning the app into Java objects
 
-Low-level design = deciding **which classes exist and how they collaborate**. Think of it as casting the roles for the restaurant play: there's a `Restaurant`, a `MenuItem`, a `Cart`, an `Order`, a `DeliveryPartner`, and a manager (`OrderOrchestrator`) who coordinates everyone.
+Low-level design = deciding **which classes exist and how they collaborate**. The main domain classes are `Restaurant`, `MenuItem`, `Cart`, `Order`, and `DeliveryPartner`, plus a coordinator (`OrderOrchestrator`) that drives the checkout flow.
 
 Here's the same domain as small, self-contained beginner classes (illustrative — the doc's versions are terser):
 
@@ -774,7 +774,7 @@ class OrderOrchestrator {
 
 #### Q: What are all these `...Port` interfaces (`PaymentPort`, `GeoIndexPort`)?
 
-A **Port** is a **socket in the wall**: the domain code says "I need to charge a card" by calling `PaymentPort.charge(...)`, without knowing *who's plugged in*. Razorpay or Stripe is the **adapter** (the plug). Swapping payment providers = swapping the plug; the room's wiring (business logic) never changes. This is the **Ports & Adapters (Hexagonal)** style — it keeps the core logic clean and testable (in tests you plug in a fake payment that always "succeeds").
+A **Port** is an interface the domain depends on: the domain code says "I need to charge a card" by calling `PaymentPort.charge(...)`, without knowing which provider implements it. Razorpay or Stripe is the **adapter** that implements the port. Swapping payment providers = swapping the adapter; the business logic never changes. This is the **Ports & Adapters (Hexagonal)** style — it keeps the core logic clean and testable (in tests you plug in a fake payment that always "succeeds").
 
 #### Q: What does `order.transitionTo(PLACED, SYSTEM)` do — why not just `order.status = PLACED`?
 
@@ -809,9 +809,9 @@ A single order touches multiple services (Payment, Dispatch, Restaurant) that ea
 | **Publish-Subscribe + WebSocket (Fan-out)** | Live tracking push | One rider location → all subscribers of that order |
 | **CQRS (lite)** | Write path (orders RDBMS) vs read path (discovery on ES) | Separate optimized read model from the write model |
 
-### Plain-English: design patterns are reusable "recipes"
+### Design patterns: what they are
 
-A **design pattern** is a named, proven solution to a common problem — like a cooking technique ("sauté", "braise") that any chef recognizes. You don't invent them per project; you spot the situation and apply the known recipe. Here are the key ones with a food-delivery analogy and tiny code.
+A **design pattern** is a named, proven solution to a common problem. You don't invent them per project; you recognize the situation and apply the known solution. Here are the key ones with tiny code.
 
 **State** — an order can only make legal moves:
 
@@ -834,7 +834,7 @@ class BatchOptimizeStrategy implements DispatchStrategy { /* one driver carries 
 dispatch.strategy = new NearestIdleStrategy();
 ```
 
-Analogy: "how do we assign a driver?" is like choosing a route-planning technique — you can switch from "closest driver wins" to "batch two orders on one trip" by swapping the strategy object.
+"How do we assign a driver?" becomes a swappable choice — switch from "closest driver wins" to "batch two orders on one trip" by swapping the strategy object, even A/B testing them.
 
 **Chain of Responsibility** — the validation pipeline before an order is accepted:
 
@@ -850,7 +850,7 @@ List<OrderCheck> pipeline = List.of(
 for (OrderCheck check : pipeline) check.validate(cmd);   // throws on first failure
 ```
 
-Analogy: a series of quality-control gates on an assembly line; the item stops at the first gate it fails.
+Each check is an independent gate; the order stops at the first gate it fails.
 
 **Decorator** — building the final price by stacking modifiers:
 
@@ -912,9 +912,9 @@ OFFERED ─accept→ ACCEPTED
    │ reject / timeout → REJECTED/TIMEOUT → (offer next rider)
 ```
 
-### Plain-English: an order's life is a board game with legal moves
+### The order state machine
 
-A **state machine** is the rulebook for what an order (or payment, or driver offer) can do next. Like a board game: from a given square you can only move to certain other squares. You can't teleport from "PLACED" straight to "DELIVERED" — you must pass through "ACCEPTED → PREPARING → OUT_FOR_DELIVERY" first.
+A **state machine** is the rulebook for what an order (or payment, or driver offer) can do next: from a given state you can only move to certain allowed next states. An order can't jump from "PLACED" straight to "DELIVERED" — it must pass through "ACCEPTED → PREPARING → OUT_FOR_DELIVERY" first.
 
 **Follow one order through its states:**
 
@@ -1027,11 +1027,11 @@ cancel(order):
     release rider lock if held; notify parties
 ```
 
-### Plain-English: the four core "how-to" recipes
+### The four core algorithms
 
-These are the actual step-by-step logic for the hard parts. Let's translate each.
+These are the actual step-by-step logic for the hard parts. Let's walk through each.
 
-#### Recipe 1 — Placing an order (the careful checkout)
+#### Algorithm 1 — Placing an order (the careful checkout)
 
 The order matters: **check first, charge second, announce third.** We validate everything *before* touching money, save the order + outbox event in one transaction, then charge, then announce.
 
@@ -1056,13 +1056,13 @@ Order placeOrder(PlaceOrderCmd cmd) {
 }
 ```
 
-#### Recipe 2 — Dispatch (finding a driver) — the interesting one
+#### Algorithm 2 — Dispatch (finding a driver) — the interesting one
 
 "Find a nearby free driver, offer the order, and if they say no or don't answer, offer the next one" — all while making sure **two orders never grab the same driver**.
 
 ```java
 void dispatch(Order order) {
-    // Ask the geo radar for free drivers within 3 km of the restaurant
+    // Ask the geo index for free drivers within 3 km of the restaurant
     List<DeliveryPartner> candidates =
         geo.nearbyRiders(order.restaurantLat, order.restaurantLng, 3000)
            .stream().filter(r -> r.status == ONLINE).toList();
@@ -1085,22 +1085,22 @@ void dispatch(Order order) {
 }
 ```
 
-Analogy: a dispatcher radios the nearest free driver — "got a pickup, take it?" — if they don't answer in 20 seconds, radio the next nearest. The **claim/lock** is like putting a sticky "RESERVED" note on that driver so two dispatchers can't both hand them a job.
+The dispatcher offers the order to the nearest free driver; if they don't respond in 20 seconds, it offers the next nearest. The **claim/lock** marks that driver as reserved so two dispatch loops can't both hand them a job at once.
 
-#### Recipe 3 — Location ingest (the GPS firehose)
+#### Algorithm 3 — Location ingest (the GPS firehose)
 
 Every driver's phone pings location constantly. Keep it **only in fast memory**, never the orders DB.
 
 ```java
 void onPing(long riderId, double lat, double lng) {
-    geo.geoAdd("riders:online", lng, lat, "rider:" + riderId);  // update the radar
+    geo.geoAdd("riders:online", lng, lat, "rider:" + riderId);  // update the geo index
     redis.setEx("loc:rider:" + riderId, json(lat, lng), 30);    // latest value, 30s TTL
     kafka.publishSampled("rider.location", riderId, lat, lng);  // sampled → tracking/analytics
     // NEVER write to the orders database (would melt under the write volume)
 }
 ```
 
-#### Recipe 4 — Cancellation + refund (undoing safely)
+#### Algorithm 4 — Cancellation + refund (undoing safely)
 
 If you cancel, we reverse the earlier steps — the "compensation" half of the Saga.
 
@@ -1155,9 +1155,9 @@ Customer  OrderSvc  Payment  Kafka  Restaurant  Dispatch  Rider  Customer(map)
 charge → FAILED → order=PAYMENT_FAILED → notify customer → (no dispatch)
 ```
 
-### Plain-English: reading the "who-talks-to-whom" diagram
+### Reading the sequence diagram
 
-A **sequence diagram** shows the *timeline* of one scenario — who sends what message to whom, top to bottom. Each vertical line is a service; each arrow is a message. Read it like a comic strip of a single order.
+A **sequence diagram** shows the *timeline* of one scenario — who sends what message to whom, top to bottom. Each vertical line is a service; each arrow is a message. Read it top to bottom as a single order's timeline.
 
 **The happy path, in plain words:**
 
@@ -1197,9 +1197,9 @@ It's *concurrency*, not a bug. The restaurant cooking and Dispatch finding a dri
 | Location firehose | Redis only; never RDBMS |
 | Coupon over-use | `coupon_redemptions` unique + atomic decrement of usage limit |
 
-### Plain-English: what goes wrong when many things happen at once
+### What goes wrong when many things happen at once
 
-**Concurrency** = lots of actions happening simultaneously. Bugs appear when two actions touch the same thing at the same moment. Each row above is a "two people grab the last cookie" problem and its fix.
+**Concurrency** = lots of actions happening simultaneously. Bugs appear when two actions touch the same thing at the same moment. Each row above is a race condition and its fix.
 
 **The two orders / one driver race (the classic):**
 
@@ -1216,7 +1216,7 @@ if (gotIt) offer(rider, order);   // order A wins
 else       tryNextRider();        // order B is told "taken", moves on
 ```
 
-`SET NX` is atomic — the database guarantees only one caller can create the key. It's the digital version of "first hand on the cookie wins, and everyone can see whose hand got there first."
+`SET NX` is atomic — the store guarantees only one caller can create the key, so exactly one order wins the driver and the rest are told it's taken.
 
 **The duplicate-tap race (idempotency):**
 
@@ -1262,9 +1262,9 @@ A **dual write** is writing to two systems that can't share one transaction — 
 | `cart:{userId}` | cart | session |
 | `ratelimit:{userId}` | counters | window |
 
-### Plain-English: keep a fast copy of stuff you read a lot
+### Keep a fast copy of what you read a lot
 
-A **cache** is a small, fast copy of data you'd otherwise fetch the slow way every time. Analogy: a waiter memorizes today's specials instead of walking to the kitchen to ask for every table. If lots of people ask the same thing, answer from memory.
+A **cache** is a small, fast copy of data you'd otherwise fetch the slow way every time. Instead of hitting the slow SQL DB on every read of the same data, keep the answer in fast memory and serve repeated reads from there.
 
 Each cache entry has a **TTL (time to live)** — how long before the copy is thrown away and refetched. Short TTL = fresher but more work; long TTL = faster but can be stale.
 
@@ -1318,7 +1318,7 @@ The classic problem is **stale reads** — the cache says an item is available b
 | Redis/location down | Tracking degrades to last-known + ETA; orders unaffected |
 | Dispatch double-assign | Atomic rider lock |
 
-### Plain-English: planning for when things go wrong
+### Planning for when things go wrong
 
 Real systems spend most of their code on the *unhappy* paths. Good design means every failure has a defined, graceful response — the app should degrade, not crash. Walk through the common ones:
 

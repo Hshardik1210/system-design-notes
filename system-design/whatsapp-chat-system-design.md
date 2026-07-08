@@ -2,7 +2,7 @@
 
 > **Core challenge:** deliver messages between users **in real time**, **reliably** (never lose a message), **in order**, with **delivery/read receipts**, **presence**, **group chat**, **multi-device sync**, and **offline delivery** — over hundreds of millions of **persistent connections**, optionally **end-to-end encrypted**, at billions-of-messages/day scale.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated code, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated code and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -42,15 +42,15 @@ Sender ──WebSocket──► Gateway A ──► [persist message] ──► 
 
 Persistent connections + a **message store** + a **router** that finds where the recipient is connected. The hard parts: **connection management at scale**, **reliable + ordered delivery**, **offline sync**, **multi-device**, and (WhatsApp) **end-to-end encryption**.
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
-Think about texting a friend. You type "hey", hit send, and a moment later a little checkmark appears. Your friend's phone buzzes. If their phone is off, the message isn't lost — it shows up the second they turn it back on. That entire experience, but for **two billion people at once**, is what we're designing.
+Texting: you type "hey", hit send, and a moment later a checkmark appears. The recipient's phone buzzes. If their phone is off, the message isn't lost — it shows up the second they turn it back on. That entire experience, but for **two billion people at once**, is what we're designing.
 
-Break the magic into three plain jobs:
+Break it into three jobs:
 
-1. **Keep a live wire open to every phone.** So the server can push a message *down* to you the instant it arrives — you shouldn't have to keep asking "any new messages? any new messages?". That live wire is a **WebSocket** (§4).
-2. **Write every message down before saying "sent".** Like a post office stamping and filing your letter before promising to deliver it. If the building loses power a second later, your letter is still safe on the shelf. This is the **message store** (§9).
-3. **Find where the other person is.** Your friend's phone is connected to some server in a data center somewhere. We keep a phone-book (the **connection registry**, §5) that says "user 42's phone is currently plugged into gateway server B" so we know where to push the message.
+1. **Keep a live connection open to every phone.** So the server can push a message *down* to you the instant it arrives, instead of you repeatedly asking "any new messages?". That connection is a **WebSocket** (§4).
+2. **Persist every message before acknowledging it as "sent".** Write the message durably before returning the ack, so a crash a moment later can't lose it. This is the **message store** (§9).
+3. **Find where the other person is.** Each phone is connected to some gateway server. We keep a **connection registry** (§5) that records "user 42's phone is currently connected to gateway server B" so we know where to push the message.
 
 Everything else in this doc — ticks, presence, groups, encryption — is a refinement on those three jobs.
 
@@ -109,11 +109,11 @@ Client ⇄ WebSocket Gateway (stateful)  ── on connect, register: user/devic
 - **Load balancer** must support WebSocket upgrade; connections are long-lived so balance by connection count, drain gracefully on deploy.
 - Gateways are **horizontally scaled**; a user's multiple devices may land on different nodes.
 
-### Plain-English: the phone line that stays open
+### The persistent connection
 
-**Analogy: a phone call vs. sending letters.** A normal web request (REST) is like mailing a letter: you send it, you get one reply, and the conversation is over — to ask again you mail another letter. A **WebSocket** is like keeping a phone call open the whole time. Nobody has to redial. The moment the other side has something to say, they just say it and you hear it instantly.
+A normal web request (REST) is one-shot: the client sends a request, gets one reply, and the exchange is over — to ask again it must open a new request. A **WebSocket** keeps a single connection open the whole time. Neither side has to reconnect: the moment either side has something to send, it sends it and the other receives it instantly.
 
-That "always-open line" is exactly what chat needs, because messages arrive at *unpredictable* times and the **server** must be able to start talking (push to you), not just answer when asked.
+That always-open connection is exactly what chat needs, because messages arrive at *unpredictable* times and the **server** must be able to initiate (push to you), not just answer when asked.
 
 #### Q: WebSocket vs. polling — why not just ask the server every few seconds?
 
@@ -134,7 +134,7 @@ Two problems: (1) **slow** — a message can sit up to 3 seconds before you even
 | Wasted traffic | Tons ("nothing new") | Almost none |
 | Connection | New request each time | One long-lived connection |
 
-#### Plain-English: what "handling a connection" looks like in code
+#### What "handling a connection" looks like in code
 
 When a phone connects, the gateway does two things: keep the live socket object in local memory (so it can push later), and write a note in the shared registry saying "this user is here, on me."
 
@@ -152,7 +152,7 @@ public class WebSocketGateway {
     public void onConnect(WsConnection conn, String userId, String deviceId) {
         liveConns.put(deviceId, conn);                    // remember the live wire locally
 
-        // tell the shared phone-book "this user's device is reachable on THIS node"
+        // tell the shared registry "this user's device is reachable on THIS node"
         registry.add("conn:user:" + userId,
                      new Route(deviceId, nodeId, conn.id()),
                      Duration.ofSeconds(60));             // TTL — refreshed by heartbeats
@@ -166,7 +166,7 @@ public class WebSocketGateway {
     // called when the socket drops (app closed, network died, phone slept)
     public void onDisconnect(String userId, String deviceId) {
         liveConns.remove(deviceId);                       // drop the local wire
-        registry.remove("conn:user:" + userId, deviceId); // remove from the phone-book
+        registry.remove("conn:user:" + userId, deviceId); // remove from the registry
     }
 
     // how another part of the system pushes a message down to this device
@@ -180,12 +180,12 @@ public class WebSocketGateway {
 ```
 
 - `liveConns` (in RAM on this one node) = the actual open wires. This is why gateways are **stateful**: the connection *is* the state, and it can't move to another machine.
-- The **registry** entry (in Redis, shared) = the phone-book other nodes read to find this user (§5).
+- The **registry** entry (in Redis, shared) = what other nodes read to find this user (§5).
 - **Heartbeats + TTL:** mobile networks die silently (subway, dead battery) — no "goodbye" packet. So each entry expires after ~60s unless the phone keeps pinging. No ping → entry vanishes → the user is treated as offline.
 
 #### Q: Why can't I just move a connection to a different, less-busy server?
 
-Because the open socket is a physical thing pinned to one machine's memory and network card — you can't teleport a live phone call to another operator. That's why we **balance by connection count** (send new connections to emptier nodes) and, on deploy, **drain gracefully** (stop accepting new connections, let existing ones migrate as clients reconnect) instead of yanking them.
+Because the open socket is a physical thing pinned to one machine's memory and network card — you can't move a live connection to another machine. That's why we **balance by connection count** (send new connections to emptier nodes) and, on deploy, **drain gracefully** (stop accepting new connections, let existing ones migrate as clients reconnect) instead of yanking them.
 
 ---
 
@@ -208,17 +208,17 @@ Sender (Gateway A) → Chat Service persists msg
 
 > **Key idea:** the gateway a user is connected to is dynamic, so routing = **registry lookup + a message bus between gateways**. No single node holds all connections.
 
-### Plain-English: your message and your friend are on different servers
+### Your message and your friend are on different servers
 
-**Analogy: a huge office with hundreds of receptionists.** You call reception (Gateway A) to leave a message for a colleague. But your colleague sits on a different floor served by a *different* receptionist (Gateway B). Gateway A doesn't have a wire to your colleague. So it (1) looks them up in the **company directory** ("Bob is on floor 7, desk B") and (2) uses the **internal intercom** to tell floor 7's receptionist "push this to Bob." That directory is the Redis **connection registry**; the intercom is the **pub-sub bus**.
+The sender is connected to Gateway A, but the recipient's device holds its socket on a *different* node, Gateway B. Gateway A has no open socket to the recipient. So it (1) looks the recipient up in the **connection registry** (which returns "on gateway-B") and (2) relays the message over the **pub-sub bus** to Gateway B, which pushes it down its socket. The registry lives in Redis; the bus is Kafka/Redis pub-sub.
 
-Why not have Gateway A talk to the phone directly? Because A has **no open wire** to Bob's phone — only B does. The socket is pinned to B (§4). So A must relay through B.
+Why not have Gateway A talk to the device directly? Because A has **no open socket** to the recipient's device — only B does. The socket is pinned to B (§4). So A must relay through B.
 
 ```java
 public class MessageRouter {
 
     public void route(Message m) {
-        // 1. WHERE is the recipient connected? ask the shared phone-book
+        // 1. WHERE is the recipient connected? ask the shared registry
         List<Route> routes = registry.lookup("conn:user:" + m.recipientId());
 
         if (routes.isEmpty()) {
@@ -239,7 +239,7 @@ public class MessageRouter {
 @Component
 public class GatewayBusListener {
 
-    @KafkaListener(topics = "gateway-B")   // this node only reads its own mailbox
+    @KafkaListener(topics = "gateway-B")   // this node only reads its own topic
     public void onEnvelope(Envelope e) {
         gateway.pushToDevice(e.deviceId(), e.message());   // down the local WebSocket
     }
@@ -272,18 +272,18 @@ That's exactly why the registry has a **short TTL and heartbeats** (§4). If Bob
 
 > **Persist before ack** → a crash after accepting never loses the message (at-least-once). The client **dedups by `message_id`** so retries don't create duplicates.
 
-### Plain-English: send, file it, then confirm
+### Persist, then confirm
 
-**Analogy: the post office holding a letter until delivered.** You hand your letter to the clerk. Before promising anything, the clerk **stamps and files it** in the back room (durable write). *Then* they hand you a receipt ("we've got it — ✓"). Now even if the delivery van crashes, your letter is safe on the shelf and will go out later. What they must **never** do is say "got it!" and then drop the letter on the floor unfiled — that's a lost message.
+The server must **persist the message durably before acknowledging it**. When a message arrives, the server writes it to the store (durable write) and only *then* returns the "✓ sent" ack. If the server crashes right after persisting, the message is safe and delivery can be retried later. The failure to avoid: acking "sent" and then crashing before the write lands — that loses the message.
 
-That ordering — **file first, confirm second** — is the single most important rule in the whole design:
+That ordering — **persist first, confirm second** — is the single most important rule in the whole design:
 
 ```
 persist message  ─►  THEN ack the sender   ✅  (crash after persist = message safe, retry delivery)
 ack the sender    ─►  THEN persist message  ❌  (crash in between = sender thinks it sent, message gone)
 ```
 
-#### Plain-English: the delivery + ack flow in code
+#### The delivery + ack flow in code
 
 ```java
 @Component
@@ -315,7 +315,7 @@ public class ChatService {
 }
 ```
 
-Walk the numbered steps against the analogy: **(1)** file the letter, **(2)** hand back the receipt, **(3)** attempt delivery. Steps 2 and 3 can even fail entirely — the message is already safe, so we just retry delivery later.
+Walk the numbered steps: **(1)** persist the message, **(2)** ack the sender, **(3)** attempt delivery. Steps 2 and 3 can even fail entirely — the message is already safe, so we just retry delivery later.
 
 #### Q: What does "at-least-once" mean, and won't I see duplicate messages?
 
@@ -338,17 +338,17 @@ Because the ✓ only means "**the server has safely stored it**" — not "delive
 - **At-least-once + client dedup** by client-generated **`message_id` (UUID)** → safe retries, no dupes.
 - Receipts are themselves small messages routed the same way (and update `message_receipts`).
 
-### Plain-English: the one, two, and blue ticks
+### The one, two, and blue ticks
 
-**Analogy: tracking a package.** "Label created" (you got a tracking number), "Out for delivery" (it reached the truck), "Delivered — signed for" (someone actually took it in). WhatsApp's ticks are the same three milestones for your message:
+WhatsApp's ticks are three delivery milestones for your message:
 
-| What you see | Package equivalent | Really means | Who reports it |
-| --- | --- | --- | --- |
-| **Single ✓** | Label created | Server stored it | the server, after the durable write |
-| **Double ✓✓** | Out for delivery / arrived | It reached the recipient's *device* | the recipient's **device** sends a "delivered" receipt |
-| **Blue ✓✓** | Delivered — signed for | The recipient **opened the chat** | the recipient's app sends a "read" receipt |
+| What you see | Really means | Who reports it |
+| --- | --- | --- |
+| **Single ✓** | Server stored it | the server, after the durable write |
+| **Double ✓✓** | It reached the recipient's *device* | the recipient's **device** sends a "delivered" receipt |
+| **Blue ✓✓** | The recipient **opened the chat** | the recipient's app sends a "read" receipt |
 
-The key insight: a **receipt is just another tiny message flowing the other way.** When Bob's phone gets your message, it sends a "delivered" note back through the exact same pipes (gateway → bus → your gateway → your phone), which flips your ✓ into ✓✓.
+The key insight: a **receipt is just another tiny message flowing the other way.** When the recipient's phone gets your message, it sends a "delivered" note back through the exact same path (gateway → bus → your gateway → your phone), which flips your ✓ into ✓✓.
 
 ```java
 // On the RECIPIENT's device: as soon as a message lands, fire a "delivered" receipt back.
@@ -394,9 +394,9 @@ Then the client simply **doesn't send the "read" receipt** — the message still
 - **No global ordering** across conversations — unnecessary and unscalable.
 - For groups, the `seq` is per-group (assigned by the group's partition/coordinator).
 
-### Plain-English: numbering the pages so nothing reads out of order
+### Per-conversation sequence numbers
 
-**Analogy: numbered pages of a letter.** If you mail someone a 5-page letter in separate envelopes, they might arrive as pages 3, 1, 2, 5, 4. As long as every page has a **page number**, the reader can lay them out in the right order regardless of arrival order. The server stamps each message in a conversation with an ever-increasing **`seq`** (1, 2, 3, ...) — that's the page number.
+Messages can arrive out of order (different network paths), e.g. as 3, 1, 2, 5, 4. The server stamps each message in a conversation with an ever-increasing **`seq`** (1, 2, 3, ...), and the receiver reorders by `seq` regardless of arrival order.
 
 ```java
 // The server hands out a strictly increasing seq PER conversation.
@@ -446,11 +446,11 @@ On reconnect:
 - **Retention:** WhatsApp (E2E) **deletes from the server once delivered to all devices**; Slack/Messenger **retain full history** server-side → bigger store + search index.
 - **Undelivered queue** can be derived from `messages` where `seq > device.last_delivered_seq`.
 
-### Plain-English: the post office holds your letter until you're home
+### Offline delivery and catch-up
 
-**Analogy: the post office holding a letter until delivered.** If nobody's home, the mail carrier doesn't throw your letter away — they take it back and hold it. They also slip a "we tried to deliver" slip through the door (that's the **push notification**). Next time you're around, you pick it up. Offline delivery is exactly this: the message sits safely in the store, a push notification nudges the phone, and on reconnect the phone collects everything it missed.
+If the recipient is offline, the message isn't discarded — it stays in the store as undelivered, and a **push notification** (APNS/FCM) nudges the device. On reconnect, the phone collects everything it missed.
 
-The clever bit is how the phone catches up: it just remembers **"the last page number I have is 42"** and asks the server for everything after that.
+The catch-up is simple: the phone remembers **the last `seq` it has (42)** and asks the server for everything after that.
 
 ```
 Recipient offline → message already stored (undelivered) + push notif fired
@@ -458,16 +458,16 @@ Recipient reconnects → "my last_delivered_seq for conv 7 is 42"
 Server → give me messages in conv 7 WHERE seq > 42 → stream them → mark delivered
 ```
 
-#### Plain-English: why a wide-column store, and the actual query
+#### Why a wide-column store, and the actual query
 
-We store messages in a **wide-column** database (Cassandra/HBase) laid out so all of one conversation's messages sit **together, sorted by `seq`**. That makes "everything after seq 42" a single fast **range scan** — like flipping to page 43 of a book and reading on, instead of searching the whole library.
+We store messages in a **wide-column** database (Cassandra/HBase) laid out so all of one conversation's messages sit **together, sorted by `seq`**. That makes "everything after seq 42" a single fast **range scan** over a contiguous slice, instead of scanning the whole table.
 
 ```sql
 -- Layout: PARTITION by conversation (all its messages on one node, together)
 --         CLUSTER (sort on disk) by seq (so ranges are contiguous & fast)
 CREATE TABLE messages (
     conversation_id BIGINT,
-    seq             BIGINT,      -- the per-conversation page number (§8)
+    seq             BIGINT,      -- the per-conversation sequence number (§8)
     message_id      UUID,        -- client-generated, for dedup
     sender_id       BIGINT,
     ciphertext      BLOB,
@@ -508,7 +508,7 @@ public class SyncService {
 ```
 
 - **Why LSM / write-optimized?** Chat is a firehose of *writes* (100B messages/day). Wide-column stores use LSM trees, which turn writes into fast sequential appends — ideal for this.
-- **`last_delivered_seq` per device** is the "which page am I on" bookmark. Each of your devices (phone, laptop) has its own bookmark, so each catches up independently (§13).
+- **`last_delivered_seq` per device** is a cursor marking how far that device has received. Each of your devices (phone, laptop) has its own cursor, so each catches up independently (§13).
 
 #### Q: Where do offline messages actually "queue"? Is there a separate queue table?
 
@@ -520,7 +520,7 @@ On your **devices**, not the server. Because WhatsApp is end-to-end encrypted (�
 
 #### Q: What's the push notification for if the message is already stored?
 
-The stored message just sits there silently — the phone won't know to reconnect and grab it. The push notification (APNS on iOS, FCM on Android) is the **"you've got mail" slip**: it wakes the phone/app enough to buzz the user and trigger a reconnect + resync. Without it, an offline user wouldn't see the message until they happened to open the app.
+The stored message just sits there silently — the phone won't know to reconnect and grab it. The push notification (APNS on iOS, FCM on Android) is the external nudge: it wakes the phone/app enough to alert the user and trigger a reconnect + resync. Without it, an offline user wouldn't see the message until they happened to open the app.
 
 ---
 
@@ -542,16 +542,16 @@ Group message → per member: route to online devices, queue for offline
 - **Encrypted groups** use **Sender Keys** (§12) so the sender encrypts once, not once per member.
 - See the [Fan-Out / Fan-In](../concepts/fan-out-fan-in.md) note for the general pattern + celebrity/huge-group problem.
 
-### Plain-English: one message, many mailboxes
+### One message, many recipients (fan-out)
 
-**Analogy: sending the same party invite to 8 friends.** You wrote one invite, but 8 people need to receive it. Two ways to handle it:
+One message must reach many members. Two ways to handle it:
 
-- **Fan-out on write** — you photocopy the invite 8 times and drop one into **each friend's mailbox** now. Their mailbox is ready instantly (fast to read later), but *you* did 8 copies of work up front. Great for small groups; brutal for a 5,000-person group.
-- **Fan-out on read** — you pin **one** invite on the shared community board. Nobody's mailbox gets a copy; each friend walks over and reads the board when they check. Cheap for you (write once), a bit more work for each reader. Great for huge groups.
+- **Fan-out on write** — write a copy into **each member's inbox** now. Reads are instant later, but the write does N copies of work up front. Great for small groups; brutal for a 5,000-person group.
+- **Fan-out on read** — write the message **once** into the shared group log. No per-member copies; each member reads the log when they catch up. Cheap write, a bit more work per reader. Great for huge groups.
 
 ```java
 public void deliverGroupMessage(GroupMessage gm) {
-    long seq = seqGenerator.next(gm.groupId());          // ONE per-group page number (§8)
+    long seq = seqGenerator.next(gm.groupId());          // ONE per-group seq (§8)
     store.appendToGroupLog(gm.groupId(), seq, gm);       // store once in the group's log
 
     List<Member> members = groupMembers(gm.groupId());
@@ -603,9 +603,9 @@ Typing:   ephemeral event pushed to the other party; never stored
 - Presence is **high-churn + ephemeral** → Redis, not the DB.
 - **Fan out presence only to interested parties** (open chats / contacts currently viewing) to avoid an N² storm when millions come online.
 
-### Plain-English: the "online" dot and "last seen"
+### The "online" dot and "last seen"
 
-**Analogy: an "open / closed" sign on a shop door, on a spring timer.** When the shop opens, they flip the sign to **OPEN** — but the sign is on a timer that flips back to CLOSED unless someone keeps resetting it. As long as the shopkeeper is around, they tap it every minute so it stays OPEN. The moment they leave (or forget), the timer lapses and it reads CLOSED — and a little note records *when* it last flipped. That's presence: an **online flag with a short expiry (TTL)** that heartbeats keep alive, plus a **last_seen** timestamp captured when it lapses.
+Presence is an **online flag with a short expiry (TTL)**: on connect (and on every heartbeat) the flag is set with a short TTL, so it stays "online" only while heartbeats keep refreshing it. When heartbeats stop, the TTL lapses and the user flips to offline, and a **last_seen** timestamp records when that happened.
 
 ```java
 @Component
@@ -742,11 +742,11 @@ CREATE TABLE blocked_users ( user_id BIGINT, blocked_id BIGINT, PRIMARY KEY (use
 
 > **Tables to consider:** users, devices, prekeys, conversations, conversation_members, messages, message_receipts, group_metadata, blocked_users. Connection/presence = Redis; media = blob/CDN.
 
-### Plain-English: a tour of the tables
+### A tour of the tables
 
-Think of these tables as the **filing cabinets** behind the app. Here's what each drawer is for and the one thing that makes it tick:
+Here's what each table stores and the one detail that makes it tick:
 
-| Table | Plain-English "it's the drawer for…" | Key detail |
+| Table | What it stores | Key detail |
 | --- | --- | --- |
 | `users` | who you are (phone, name) | `last_seen` snapshot |
 | `devices` | each gadget you own | `last_delivered_seq` = that device's catch-up bookmark (§9) |
@@ -758,12 +758,12 @@ Think of these tables as the **filing cabinets** behind the app. Here's what eac
 | `group_metadata` | group name, admins, sender keys | `sender_keys` for one-encrypt groups |
 | `blocked_users` | who blocked whom | simple pair lookup |
 
-The three "cursors" are the heart of correctness — they're all just **page numbers** (§8) pointing into the `messages` table:
+The three "cursors" are the heart of correctness — they're all just **`seq` values** (§8) pointing into the `messages` table:
 
 ```
-messages.seq              → the page number stamped on each message
-devices.last_delivered_seq → "this device has received up to page N"      (drives offline sync, §9)
-conversation_members.last_read_seq → "this user has read up to page N"    (drives unread badges + blue ticks)
+messages.seq              → the sequence number stamped on each message
+devices.last_delivered_seq → "this device has received up to seq N"      (drives offline sync, §9)
+conversation_members.last_read_seq → "this user has read up to seq N"    (drives unread badges + blue ticks)
 ```
 
 ```sql

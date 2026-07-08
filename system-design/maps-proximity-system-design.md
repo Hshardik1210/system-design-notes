@@ -2,7 +2,7 @@
 
 > **Core challenge:** two related problems — **"find places/friends/drivers near me"** (proximity search over billions of points) and **routing/ETA** (shortest path over a road graph with live traffic). The heart is a **geospatial index** (geohash / quadtree / S2 / H3) and, for maps, **graph routing with precomputation**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -35,7 +35,7 @@ B. Routing + ETA      → "fastest path from A to B given current traffic"      
 
 Most interviews focus on **(A) proximity** (a clean geo-index problem); **(B) routing** is a graph/algorithms deep-dive.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
 Open **Yelp** (or Google Maps) and tap **"restaurants near me."** In under a second you get a list: *Pizza place — 200m, Cafe — 450m, Sushi — 900m*, sorted closest-first. That is the whole game for **problem (A)**: out of **hundreds of millions** of places in the world, instantly find the handful near one point and rank them by distance.
 
@@ -104,7 +104,7 @@ Index 2D points so "nearby" is fast (not a full scan / O(n) distance compute).
 - **Geohash precision ↔ cell size:** ~5 chars ≈ 5km, ~6 ≈ 1.2km, ~7 ≈ 150m. Pick precision so the query radius spans a few cells.
 - **Why not a lat/lng B-tree?** A range on lat AND lng returns a big **rectangle** you'd still distance-filter, and it doesn't cluster nearby points. Geo-cells turn "nearby" into a **cell/prefix lookup**.
 
-### Plain-English: why not just measure distance to every place?
+### Why not just measure distance to every place?
 
 First instinct: to find restaurants near me, loop over **all** restaurants, compute the distance to each, keep the close ones.
 
@@ -128,9 +128,9 @@ Why it collapses:
 
 The trick to "narrow down cheaply" is a **geospatial index**: chop the map into **cells** (little tiles) and label each place with the cell it sits in. To find places near me, I compute *my* cell, grab only the places in that cell (and its neighbors), and ignore the entire rest of the planet. 100M distance checks becomes ~200.
 
-### Plain-English: geohash — turn (lat, lng) into a prefix
+### Geohash — turn (lat, lng) into a prefix
 
-**Analogy: a postal / PIN code.** A pincode like `110001` narrows you to a small area; `110xxx` is a bigger region; `11xxxx` bigger still. **Places that are physically close share a leading prefix.** A geohash is exactly this idea, but precise and global: it turns any `(lat, lng)` into a short string like `tdr1y2`, where **the longer the shared prefix, the closer two points are.**
+A geohash turns any `(lat, lng)` into a short string like `tdr1y2`, with one key property: **the longer the prefix two points share, the closer they are.** A shorter shared prefix means a larger enclosing region; a longer one means a smaller, more exact cell — the same hierarchical narrowing you see in postal codes, but precise and global.
 
 ```java
 // Encode a point to a geohash string. Longer 'precision' = smaller, more exact cell.
@@ -154,7 +154,7 @@ List<Place> nearbyCandidates(double lat, double lng) {
 
 We went from "measure distance to 100M places" to "fetch the ~50 places that share my tile's code." That short list is then distance-filtered exactly (see §6).
 
-### Plain-English: quadtree — split only where it's crowded
+### Quadtree — split only where it's crowded
 
 Geohash cells are a **fixed grid** — every tile is the same size. Problem: a tile in the **Sahara desert** holds 0 places, but the same-size tile in **Manhattan** holds 5,000. One is empty, the other is overloaded.
 
@@ -184,7 +184,7 @@ class QuadNode {
 
 Result: **empty regions stay one big cell; dense regions become many tiny cells.** A "near me" search walks down the tree to the small node covering my location, so a dense city doesn't dump 5,000 candidates on me. This "adapts to density" is the quadtree's whole selling point.
 
-### Plain-English: S2 and H3 — the industrial-strength versions
+### S2 and H3 — the industrial-strength versions
 
 Geohash and quadtree are the intuition. Real companies often use two more advanced schemes that solve subtle problems:
 
@@ -206,7 +206,7 @@ S2      : sphere-correct; integer range queries;      squares, Hilbert-curve ids
 H3      : equal-distance neighbors;                   hexagons, great for dispatch/coverage
 ```
 
-### Plain-English: common confusions (Q&A)
+### Common confusions (Q&A)
 
 #### Q: Geohash vs quadtree vs S2 vs H3 — which do I pick?
 
@@ -285,14 +285,14 @@ search(lat, lng, radiusKm):
 - **Sparse areas / large radius:** widen to coarser cells so you don't query thousands.
 - **Static places** → precompute a geo-index (S2/PostGIS/Elasticsearch geo), **cache hot cells**.
 
-### Plain-English: the two-step dance (narrow, then measure)
+### The two-step approach (narrow, then measure)
 
 Every "nearby" search is **two steps**, and mixing them up is the #1 beginner mistake:
 
 1. **Narrow (cheap, approximate):** use the geo-index to grab the ~hundreds of places in my cell + neighbor cells. This throws away 99.999% of the world for almost free.
 2. **Measure (exact, but only on the survivors):** compute the *real* distance to just those candidates, drop the ones outside the radius, and **sort closest-first**.
 
-**Analogy:** finding a friend in a stadium. You don't check every one of 50,000 seats (step-2-on-everything = the naive scan). You first go to **their section** (step 1, the cell narrowing), *then* scan the few hundred faces there (step 2, exact check). Section first, faces second.
+The cell lookup narrows the search space to a small region first, so the expensive exact-distance math runs on only a few hundred candidates instead of every point on the planet.
 
 ```java
 List<Place> searchNearby(double lat, double lng, double radiusKm, int topN) {
@@ -313,7 +313,7 @@ List<Place> searchNearby(double lat, double lng, double radiusKm, int topN) {
 
 Why `haversine`? It's the formula for distance between two points **on a sphere** (the Earth is round), so it's more correct than flat-plane distance over long spans.
 
-### Plain-English: ranking by more than distance
+### Ranking by more than distance
 
 Yelp doesn't just show the *nearest* restaurant — a mediocre place 50m away shouldn't beat a beloved one 200m away. Real "nearby" ranks by a **blend of distance and relevance** (rating, popularity, whether it's open):
 
@@ -328,7 +328,7 @@ double score(Place p, double distanceKm) {
 
 The geo-index still does the heavy lifting (find the candidates); ranking is just how you *order* the short survivor list. This is why "nearby places" often layer a **search engine like Elasticsearch** (geo-filter + relevance scoring) on top of the raw geo-index.
 
-### Plain-English: common confusions (Q&A)
+### Common confusions (Q&A)
 
 #### Q: What if my cell/neighbors return *thousands* of candidates (busy downtown)?
 
@@ -363,11 +363,11 @@ Traffic pipeline: GPS probes → Kafka → per-edge speed estimate → update ed
 
 - **Interview depth:** mention A* + **precomputation (CH)** + **traffic-adjusted weights** — don't hand-roll Dijkstra unless asked.
 
-### Plain-English: the map is a graph, driving directions are a shortest path
+### The map is a graph, driving directions are a shortest path
 
 Forget geo-cells for a second — routing is a **different problem** with a **different data structure**.
 
-**Analogy: a subway map.** Stations = **nodes**; the track between two stations = an **edge**; how long that leg takes = the edge's **weight**. "Get me from A to B fastest" = find the cheapest chain of edges from station A to station B. For driving, nodes are **intersections**, edges are **road segments**, and the weight is **travel time** (not just distance — a short road in gridlock is "expensive").
+The road network is a **weighted graph**: **intersections** are nodes, **road segments** are edges, and each edge's **weight** is its travel time (not just distance — a short road in gridlock is "expensive"). "Get me from A to B fastest" means finding the cheapest chain of edges from node A to node B.
 
 ```java
 class RoadGraph {
@@ -390,7 +390,7 @@ Without precompute:  A → (crawl 10,000,000 intersections with Dijkstra) → B 
 With CH shortcuts:   A → (hop across ~dozens of precomputed shortcuts)   → B   ← milliseconds
 ```
 
-**Analogy:** planning a road trip, you don't trace every side street — you think in highways ("take I-5 to Route 66"). CH shortcuts *are* those highways, precomputed.
+The shortcuts let the query reason at the level of long-haul highways instead of every intermediate side street — the long stretches are collapsed into single precomputed edges.
 
 #### Q: How does the ETA change with traffic?
 
@@ -422,9 +422,9 @@ For drivers/friends (constantly moving):
 - Movement re-indexes the point (GEOADD overwrites); serve "nearby" from the **in-memory** index.
 - Stream pings to **Kafka** for analytics/history; downsample.
 
-### Plain-English: static places vs moving drivers
+### Static places vs moving drivers
 
-A restaurant is a **thumbtack** — pin it once, it stays. An Uber driver is a **firefly** — it moves every few seconds, so its "pin" must be re-placed constantly. Same "find near me" question, very different write pattern:
+A restaurant's position is fixed — set it once and it stays. An Uber driver's position changes every few seconds, so it must be re-indexed constantly. Same "find near me" question, very different write pattern:
 
 | | **Static places** (restaurants, ATMs) | **Moving objects** (drivers, live friends) |
 | --- | --- | --- |
@@ -481,7 +481,7 @@ CREATE TABLE edge_traffic ( edge_id BIGINT PRIMARY KEY, current_speed DOUBLE PRE
 
 > **Stores to consider:** places (+ geo index: PostGIS/ES/S2), Redis GEO for moving objects, road graph (nodes/edges) + CH shortcuts, traffic time-series, search index.
 
-### Plain-English: how a place is actually stored and looked up
+### How a place is actually stored and looked up
 
 Each place row carries its coordinates **and** its precomputed geo-cell, so the "narrow" step is a plain indexed column lookup:
 
@@ -495,11 +495,11 @@ void savePlace(Place p) {
 
 The `CREATE INDEX ... ON places(geohash)` line above is what makes `WHERE geohash LIKE 'ttnfv2%'` fast — without it, that query would scan every row (back to the naive full scan we were escaping). **The geo-cell column + its index are the whole "geospatial index" in a plain SQL setup.** PostGIS's GIST index is the fancier, purpose-built version of the same idea.
 
-### Plain-English: sharding — splitting the world across machines
+### Sharding — splitting the world across machines
 
 100M+ places (and the driver firehose) won't fit or serve from one machine. So you **shard**: split the data across many servers. The natural key for maps is **geography** — put all of India's data on the India servers, all of the US's on the US servers.
 
-**Analogy: a phone book split by city.** You don't keep one giant national book; you keep a Delhi book, a Mumbai book, etc. To find something in Delhi, you only open the Delhi book. A "restaurants near me" query is **inherently local** — it only touches one region's shard — so geo-sharding gives you both **scale** (spread the load) and **locality** (each query hits one shard, not all of them).
+A "restaurants near me" query is **inherently local** — it only touches one region's shard — so geo-sharding gives you both **scale** (spread the load across servers) and **locality** (each query hits one shard, not all of them).
 
 ```java
 // Route a request to the shard that owns its region

@@ -2,7 +2,7 @@
 
 > **Core challenge:** ingest a **firehose of click events** (millions/sec), aggregate them into **near-real-time counts** (clicks per ad per minute) for dashboards + billing, while handling **duplicates, out-of-order/late events, hot keys, and huge scale** — the canonical **stream-processing** problem. Billing needs **accuracy**; dashboards need **freshness**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -34,9 +34,9 @@ click event → ingest (Kafka) → stream aggregator (windowed counts) → store
 
 You almost never store-and-recount raw clicks per query — you **pre-aggregate as a stream** into time buckets and serve those. (Same family as YouTube view counting.)
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
-Imagine you run Google Ads / Facebook Ads. Advertisers pay you **every time someone clicks their ad** (e.g. Nike pays ₹5 per click). Reality:
+Say you run Google Ads / Facebook Ads. Advertisers pay you **every time someone clicks their ad** (e.g. Nike pays ₹5 per click). Reality:
 
 - **Millions of ads** running at once.
 - People click them **all over the world, constantly** — **millions of clicks per second**.
@@ -46,7 +46,7 @@ Imagine you run Google Ads / Facebook Ads. Advertisers pay you **every time some
 
 So the whole system is a giant, super-fast **click counter**. Everything else is just "how do we count clicks correctly when there are billions of them."
 
-### Plain-English: why not just use a normal database?
+### Why not just use a normal database?
 
 First instinct: make a table, add a row per click, `SELECT COUNT(*)` to count. Why it explodes:
 
@@ -129,13 +129,11 @@ Ad clients ─► Ingestion API ─► Kafka (partitioned by ad_id) ─► Strea
 - **Stream processor** (Flink is the standard) does windowed aggregation with **state + checkpoints** (exactly-once).
 - **OLAP store** serves fast aggregate queries; **raw events archived** for reprocessing/audit.
 
-### Plain-English: "write it down cheaply, then count in batches"
+### Write it down cheaply, then count in batches
 
-**Analogy used throughout: a busy restaurant kitchen with an order-ticket spike.**
+#### Part A — The append-only log: Kafka
 
-#### Part A — The notepad: Kafka
-
-When a click happens, don't count. Just **append it to a giant shared notepad** as fast as possible and move on. That notepad is **Kafka**.
+When a click happens, don't count. Just **append it to a giant shared log** as fast as possible and move on. That log is **Kafka**.
 
 > **Kafka is an append-only list.** Messages come in, Kafka tacks each onto the end, in order. Never edits the middle. Write, write, write, forever.
 
@@ -148,11 +146,11 @@ Why better than the DB `UPDATE` from §1:
 User clicks ad  →  small API server  →  append "{ad_id:123, time:2:05:03, ...}" to Kafka  →  done
 ```
 
-Kafka = the **order-ticket spike**: waiters slam tickets on it (fast, no waiting); cooking (counting) happens later.
+The write is a cheap append; the counting happens later, off this path.
 
-#### Part B — Splitting the notepad into lanes: partitions
+#### Part B — Splitting the log into lanes: partitions
 
-One notepad = one machine = a limit. So Kafka splits it into **lanes** (**partitions**), each its own list on its own machine. Which lane does a click go to? **Split by `ad_id`** — all clicks for ad 123 → lane A, ad 456 → lane B.
+One log = one machine = a limit. So Kafka splits it into **lanes** (**partitions**), each its own list on its own machine. Which lane does a click go to? **Split by `ad_id`** — all clicks for ad 123 → lane A, ad 456 → lane B.
 
 ```
 click for ad 123 ─┐
@@ -176,11 +174,11 @@ loop forever:
   4. Repeat
 ```
 
-Huge win: read 50,000 clicks, do **one** write. Kitchen: the cook grabs a stack of tickets and notes "50 burgers this batch" once, instead of walking to the manager 50 times.
+Huge win: read 50,000 clicks, do **one** write — instead of one write per click.
 
 ```
                                     ┌─ Lane A (ad 123) ─► Counter 1 ─┐
-Clicks ─► API ─► Kafka (notepad) ───┼─ Lane B (ad 456) ─► Counter 2 ─┼─► Results DB ─► Dashboards / Billing
+Clicks ─► API ─► Kafka (log) ───────┼─ Lane B (ad 456) ─► Counter 2 ─┼─► Results DB ─► Dashboards / Billing
                                     └─ Lane C (ad 789) ─► Counter 3 ─┘
 ```
 
@@ -218,7 +216,7 @@ ad 999 clicks ─► Lane D ─► Instance 2  ─┘
 - **Backpressure**: if the pipeline lags, Kafka buffers (its whole point); shed/queue at the edge only if necessary.
 - **Fraud filter** stage (rate per user/IP, ML scoring) drops bots **before** counting so billing isn't inflated.
 
-### Plain-English: what "enrich" means (and where "country" comes from)
+### What "enrich" means (and where "country" comes from)
 
 The raw click carries an **IP address**, not "India." So early — at the **ingestion API, before Kafka** — we do IP → country (geo-IP lookup) and stamp country/campaign/device onto the event. **"Enrich"** = add useful fields before saving, so the counter downstream can group by them (see §6).
 
@@ -228,7 +226,7 @@ raw click {ad_123, ip: 49.36.x.x}
    → Kafka → counter adds 1 to the (ad_123, 2:05, India) bucket
 ```
 
-### Plain-English: how do we detect bot / fraud clicks?
+### How do we detect bot / fraud clicks?
 
 We keep saying "fraud filter drops bots **before** counting" — but *how* do we know a click is a bot? First, **why bots even click ads:**
 
@@ -238,7 +236,7 @@ We keep saying "fraud filter drops bots **before** counting" — but *how* do we
 
 If we count these, the advertiser gets **overbilled for worthless clicks** → refunds, lawsuits, lost trust. So we try to catch them.
 
-**Key idea: a bot doesn't behave like a human.** We score each click on a bunch of **signals** and drop the ones that look fake. Think of a **bouncer at a club**: no single thing gets you turned away, but "fake ID + drunk + no shoes + on the banned list" together is an easy no.
+**Key idea: a bot doesn't behave like a human.** We score each click on a bunch of **signals** and drop the ones that look fake. No single signal is decisive, but several suspicious signals together (datacenter IP + impossibly fast click + on a blocklist) make fraud clear.
 
 #### The signals (what smells like a bot)
 
@@ -252,7 +250,7 @@ If we count these, the advertiser gets **overbilled for worthless clicks** → r
 | **Device fingerprint** | varied, real devices | 10,000 clicks from the *identical* device/user-agent | one machine faking a whole crowd |
 | **Click pattern** | irregular, human timing | perfectly even (one click every 200ms, like a metronome) | real behaviour is messy; automation is suspiciously regular |
 
-> **No single signal is proof** — a real user *could* be on a VPN or click fast. It's the **combination** (the bouncer logic): datacenter IP **+** 5ms click **+** zero conversions **+** 500/sec together = confidently fake.
+> **No single signal is proof** — a real user *could* be on a VPN or click fast. It's the **combination**: datacenter IP **+** 5ms click **+** zero conversions **+** 500/sec together = confidently fake.
 
 #### Two layers of defence (fast now + smart later)
 
@@ -378,13 +376,13 @@ aggregate: count(clicks), unique_users (HyperLogLog), sum(revenue)
 - **HyperLogLog** for cheap approximate unique counts (distinct users) without storing every id.
 - **Roll up** minute → hour → day for cheaper long-range queries.
 
-### Plain-English: counters, not event lists
+### Counters, not event lists
 
 #### Q: Are the 50k (or millions of) events held in memory as an ArrayList?
 
 **No — the most important optimization.** We do **not** keep events. We keep only a **running count**.
 
-Analogy: counting people entering a room — you don't write every name in a list; you keep a tally in your head (1, 2, 3...) and throw away each person after +1.
+The idea: keep a running tally and discard each event after adding 1 to the count, rather than storing every event.
 
 ```
 click for ad 123 arrives → counter[123] = counter[123] + 1 → THROW AWAY the click
@@ -448,7 +446,7 @@ rows per minute ≈ (active ads) × (countries) × (campaigns) × (other dimensi
 - **High-variety** field like `user_id` (billions) → rows explode to ~one-per-click → **defeats the whole design.** **Never** put `user_id` (or exact timestamp, IP) in the aggregation key.
 - Rule: **only low-cardinality dimensions in the key.** Also **roll up** minute → hour → day so long-range queries read few rows.
 
-### Plain-English: windowing with code
+### Windowing with code
 
 A "window" = a time bucket (per-minute). The event/key model and the counting machine:
 
@@ -548,7 +546,7 @@ Billing can't over/under-count.
 | **Reprocessing**                                    | Raw events in S3 → **replay** to rebuild aggregates if logic changes / a bug is found                                                |
 
 
-### Plain-English: watermarks & late events
+### Watermarks & late events
 
 Dilemma: bucket by event time (§6), but a 2:05 click may arrive at 2:08. **When is it safe to finalize 2:05?**
 
@@ -644,7 +642,7 @@ Timeline:
 
 We **don't** retroactively edit a finalized/billed count; stragglers go to a **correction/batch job** and are fixed in nightly reconciliation (**Lambda**, see §9). Real tools (Flink) give watermarks + allowed lateness built-in; here we hand-rolled them to see the mechanics.
 
-### Plain-English: deduplication & exactly-once
+### Deduplication & exactly-once
 
 Two different "counted twice" problems (people mix them up):
 
@@ -748,11 +746,11 @@ Mitigation: SALT the key → (ad_id, salt 0..K) spreads one hot ad across K part
 - Trade-off: a second aggregation step to combine partials, but it removes the single-task bottleneck.
 - Also: pre-aggregate on the **client/edge** (batch counts per ad before sending) to cut event volume.
 
-### Plain-English: the problem restated
+### The problem restated
 
 Because we partition by `ad_id` (§4), **one ad = one lane = one consumer**. So if ad 123 goes viral (Super Bowl ad), **all** its clicks pile into Lane A → Instance 1 drowns while Instances 2, 3, 4 sit idle. The thing that made counting clean now bites us.
 
-### Plain-English: pre-counting before Kafka (client/edge pre-aggregation)
+### Pre-counting before Kafka (client/edge pre-aggregation)
 
 Instead of one Kafka message per click, the **ad server / edge service** (many of these sit in front) batches and counts locally for ~1 second, then sends **one message with a count**.
 
@@ -791,9 +789,9 @@ public class EdgePreAggregator {
 }
 ```
 
-Kafka now gets `{ad_123, 2:05, India, count: 500}` — one message; the downstream counter does `+= 500`. Shrinks a viral ad's firehose **at the source**. Trade-off: dashboards ~1s less fresh, edge holds a little state. Analogy: each cashier tallies their own drawer and reports a total, instead of radioing the manager on every sale.
+Kafka now gets `{ad_123, 2:05, India, count: 500}` — one message; the downstream counter does `+= 500`. Shrinks a viral ad's firehose **at the source**. Trade-off: dashboards ~1s less fresh, edge holds a little state.
 
-### Plain-English: salting — and how it works with fixed partitions
+### Salting — and how it works with fixed partitions
 
 > **Q: If partitions already exist and a consumer is assigned to a partition, how does salting work? Is it built into Kafka?**
 > **Salting is NOT a Kafka feature — it's application-level code you write.**
@@ -915,7 +913,7 @@ Kappa:  one streaming pipeline; reprocess by REPLAYING Kafka/S3 when needed
 
 > **Common answer:** streaming for real-time dashboards + a **batch reconciliation** for billing (Lambda-style); or Kappa with replay if the stream layer is trusted for exactly-once.
 
-### Plain-English: why two paths at all
+### Why two paths at all
 
 Our streaming pipeline is **fast but approximate** (HyperLogLog for unique users, too-late events shunted aside, salting partials, tiny crash-edge gaps). Great for dashboards, not the final word on money. So we run **two paths = Lambda architecture.**
 
@@ -1034,7 +1032,7 @@ CREATE TABLE ads ( ad_id BIGINT PRIMARY KEY, campaign_id BIGINT, advertiser_id B
 
 > **Stores to consider:** Kafka (ingest buffer), stream-processor state (dedup/windows), **OLAP store** (Druid/ClickHouse — aggregates), **raw event lake** (S3), ads/campaign metadata (RDBMS).
 
-### Plain-English: what is OLAP here?
+### What is OLAP here?
 
 **OLAP = Online Analytical Processing** — a *category* of database built to **answer aggregation/summary queries over huge data, fast**. In our design the "results / aggregate store" feeding dashboards is OLAP (**Druid**, **ClickHouse**). Contrast with the OLTP DBs you're used to:
 

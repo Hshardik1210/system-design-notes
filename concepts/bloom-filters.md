@@ -2,7 +2,7 @@
 
 > A **probabilistic, space-efficient** set membership structure. It answers *"is X in the set?"* with **"definitely not"** or **"probably yes"** — **no false negatives, some false positives** — in tiny memory. Used to avoid expensive lookups (DB/disk/network) for items that don't exist.
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -30,23 +30,21 @@ You want to check membership in a **huge set** without storing the whole set in 
 
 A Bloom filter answers most **negatives** instantly in RAM, so you only do the expensive lookup when it says "probably yes."
 
-### Plain-English: the nightclub bouncer with a "definitely-not-on-the-list" gut
+### When a Bloom filter helps
 
-**Analogy: a bouncer who is great at rejecting, cautious about accepting.**
+A Bloom filter is a cheap in-memory pre-check placed in front of an expensive lookup. It gives one of two answers about whether an item is in the set:
 
-Imagine a club with a **guest list of 1 million names**. The bouncer can't memorize a million names, and phoning the office to check each name takes 10 seconds (the "expensive lookup"). So he uses a **cheap gut-check** he can do instantly:
+- **"definitely absent"** → skip the expensive lookup entirely. This answer is **never wrong**: if the item had been added, the filter would say otherwise.
+- **"probably present"** → not sure. The item may be in the set, or it may be a false positive. *Only then* do you perform the real lookup to confirm.
 
-- If his gut says **"nope, definitely never heard that name"** → he turns you away on the spot. He is **never wrong** about this — if you were really on the list, his gut would have twitched.
-- If his gut says **"hmm, that rings a bell"** → he's **not sure**. Maybe you're on the list, maybe you just sound like someone who is. *Only then* does he phone the office to actually check.
+That turns "do the expensive lookup every time" into "do it only for the fraction that pass the pre-check."
 
-That gut-check is the Bloom filter. It turns "check 1M names every time" into "phone the office only for the handful that sound familiar."
-
-**The "have I definitely NOT seen this?" checklist** — a Bloom filter shines exactly when:
+A Bloom filter shines exactly when:
 
 - The set is **huge** (millions/billions of items) and you can't hold it all in memory.
 - The real lookup is **expensive** (disk read, network call, DB query).
 - **Most queries are for things that don't exist** (missing keys, uncrawled URLs, unseen articles) — so a fast "definitely absent" saves the most work.
-- You can **tolerate an occasional false alarm** (an extra unnecessary lookup) but **cannot** tolerate wrongly saying "absent" for something that exists.
+- You can **tolerate an occasional false positive** (an extra unnecessary lookup) but **cannot** tolerate wrongly saying "absent" for something that exists.
 
 If instead you need exact answers, or you must delete items freely, or nearly everything you look up *does* exist — a plain Bloom filter is a poor fit (see §3 and §5).
 
@@ -71,27 +69,25 @@ contains("dog"): bit 2 is 0       → definitely absent ✅
 contains("fox"): bits 1,4,7 happen to be 1 (set by others) → FALSE POSITIVE ⚠️
 ```
 
-### Plain-English: a row of light switches you flip ON
+### How the bit array works
 
-**Analogy: a long row of light switches, all OFF to start.**
+The structure is a bit array of `m` bits, all **0** to start, plus `k` hash functions that map any item to the **same** `k` positions each time.
 
-Picture `m` light switches in a row, every one **OFF (0)**. You have `k` fixed "rules" (the hash functions) that, given a name, always point at the **same** handful of switch positions.
+- **Adding an item** = run it through the `k` hash functions to get `k` positions, and set those bits to **1**. Bits are never cleared.
+- **Checking an item** = run it through the same `k` hash functions and inspect those `k` bits:
+  - If **any** of them is still **0**, the item was *never* added (adding it would have set that bit to 1) → **"definitely absent."**
+  - If **all** of them are **1**, the item is **"probably present"** — but those bits may have been set to 1 by *other* items that happened to hash to the same positions. That coincidence is a **false positive**.
 
-- **Adding a name** = run it through the `k` rules to get `k` positions, and flip those switches **ON**. You never turn a switch back off.
-- **Checking a name** = run it through the same `k` rules and peek at those `k` switches:
-  - If **any** of them is still **OFF**, the name was *never* added (adding it would have flipped that switch ON) → **"definitely absent."**
-  - If **all** of them are **ON**, the name is **"probably present"** — but maybe those switches were flipped ON by *other* names that happened to share positions. That coincidence is a **false positive**.
+Key point: the filter never stores the items themselves — only the array of set/unset bits. That's why it's tiny, and also why it can't tell you *which* item set a given bit.
 
-Key mental model: the filter never stores the names themselves — only a smear of ON/OFF switches. That's why it's tiny, and also why it can't tell you *who* flipped a switch on.
-
-### Plain-English: the whole thing in ~30 lines of Java
+### The whole thing in ~30 lines of Java
 
 ```java
 class BloomFilter {
 
-    private final boolean[] bits;   // the row of "light switches", all false (0) at start
-    private final int m;            // number of bits (switches)
-    private final int k;            // number of hash functions ("rules")
+    private final boolean[] bits;   // the bit array, all false (0) at start
+    private final int m;            // number of bits
+    private final int k;            // number of hash functions
 
     BloomFilter(int m, int k) {
         this.m = m;
@@ -102,8 +98,8 @@ class BloomFilter {
     // ADD: flip ON the k positions this item hashes to
     void add(String item) {
         for (int i = 0; i < k; i++) {
-            int pos = hash(item, i) % m;   // rule #i → a position in [0, m)
-            bits[pos] = true;              // flip that switch ON (never turned off)
+            int pos = hash(item, i) % m;   // hash #i → a position in [0, m)
+            bits[pos] = true;              // set that bit to 1 (never cleared)
         }
     }
 
@@ -112,16 +108,16 @@ class BloomFilter {
         for (int i = 0; i < k; i++) {
             int pos = hash(item, i) % m;
             if (!bits[pos]) {
-                return false;   // one switch is OFF → DEFINITELY absent (no false negatives)
+                return false;   // one bit is 0 → DEFINITELY absent (no false negatives)
             }
         }
-        return true;            // every switch ON → PROBABLY present (could be a false positive)
+        return true;            // every bit is 1 → PROBABLY present (could be a false positive)
     }
 
     // k "independent" hashes cheaply: mix one base hash with a seed i.
     // (Real impls use techniques like double hashing; this is the idea.)
     private int hash(String item, int seed) {
-        int h = (item.hashCode() ^ (seed * 0x9E3779B1));   // combine item with the rule number
+        int h = (item.hashCode() ^ (seed * 0x9E3779B1));   // combine item with the seed
         return Math.abs(h);
     }
 }
@@ -137,7 +133,7 @@ bf.contains("dog");   // → false : one of dog's positions (say 2) is OFF → d
 bf.contains("fox");   // → true  : fox's positions happen to be 1,4,7 (set by "cat") → FALSE POSITIVE ⚠️
 ```
 
-Notice there is **no `remove` method** — because turning a switch OFF could silently un-add some *other* name that shares that position (see §5 for the fix, a Counting Bloom filter).
+Notice there is **no `remove` method** — because clearing a bit could silently un-add some *other* item that shares that position (see §5 for the fix, a Counting Bloom filter).
 
 ---
 
@@ -153,30 +149,30 @@ Notice there is **no `remove` method** — because turning a switch OFF could si
 
 > The **guarantee that matters:** no false negatives → safe to use as a "skip the expensive lookup if absent" gate. A false positive just means an occasional unnecessary lookup (still correct, just not free).
 
-### Plain-English: why false positives but NEVER false negatives
+### Why false positives but never false negatives
 
-This is *the* question people trip on, so let's nail it with the light-switch model from §2.
+This is *the* question people trip on, so let's work through it with the bit-array model from §2.
 
 #### Q: Why can it never give a false negative (say "absent" for something that IS there)?
 
-Because **adding a name only ever flips switches ON, and nothing ever flips them back OFF.** So if you truly added `"cat"`, then `"cat"`'s `k` switches are guaranteed ON forever. When you later check `"cat"`, you look at those exact same `k` switches — they *must* all be ON — so the answer can never be "absent." A "definitely absent" happens only when *at least one* of the checked switches is OFF, and that's impossible for a name you actually added.
+Because **adding an item only ever sets bits to 1, and nothing ever clears them.** So if you truly added `"cat"`, then `"cat"`'s `k` bits are guaranteed 1 forever. When you later check `"cat"`, you inspect those exact same `k` bits — they *must* all be 1 — so the answer can never be "absent." A "definitely absent" happens only when *at least one* checked bit is 0, which is impossible for an item you actually added.
 
-> One-liner: **"absent" is trustworthy because the only way to see an OFF switch is if nobody ever set it.**
+> One-liner: **"absent" is trustworthy because the only way to see a 0 bit is if nobody ever set it.**
 
 #### Q: Then why CAN it give a false positive (say "present" for something that isn't)?
 
-Because switches are **shared**. Different names can hash to overlapping positions. If `"cat"` turned ON positions 1,4,7 and `"owl"` turned ON 4,7,9, then a brand-new name `"fox"` whose positions happen to be 1,4,7 will find **all three ON** — even though `"fox"` was never added. The filter can't tell "these switches are ON *because of you*" from "these switches are ON *because of other names*." It only sees ON/OFF, not *who* flipped them.
+Because bits are **shared**. Different items can hash to overlapping positions. If `"cat"` set positions 1,4,7 and `"owl"` set 4,7,9, then a brand-new item `"fox"` whose positions happen to be 1,4,7 will find **all three set** — even though `"fox"` was never added. The filter can't tell "these bits are 1 *because of this item*" from "these bits are 1 *because of other items*." It only sees 1/0, not *which* item set them.
 
 ```
-"present" really means: "every switch you'd have flipped is already ON —
-                         so MAYBE it was you, or maybe it was a mix of others."
-"absent"  really means: "a switch you'd have flipped is OFF —
-                         so it definitely wasn't you." (rock solid)
+"present" really means: "every bit this item maps to is already 1 —
+                         so MAYBE it was this item, or maybe a mix of others."
+"absent"  really means: "a bit this item maps to is 0 —
+                         so it was definitely never added." (rock solid)
 ```
 
 #### Q: What happens to the false-positive rate as I add more items?
 
-More names → more switches flipped ON → more collisions → **more false positives.** Eventually, if you overfill the filter, *most* switches are ON and nearly everything reads "probably present" (useless). This is why sizing matters (§4): you pick `m` and `k` up front for how many items `n` you expect. False *negatives* never appear no matter how full it gets — only the false-*positive* rate degrades.
+More items → more bits set to 1 → more collisions → **more false positives.** Eventually, if you overfill the filter, *most* bits are 1 and nearly everything reads "probably present" (useless). This is why sizing matters (§4): you pick `m` and `k` up front for how many items `n` you expect. False *negatives* never appear no matter how full it gets — only the false-*positive* rate degrades.
 
 ---
 
@@ -192,7 +188,7 @@ Given n items and target false-positive rate p:
 - Too many items in a fixed filter → fills up → false-positive rate climbs.
 - Example: ~10 bits/item + 7 hashes → ~1% false positives.
 
-### Plain-English: how to actually pick `m` and `k`
+### How to actually pick `m` and `k`
 
 You don't guess these — you **work backwards from two numbers you already know**:
 
@@ -225,12 +221,12 @@ Handy rules of thumb worth memorizing:
 
 #### Q: Why is there a "best" `k`? Wouldn't more hashes always be safer?
 
-No — `k` has a sweet spot. Each hash you add flips **more** switches ON per item:
+No — `k` has a sweet spot. Each hash you add sets **more** bits per item:
 
-- **Too few hashes** → you check too few switches, so collisions slip through as false positives.
-- **Too many hashes** → each add floods the array with ON switches, so the array **fills up faster** and *everything* starts colliding.
+- **Too few hashes** → you check too few bits, so collisions slip through as false positives.
+- **Too many hashes** → each add sets more bits, so the array **fills up faster** and *everything* starts colliding.
 
-The formula `k = (m/n) · ln 2` gives the `k` that balances these — it's the point where about **half the bits are ON** when the filter is full, which mathematically minimizes false positives. More is not better; it's a tuned knob.
+The formula `k = (m/n) · ln 2` gives the `k` that balances these — it's the point where about **half the bits are set** when the filter is full, which mathematically minimizes false positives. More is not better; it's a tuned knob.
 
 #### Q: What if I don't know `n` in advance?
 
@@ -246,11 +242,11 @@ Either **over-provision** `m` for the largest `n` you expect (a Bloom filter deg
 | **Scalable Bloom filter** | Grows as items are added (keeps FP rate bounded) |
 | **Cuckoo filter** | Supports deletion, often better space + lookup |
 
-### Plain-English: why plain Bloom filters can't delete (and how counting fixes it)
+### Why plain Bloom filters can't delete (and how counting fixes it)
 
-#### Q: Why can't I just flip the bits back OFF to delete an item?
+#### Q: Why can't I just clear the bits back to 0 to delete an item?
 
-Because bits are **shared** (the §3 insight again). Say `"cat"` set positions 1,4,7 and `"owl"` set 4,7,9. If you "delete" `"cat"` by flipping 1,4,7 back OFF, you also just turned OFF positions 4 and 7 — which `"owl"` still needs. Now `contains("owl")` sees an OFF switch and wrongly reports **"definitely absent"** — a **false negative**, which destroys the one guarantee the whole structure is built on. So plain Bloom filters simply forbid deletion.
+Because bits are **shared** (the §3 insight again). Say `"cat"` set positions 1,4,7 and `"owl"` set 4,7,9. If you "delete" `"cat"` by clearing 1,4,7 back to 0, you also just cleared positions 4 and 7 — which `"owl"` still needs. Now `contains("owl")` sees a 0 bit and wrongly reports **"definitely absent"** — a **false negative**, which destroys the one guarantee the whole structure is built on. So plain Bloom filters simply forbid deletion.
 
 #### Q: How does a Counting Bloom filter allow deletion?
 
@@ -309,7 +305,7 @@ Now deleting `"cat"` decrements 1,4,7. Positions 4 and 7 drop from 2 → 1 (stil
 
 > Appears across these notes: URL Shortener (unknown codes), Web Crawler (seen URLs), Distributed Cache (penetration).
 
-### Plain-English: when to reach for one (and when NOT to)
+### When to reach for one (and when NOT to)
 
 Notice the common shape of **every** row in the table above: *"before I do something slow/expensive, cheaply rule out the cases that don't exist."* That's the one job of a Bloom filter.
 

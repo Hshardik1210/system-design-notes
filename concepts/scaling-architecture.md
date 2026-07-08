@@ -2,7 +2,7 @@
 
 > **Core idea:** scaling is a **journey** — you evolve the architecture one bottleneck at a time, from a single server to a globally distributed system. The skill is knowing **which bottleneck to fix next** and **which lever** (vertical vs horizontal, cache, replicas, shard, async) to pull.
 
-> **How to read this doc:** each section has the **dense summary first** (tables/diagrams for quick revision), then a **Plain-English** deep dive (a running restaurant-chain analogy, simple annotated examples, and the exact confusions beginners hit). Skim the summaries to revise; read the Plain-English parts to actually understand *why*.
+> **How to read this doc:** each section has the **dense summary first** (tables/diagrams for quick revision), then a **deep dive** (annotated examples and the exact confusions beginners hit). Skim the summaries to revise; read the deep dives to actually understand *why*.
 
 ---
 
@@ -32,20 +32,20 @@
 
 > Start vertical (cheap, easy) → hit the ceiling → go **horizontal** (the only path to millions of users). Horizontal scaling **requires stateless services** (§3) and **distributed data** (§4).
 
-### Plain-English: vertical vs horizontal scaling
+### Vertical vs horizontal scaling
 
-**The kitchen analogy (used throughout this doc).** Picture a restaurant whose orders keep growing:
+Two ways to handle growing load:
 
-- **Vertical scaling = a bigger oven.** Your one oven can't keep up, so you buy a **bigger, more powerful oven** in the same kitchen. Nothing else changes — same building, same one cook, same one oven, just beefier. Easy, but there's a limit: eventually you buy the biggest oven money can make, and you're stuck.
-- **Horizontal scaling = more ovens (and eventually more kitchens).** Instead of one giant oven, you add a **second oven, a third, a tenth** — and later open **more restaurant branches** across the city. No single oven has to be huge; you just keep adding. Near-limitless, and if one oven breaks, the others keep cooking.
+- **Vertical scaling = a bigger box.** Your one server can't keep up, so you move to a **bigger, more powerful machine** (more CPU/RAM). Nothing else changes — same single server, just beefier. Easy, but there's a limit: eventually you're on the biggest machine available and you're stuck.
+- **Horizontal scaling = more boxes.** Instead of one giant server, you add a **second, a third, a tenth** — and later spread across **more regions**. No single machine has to be huge; you just keep adding. Near-limitless, and if one box dies, the others keep serving.
 
 ```
-Vertical  (scale UP):   [🔥]  →  [🔥🔥🔥]        one box, made stronger
-Horizontal (scale OUT): [🔥]  →  [🔥][🔥][🔥]     many boxes, added alongside
+Vertical  (scale UP):   [■]  →  [■■■]        one box, made stronger
+Horizontal (scale OUT): [■]  →  [■][■][■]     many boxes, added alongside
 ```
 
-- **Vertical is where everyone starts** — it needs zero code changes. You just move to a bigger machine (more CPU/RAM). Cheap and instant.
-- **Horizontal is where everyone ends up** — because the "bigger oven" runs out. Real scale = many machines working together, which is why the rest of this doc exists.
+- **Vertical is where everyone starts** — it needs zero code changes. You just move to a bigger machine. Cheap and instant.
+- **Horizontal is where everyone ends up** — because the bigger box runs out. Real scale = many machines working together, which is why the rest of this doc exists.
 
 #### Q: Why not just keep buying a bigger box forever?
 
@@ -56,7 +56,7 @@ Two walls:
 
 #### Q: What is a "single point of failure" (SPOF)?
 
-A SPOF is **one component that, if it fails, takes the entire system down** — like a restaurant with exactly one oven. Oven breaks → no food → restaurant closed. One giant server is a SPOF; ten smaller servers are not, because losing one still leaves nine cooking. Removing SPOFs (via horizontal scaling, replicas, multi-region) is a core theme of everything below.
+A SPOF is **one component that, if it fails, takes the entire system down**. One giant server is a SPOF: if it dies, the whole app is down. Ten smaller servers are not, because losing one still leaves nine serving. Removing SPOFs (via horizontal scaling, replicas, multi-region) is a core theme of everything below.
 
 #### Q: Isn't horizontal always better then?
 
@@ -100,28 +100,28 @@ Stage 8 — Multi-region + GeoDNS
 
 > **Order matters:** cache before replicas, replicas before sharding, sharding before multi-region — you always **fix the current bottleneck**, don't over-engineer early.
 
-### Plain-English: the growing restaurant chain
+### The evolution journey stage by stage
 
-Think of the whole journey as **one food stall growing into a national restaurant chain**. Each stage is forced by a problem the previous stage created — you never build the big version on day one.
+Each stage is forced by a problem the previous stage created — you never build the big version on day one.
 
-| Stage | Restaurant story | Tech move |
+| Stage | Problem that forces it | Tech move |
 | --- | --- | --- |
-| 0 | One tiny stall: one person takes orders, cooks, and serves | App + DB on **one box** |
-| 1 | Hire a dedicated cook so the cashier can focus on orders | **Split** app server and DB server |
-| 2 | One cashier can't keep up → add **several cashiers** + a host who points each customer to a free one | Multiple **app servers** + a **load balancer** |
-| 3 | Keep today's popular dishes pre-made on the counter instead of cooking each from scratch | Add a **cache** (Redis) for hot reads |
-| 4 | Photocopy the recipe book so many cooks can *read* it at once | Database **read replicas** |
-| 5 | Put menus/flyers at kiosks all over town so people don't walk to HQ | **CDN** for static content at the edge |
-| 6 | Too many *orders to record* for one ledger → split customers across **many ledgers** (A–M here, N–Z there) | **Shard** the database (scale writes) |
-| 7 | Split the mega-kitchen into specialist stations (grill, bar, dessert) that run independently | **Microservices** + async events (Kafka) |
-| 8 | Open branches in other cities so locals get served nearby | **Multi-region** + GeoDNS |
+| 0 | Everything on one machine; simplest possible start | App + DB on **one box** |
+| 1 | App and DB compete for the same CPU/RAM | **Split** app server and DB server |
+| 2 | One app server can't handle the request volume | Multiple **app servers** + a **load balancer** |
+| 3 | The same hot data is read from the DB over and over | Add a **cache** (Redis) for hot reads |
+| 4 | Read traffic exceeds what one DB can serve | Database **read replicas** |
+| 5 | Static assets travel far and load the origin | **CDN** for static content at the edge |
+| 6 | Write traffic exceeds what one primary can take | **Shard** the database (scale writes) |
+| 7 | One codebase can't be deployed/scaled independently | **Microservices** + async events (Kafka) |
+| 8 | Users are far from a single region (latency, DR) | **Multi-region** + GeoDNS |
 
-> The key beginner insight: **you don't jump to stage 8.** Each step fixes the *specific* pain the last step exposed. Adding cashiers (stage 2) eventually overwhelms the single cook (→ replicas, sharding), and so on. That's why the order is fixed: **cache → replicas → shard → microservices → multi-region.**
+> The key insight: **you don't jump to stage 8.** Each step fixes the *specific* pain the last step exposed. Adding app servers (stage 2) eventually overwhelms the single DB (→ replicas, sharding), and so on. That's why the order is fixed: **cache → replicas → shard → microservices → multi-region.**
 
 #### Q: What's the difference between a monolith and microservices?
 
-- **Monolith = one big kitchen where everything is cooked in the same room by the same team.** All your code (users, orders, payments) lives in **one application**, deployed as **one unit**. Simple to start: one codebase, one deploy. But at scale it hurts — a change to the dessert recipe means shutting the *whole* kitchen to redeploy, and one bug (a fire at the grill) can take everything down.
-- **Microservices = separate specialist stations, each its own small kitchen.** User Service, Order Service, Payment Service each have their **own code, their own database, their own deploy**. They talk over the network (API calls or events).
+- **Monolith = all your code in one application.** Users, orders, payments all live in **one codebase**, deployed as **one unit**. Simple to start: one codebase, one deploy. But at scale it hurts — changing one small feature means redeploying the *whole* app, and one bug can take everything down.
+- **Microservices = separate services, each independent.** User Service, Order Service, Payment Service each have their **own code, their own database, their own deploy**. They talk over the network (API calls or events).
 
 ```
 Monolith:       [ Users + Orders + Payments  — one app, one deploy ]
@@ -141,7 +141,7 @@ Microservices:  [ User Svc ] [ Order Svc ] [ Payment Svc ]   ← deploy & scale 
 
 #### Q: Why is the load balancer needed the moment I have more than one app server?
 
-Because customers (clients) only know **one address** — your restaurant's front door. If you have three cashiers, someone has to stand at the door and send each customer to a free one. That's the **load balancer**: a single entry point that spreads incoming requests across your app servers, and skips any server that's down.
+Because clients only know **one address** — a single entry point. With three app servers, something has to receive each request and forward it to a free server. That's the **load balancer**: a single entry point that spreads incoming requests across your app servers, and skips any server that's down.
 
 ---
 
@@ -159,12 +159,12 @@ Stateless (good): app servers hold NO per-user state
 - Move state **out**: sessions → Redis/JWT, uploads → blob store (S3), cache → Redis.
 - Stateless servers = **freely add/remove/replace** behind the load balancer; zero-downtime deploys.
 
-### Plain-English: stateless vs stateful
+### Stateless vs stateful
 
-**Analogy: coat-check tickets.** Imagine any of the three cashiers can serve you — but *only if* they don't secretly keep your stuff behind their own counter.
+Any of your app servers can serve any request — but *only if* they don't keep per-user data in their own local memory.
 
-- **Stateful (bad) = the cashier stashes your coat behind *their* counter.** If you come back and get sent to a *different* cashier, they have no idea where your coat is. So you're forced to always return to the **same** cashier ("sticky sessions"). If that cashier goes home (server crashes/restarts), your coat — your login session, your half-finished cart — is **gone**.
-- **Stateless (good) = coats go in a shared cloakroom, and you carry a numbered ticket.** Now *any* cashier can fetch your coat using the ticket, because the state lives in a **shared place** (Redis / a JWT / S3), not inside one cashier's head. Any server can serve any request.
+- **Stateful (bad) = the server keeps your session in *its* local memory.** If a later request is routed to a *different* server, that server has no record of your session. So you're forced to always return to the **same** server ("sticky sessions"). If that server crashes or restarts, your session — your login, your half-finished cart — is **gone**.
+- **Stateless (good) = state lives in a shared store, and the client carries a key/token.** Now *any* server can look up your session, because the state lives in a **shared place** (Redis / a JWT / S3), not inside one server's memory. Any server can serve any request.
 
 ```
 Stateful:   You ──always──► Server 2   (your session lives INSIDE Server 2's memory)
@@ -178,7 +178,7 @@ Stateless:  You ──► [ LB ] ──► any of Server 1/2/3
 
 #### Q: Why does horizontal scaling *require* statelessness?
 
-Because horizontal scaling means "any request can hit any server" (§1). That's only true if servers don't hoard per-user data locally. The moment a server remembers something only *it* knows, you're forced back to sticky sessions — and you lose the whole benefit of being able to **add, remove, or replace** servers freely. Stateless servers are interchangeable, like identical cashiers reading from one shared cloakroom, which is what makes elastic auto-scaling and zero-downtime deploys possible.
+Because horizontal scaling means "any request can hit any server" (§1). That's only true if servers don't hoard per-user data locally. The moment a server remembers something only *it* knows, you're forced back to sticky sessions — and you lose the whole benefit of being able to **add, remove, or replace** servers freely. Stateless servers are interchangeable — each reads shared state from the same external store — which is what makes elastic auto-scaling and zero-downtime deploys possible.
 
 #### Q: Simple example — what does "move state out" look like?
 
@@ -213,13 +213,13 @@ The DB is almost always the first hard limit. The ladder:
 
 - **Reads scale easily** (cache + replicas); **writes are the hard part** → sharding (or NewSQL like Spanner/CockroachDB). See the **Databases — Deep Dive** note.
 
-### Plain-English: why the database is (almost always) the bottleneck
+### Why the database is (almost always) the bottleneck
 
-App servers are easy: they're **stateless** (§3), so you just add more ovens. But there's usually **one shared recipe-book/ledger** — the database — that everybody depends on. You can't just clone it naively, because then which copy has the *real* latest data? So the database becomes the choke point, and the tricks below (caching, replication, sharding) are all about relieving it.
+App servers are easy: they're **stateless** (§3), so you just add more of them. But there's usually **one shared source of truth** — the database — that everybody depends on. You can't just clone it naively, because then which copy has the *real* latest data? So the database becomes the choke point, and the tricks below (caching, replication, sharding) are all about relieving it.
 
-### Plain-English: caching layers
+### Caching layers
 
-**Analogy: pre-made popular dishes on the front counter.** Cooking every order from scratch is slow. So you keep the **most-ordered dishes ready on the counter** — customers grab them instantly, and the kitchen (database) only gets involved for the unusual orders.
+A **cache** stores the **most frequently-read data** so requests don't hit the slow database every time.
 
 - A **cache** (like **Redis**) is a small, blazing-fast store of **frequently-read data** that sits **in front of** the database.
 - Most apps read the *same* popular data over and over (a celebrity's profile, today's trending items). Serve those from the cache and the database barely gets touched.
@@ -246,11 +246,11 @@ User getUser(String id) {
 - **Invalidation** — when the underlying data changes, the cached copy is now *stale* (wrong). You must delete/update the cached entry, or set a **TTL** (expiry) so it refreshes. "There are only two hard things in computer science: cache invalidation and naming things."
 - **Stampede** — if a super-popular cached item expires, thousands of requests all miss at once and *simultaneously* hammer the DB to refill it. Mitigated by locks, staggered TTLs, or refreshing before expiry.
 
-### Plain-English: replication (scaling reads)
+### Replication (scaling reads)
 
-**Analogy: photocopy the recipe book.** One cook can't answer everyone's "how do I make X?" So you make **copies of the recipe book** — cooks *read* from any copy. But to avoid chaos, only **one master copy is edited** (the head chef writes changes), and those edits are then **copied out** to all the duplicates.
+Keep multiple **copies** of the database so many servers can *read* in parallel. To avoid conflicts, only **one copy accepts writes** (the primary); those writes are then **replicated** to all the read-only copies.
 
-- **Primary (leader):** the one database that takes all **writes** (edits).
+- **Primary (leader):** the one database that takes all **writes**.
 - **Replicas (followers):** read-only copies. All the **reads** spread across them → you can add many replicas to handle huge read traffic.
 
 ```
@@ -271,11 +271,11 @@ Copying edits to the replicas isn't instant — there's a tiny delay. **Replicat
 
 Fixes: read *your own* recent writes from the primary, or wait for the replica to catch up. This is why replicas scale reads but don't magically make everything consistent.
 
-### Plain-English: sharding (scaling writes — the hard part)
+### Sharding (scaling writes — the hard part)
 
-Replicas fix **reads**, but **every write still goes to the one primary** — one head chef editing one book. Eventually even that can't keep up. **Sharding** = split the data itself across **many independent databases**, each owning a slice.
+Replicas fix **reads**, but **every write still goes to the one primary**. Eventually even that can't keep up. **Sharding** = split the data itself across **many independent databases**, each owning a slice.
 
-**Analogy: split the customer ledger by name.** Instead of one giant ledger everyone fights to write in, use several: **A–M in ledger 1, N–Z in ledger 2.** Now two writes to different letters happen **at the same time**, in parallel.
+Split the data by key: e.g. **users A–M in shard 1, N–Z in shard 2.** Now two writes to different slices happen **at the same time**, in parallel, on different databases.
 
 ```
 users A–M  → Shard 1 (its own DB, own primary+replicas)
@@ -298,13 +298,13 @@ db.write(userData);
 | What it does | Makes **full copies** of the *same* data | **Splits** data into different pieces |
 | Each machine holds | The **entire** dataset | Only **its slice** |
 | Scales | **Reads** (+ availability) | **Writes** (+ storage) |
-| Analogy | Photocopy the whole recipe book | Tear the ledger into A–M / N–Z |
+| In one line | Full copies of the same data | Data split into disjoint slices |
 
 They're **complementary**, not either/or — real systems do **both**: shard the data, then replicate *each shard* for read scaling and failover. (See the diagram in §5: shards *plus* replicas.)
 
 #### Q: What are the downsides of sharding? (why it's a last resort)
 
-- **Cross-shard queries are painful.** "List all users alphabetically" now has to ask *every* ledger and merge results — slow and complex.
+- **Cross-shard queries are painful.** "List all users alphabetically" now has to ask *every* shard and merge results — slow and complex.
 - **Hot shards.** If one slice gets way more traffic (a celebrity all on shard 2), that shard becomes a mini-bottleneck again. (Same "hot key" idea as salting in stream systems.)
 - **Resharding is hard.** Adding a shard later means *moving* data around while live — genuinely tricky. This is why you cache and add replicas **first**, and only shard when writes truly force you to.
 
@@ -340,15 +340,15 @@ They're **complementary**, not either/or — real systems do **both**: shard the
            └──────────┘  └──────────┘   └──────────┘
 ```
 
-### Plain-English: reading the big diagram (a request's journey)
+### Reading the big diagram (a request's journey)
 
-That tower looks intimidating, but it's just **every trick from §1–§4 stacked in the order a request travels through them.** Follow one user's click from top to bottom:
+That tower looks intimidating, but it's just **every technique from §1–§4 stacked in the order a request travels through them.** Follow one request from top to bottom:
 
-1. **DNS (Geo)** — "which branch is nearest you?" Your phone asks *where* to send the request; GeoDNS points you to the closest region (Mumbai, not Virginia). Lower latency.
-2. **CDN / Edge** — "is this just a menu/flyer?" Static stuff (images, JS, CSS, video) is served from a nearby edge cache **without ever reaching your servers**. Huge offload.
-3. **API Gateway** — "the front desk": handles auth, rate limiting, and routing, per region.
-4. **Reverse Proxy / Load Balancer** — "the host": picks a free app server (§2).
-5. **Services (User / Order / Payment)** — the specialist stations (microservices, §2's stage 7), each **auto-scaled** on its own.
+1. **DNS (Geo)** — decides *which region* handles the request; GeoDNS points the client to the closest region (Mumbai, not Virginia). Lower latency.
+2. **CDN / Edge** — static content (images, JS, CSS, video) is served from a nearby edge cache **without ever reaching your servers**. Huge offload.
+3. **API Gateway** — handles auth, rate limiting, and routing, per region.
+4. **Reverse Proxy / Load Balancer** — picks a free app server (§2).
+5. **Services (User / Order / Payment)** — the microservices (§2's stage 7), each **auto-scaled** on its own.
 6. **DB Shards (+ replicas, + Redis, + Kafka)** — the data layer: **sharded** for writes, **replicated** for reads, **cached** in Redis, **decoupled** with Kafka (all of §4).
 
 > Nothing here is new — it's the **evolution journey (§2) drawn as a live system.** Each layer removes a bottleneck *and* removes a single point of failure (multiple regions, multiple servers, multiple shards+replicas), so no one broken component takes the whole thing down.
@@ -371,18 +371,18 @@ That tower looks intimidating, but it's just **every trick from §1–§4 stacke
 | 10 | **Observability** | Logs + metrics + traces become mandatory (see Observability note) |
 | 11 | **Failures are normal** | Multi-region + failover; design for partial failure |
 
-### Plain-English: what actually changes when you get huge
+### What actually changes when you get huge
 
 The single biggest **mindset shift**: at small scale you assume things *work* and treat failure as an exception. At massive scale, with thousands of machines, **something is always broken right now** — a disk, a network link, a whole data center. So you *design for failure* instead of hoping to avoid it.
 
-A few of the table rows in beginner terms:
+A few of the table rows explained:
 
-- **GeoDNS (row 1)** = open branches in many cities and send each customer to the nearest one → faster for them, and if one city's branch burns down, others still serve.
-- **CDN (row 2)** = flyers/menus everywhere so people don't walk to HQ → your kitchen only handles real cooking.
-- **Services auto-scale (row 5)** = hire extra grill cooks automatically at dinner rush, send them home when it's quiet. Kubernetes' HPA does this: `Order Svc: 100+ pods` at peak, few at 3am.
-- **Event-driven / Kafka (row 8)** = instead of the cashier standing and *waiting* while the kitchen cooks, they drop the ticket on a spike and move on; the kitchen picks it up when ready. **Async** decoupling → services don't block each other and can scale independently.
-- **Rate limiting (row 9)** = a bouncer capping how many orders one rowdy customer can fire per second, so abuse can't drown everyone else.
-- **Observability (row 10)** = CCTV + dashboards for the whole chain. With one stall you can *see* the problem; with 1000 machines you're blind without logs, metrics, and traces.
+- **GeoDNS (row 1)** = run deployments in many regions and route each user to the nearest one → lower latency, and if one region goes down, others still serve.
+- **CDN (row 2)** = serve static assets from edge caches near users → your origin servers only handle dynamic requests.
+- **Services auto-scale (row 5)** = add instances automatically under load, remove them when quiet. Kubernetes' HPA does this: `Order Svc: 100+ pods` at peak, few at 3am.
+- **Event-driven / Kafka (row 8)** = instead of a service blocking while it *waits* for downstream work, it publishes an event and moves on; the consumer processes it when ready. **Async** decoupling → services don't block each other and can scale independently.
+- **Rate limiting (row 9)** = cap how many requests one client can send per second, so abuse can't drown everyone else.
+- **Observability (row 10)** = logs, metrics, and traces across the whole system. With one machine you can inspect it directly; with 1000 machines you're blind without them.
 
 > One line: at massive scale you **scale every layer** *and* assume **every layer will sometimes fail**, so redundancy and monitoring stop being optional.
 
@@ -406,17 +406,15 @@ Don't scale blindly — **measure, then fix the actual limit**:
 
 > **Fixing one bottleneck exposes the next** (e.g. more workers → DB overload). Scale is an iterative loop, not a one-shot.
 
-### Plain-English: don't guess — find the actual slow part
+### Don't guess — find the actual slow part
 
-**Analogy: the restaurant is slow tonight — where's the jam?** You wouldn't hire ten new cashiers if the real problem is a single overwhelmed grill. You'd **watch** where the line backs up, then fix *that*.
-
-Same with systems: **measure first, then fix the one resource that's maxed out.** Chasing the wrong thing wastes money and doesn't help.
+Don't add capacity blindly: if the real problem is one saturated resource, scaling something else wastes money and doesn't help. **Measure first, then fix the one resource that's maxed out.**
 
 ```
 See what's at ~100%:
-  App CPU pegged     → add app servers (more cashiers) or optimize the code
-  Too many DB reads  → add a cache + read replicas (pre-made dishes + recipe copies)
-  Too many DB writes → shard the DB (split the ledger)
+  App CPU pegged     → add app servers or optimize the code
+  Too many DB reads  → add a cache + read replicas
+  Too many DB writes → shard the DB
   Cache keeps missing→ make the cache bigger / fix expiry (TTL) / pre-warm it
   Slow only sometimes→ check p99 (the worst 1% of requests): hot keys, N+1 queries, GC pauses
   Queue backing up   → add more consumers (but never more than #partitions)
@@ -426,7 +424,7 @@ See what's at ~100%:
 
 **p99 = the 99th-percentile latency** — the response time that 99% of requests are *faster* than (so it captures the slowest 1%). Averages **lie**: if 99 requests take 10ms and 1 takes 5 seconds, the average looks fine (~60ms) but 1 in 100 users is furious. Watching **p99 (and p999)** surfaces the painful tail the average hides.
 
-> The loop never ends: **fix the jam → the line moves → a *new* jam appears somewhere else → repeat.** That's why scaling is iterative — solving the DB bottleneck might just reveal the network as the next one.
+> The loop never ends: **fix the bottleneck → throughput rises → a *new* bottleneck appears somewhere else → repeat.** That's why scaling is iterative — solving the DB bottleneck might just reveal the network as the next one.
 
 ---
 
@@ -447,16 +445,16 @@ Small system:  Request → Server → DB
 Large system:  Request → Edge(CDN) → Gateway → LB → Service → Cache → DB(shards+replicas) → Events(Kafka)
 ```
 
-### Plain-English: the same restaurant, day 1 vs national chain
+### The same system, stage 0 vs stage 8
 
-This table is just **stage 0 vs stage 8** side by side — the food stall you opened versus the chain it became:
+This table is just **stage 0 vs stage 8** side by side:
 
-- **App servers: 1 → many, stateless.** One cook → a whole crew of interchangeable cooks (§3).
-- **Load balancer: none → smart L7, multi-region.** No host needed for one cashier → a host at every branch directing traffic intelligently.
-- **DB: single → sharded + replicas.** One ledger → split ledgers, each photocopied (§4).
-- **Cache: optional → mandatory.** Nice-to-have counter of popular dishes → *required* to survive the volume.
-- **Kafka: optional → core.** No need to decouple two people → the event backbone tying independent stations together.
-- **CDN / Regions: optional → critical / multi-region.** One location → branches worldwide with failover.
+- **App servers: 1 → many, stateless.** One server → a fleet of interchangeable servers (§3).
+- **Load balancer: none → smart L7, multi-region.** Not needed for one server → routing traffic intelligently across many, per region.
+- **DB: single → sharded + replicas.** One database → split shards, each replicated (§4).
+- **Cache: optional → mandatory.** Nice-to-have → *required* to survive the volume.
+- **Kafka: optional → core.** No need to decouple two components → the event backbone tying independent services together.
+- **CDN / Regions: optional → critical / multi-region.** One location → many regions with failover.
 
 > The point of showing both columns: **you are not supposed to build the right column on day one.** Every "Massive Scale" entry was *added later*, only when volume forced it. Starting with the right column for a 10-user app is the classic **over-engineering** mistake.
 
@@ -476,9 +474,9 @@ This table is just **stage 0 vs stage 8** side by side — the food stall you op
 > **"Why stateless?"**
 > "So any request can hit any server → you can freely add/remove/replace servers behind the LB. Push state to Redis/JWT and blob storage."
 
-### Plain-English: how to actually use these in an interview
+### How to actually use these in an interview
 
-Don't recite a laundry list of buzzwords. The move that impresses is to **tell the growing-restaurant story** and let it *drive* the answer:
+Don't recite a laundry list of buzzwords. The move that impresses is to **walk the evolution journey** and let it *drive* the answer:
 
 1. **Start small on purpose.** "One box, then split app and DB." Shows you don't over-engineer.
 2. **Add one lever per bottleneck, in order.** LB + stateless → cache → replicas → CDN → shard → microservices/Kafka → multi-region. Say *why* each step is forced by the previous one.
@@ -497,11 +495,11 @@ Don't recite a laundry list of buzzwords. The move that impresses is to **tell t
 - At massive scale: **GeoDNS, CDN, multi-region gateways, smart LBs, sharded DBs, caching, Kafka, observability, failover** — scale *every* layer.
 - **Measure → fix the saturated resource → re-measure**; don't over-engineer early.
 
-### Plain-English: the whole doc in one breath
+### The whole doc in one breath
 
-**You run a food stall that becomes a national chain.** At first you just buy a **bigger oven** (vertical scaling) — easy, but there's a biggest oven, and one oven means one thing to break (a SPOF). So you switch to **more ovens and more branches** (horizontal scaling), which only works if your cooks are **interchangeable** — they keep nothing personal behind their own counter (**stateless**; state goes to a shared cloakroom = Redis/JWT/S3).
+You start with everything on one machine. At first you just move to a **bigger box** (vertical scaling) — easy, but there's a biggest box, and one box means one thing to break (a SPOF). So you switch to **more boxes** (horizontal scaling), which only works if your servers are **interchangeable** — they keep no per-user state locally (**stateless**; state goes to a shared store = Redis/JWT/S3).
 
-The recipe-book/ledger (**the database**) is the usual jam. You relieve it in order: keep popular dishes ready up front (**cache**), **photocopy the book** so many cooks can read at once (**replicas** — mind the copy-delay, *replication lag*), and when even the one editor can't keep up, **split the ledger** A–M / N–Z (**sharding** — the hard one, for writes). Split the mega-kitchen into specialist stations (**microservices + Kafka**) and open **branches worldwide** (**multi-region**). Through all of it: **watch where the line backs up, fix that one spot, look again** — and remember every big-system piece was added *only when a real bottleneck forced it*, never on day one.
+**The database** is the usual bottleneck. You relieve it in order: keep hot data ready up front (**cache**), add read-only copies so many servers can read at once (**replicas** — mind the copy-delay, *replication lag*), and when even the one primary can't keep up on writes, **split the data by key** across shards (**sharding** — the hard one, for writes). Break the monolith into independent services (**microservices + Kafka**) and deploy across **multiple regions** (**multi-region**). Through all of it: **measure where the load saturates, fix that one resource, measure again** — and remember every big-system piece was added *only when a real bottleneck forced it*, never on day one.
 
 ### Related notes
 

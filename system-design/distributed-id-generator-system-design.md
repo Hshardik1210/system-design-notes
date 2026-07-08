@@ -2,7 +2,7 @@
 
 > **Core challenge:** generate **globally unique** IDs across many machines, **at high throughput**, ideally **roughly time-sortable**, **without a single bottleneck** and without coordination on every request. The canonical answer is **Snowflake**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -33,26 +33,24 @@
 
 We usually want: **64-bit** (compact), **unique across nodes**, **time-sortable** (good index locality + natural chronological order), **no per-ID coordination**.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
-**Analogy used throughout: a busy government office (or bakery) handing out ticket numbers.**
+We need to hand out numbers that are:
 
-You walk in, take a paper ticket with a number, and wait to be called. The number must be:
+- **Unique** — no two requests ever get the same number.
+- **Roughly in order** — a number issued later should generally be larger than one issued earlier, so IDs sort by creation time.
 
-- **Unique** — no two people holding "#57", or two get called at once (chaos / a fight).
-- **Roughly in order** — whoever came earlier should have a smaller number, so "next please" just means "next number up."
+With **one** counter this is trivial: it counts 1, 2, 3, 4… That single counter is a **DB auto-increment** column — one place hands out the next number every time.
 
-With **one** ticket machine at the door this is trivial: it counts 1, 2, 3, 4… That single machine is a **DB auto-increment** column — one counter, hands out the next number every time.
+Now the system gets *insanely* busy: **millions of IDs per second**, so you run **many machines generating IDs at the same time**. The whole design problem is:
 
-Now the office gets *insanely* busy: **millions of people per second**, so you install **many doors, each with its own ticket machine**, all running at the same time. The whole design problem is:
+> **How do many independent machines mint numbers at the same time, so that no two ever collide — without the machines constantly coordinating on "who's next"?**
 
-> **How do many independent ticket machines hand out numbers at the same time, so that no two people ever get the same number — without the machines constantly phoning each other to agree on "who's next"?**
+Talking to a shared authority on every ID is **coordination**, and it's the thing we're desperate to avoid — it's slow and it becomes the bottleneck. Every scheme below (Snowflake, UUID, ticket server) is a different way to let many machines avoid handing out the same number *without talking on every request*.
 
-That "phoning each other on every ticket" is **coordination**, and it's the thing we're desperate to avoid — it's slow and it becomes the bottleneck. Every scheme below (Snowflake, UUID, ticket server) is just a different clever answer to "how do many machines avoid handing out the same number *without talking on every request*."
+### Why not just use DB auto-increment?
 
-### Plain-English: why not just use DB auto-increment?
-
-That's the **single ticket machine at one door.** It genuinely works and gives perfect 1, 2, 3… order. Why it collapses at scale:
+That's the **single shared counter.** It genuinely works and gives perfect 1, 2, 3… order. Why it collapses at scale:
 
 - **One machine = one bottleneck.** Every ID request in the whole system must go to that one database row/counter. Millions/sec can't funnel through one place.
 - **It blocks sharding.** The whole point of splitting your data across many databases (shards) is that they're independent. But if all of them must ask **one** central counter for the next ID, they're not independent anymore — you've re-coupled them.
@@ -60,7 +58,7 @@ That's the **single ticket machine at one door.** It genuinely works and gives p
 
 > The fix is NOT "make the counter faster." It's "get rid of the need for one shared counter at all," so each machine can mint IDs **locally**.
 
-### Plain-English: why not just use a plain UUID (UUIDv4)?
+### Why not just use a plain UUID (UUIDv4)?
 
 A **UUIDv4** is 128 random bits — like every machine picking a **giant random number** (`f47ac10b-58cc-4372-a567-0e02b2c3d479`) instead of asking anyone. Two machines picking the same one is so astronomically unlikely we treat it as impossible. Zero coordination — great! So what's wrong?
 
@@ -106,12 +104,12 @@ So UUIDv4 solves "no coordination" but *reintroduces* pain at the database. What
 | **Snowflake** ✅ | ✅ | ✅ (time-ordered) | None per-ID (needs a machine id) |
 | Ticket server / range allocation | ✅ | ✅ | Rare (per block) |
 
-### Plain-English: the four approaches as one code file
+### The four approaches as one code file
 
-Back to the ticket-machine analogy — here's every approach as a tiny `nextId()` method, so you can see exactly *where* each one avoids talking to other machines. All four "work"; they just trade off size, sortability, and how often they coordinate.
+Here's every approach as a tiny `nextId()` method, so you can see exactly *where* each one avoids talking to other machines. All four "work"; they just trade off size, sortability, and how often they coordinate.
 
 ```java
-// 1) DB AUTO-INCREMENT — one shared ticket machine.
+// 1) DB AUTO-INCREMENT — one shared central counter.
 //    Correct + perfectly ordered, but EVERY id goes through one row → bottleneck.
 long nextId() {
     return db.execute("INSERT INTO ids VALUES () RETURNING id");  // central round-trip per id
@@ -177,9 +175,9 @@ nextId():
 - **k-sorted**: IDs increase with time → great for DB primary keys, time-range scans, and cursors.
 - **Bit layout is tunable** to your scale (e.g., more machine bits if you have >1024 nodes, fewer sequence bits).
 
-### Plain-English: a Snowflake ID is a ticket number stamped in 3 parts
+### A Snowflake ID is one 64-bit number in 3 parts
 
-Back to the office: to let **many** ticket machines hand out numbers with **zero phoning each other**, we give each machine a smarter numbering rule. Instead of a plain counter, each ticket number is stamped with **three pieces glued together into one 64-bit integer**:
+To let **many** machines mint numbers with **zero coordination**, we give each machine a smarter numbering rule. Instead of a plain counter, each ID is **three pieces glued together into one 64-bit integer**:
 
 ```
 one 64-bit number, read left → right:
@@ -193,11 +191,9 @@ one 64-bit number, read left → right:
 2. **Machine id** = *who* (a slot number unique to this one machine). Two machines with the same clock still differ here → no collision across machines.
 3. **Sequence** = *which* (a tiny counter, 0..4095, for multiple IDs inside the *same* millisecond on the *same* machine).
 
-Why this guarantees uniqueness with **no coordination**: two IDs can only be equal if all three parts match. Different millisecond → timestamps differ. Same millisecond, different machine → machine ids differ. Same millisecond, same machine → the local sequence counter differs. There's **no scenario left** where two IDs collide, and nobody had to phone anyone.
+Why this guarantees uniqueness with **no coordination**: two IDs can only be equal if all three parts match. Different millisecond → timestamps differ. Same millisecond, different machine → machine ids differ. Same millisecond, same machine → the local sequence counter differs. There's **no scenario left** where two IDs collide, and no machine had to coordinate with any other.
 
-> Analogy: every ticket reads `[today's timestamp]-[counter #3]-[0007th ticket this ms]`. Counter 3 and counter 8 never clash (different middle part), and even counter 3 can't clash with itself (different last part). No shared machine needed.
-
-### Plain-English: Snowflake in annotated Java
+### Snowflake in annotated Java
 
 ```java
 class SnowflakeIdGenerator {
@@ -304,11 +300,11 @@ Each generating node needs a **unique machine id** (else collisions). Options:
 - The id must be **unique among *running* instances** at any time — ZooKeeper ephemeral nodes handle churn (a dead node's id can be reclaimed).
 - With only 10 bits (1024), reuse of freed ids is important for large/elastic fleets.
 
-### Plain-English: who hands out the "machine slot" numbers?
+### Who hands out the "machine slot" numbers?
 
 Snowflake's whole no-coordination trick rests on one promise: **no two live machines share a machine id.** If two machines both think they're "machine #5," they'll happily mint the *same* IDs within the same millisecond → collision. So there must be *some* one-time coordination to hand out these slots — just once at startup, never per ID.
 
-Analogy: it's like assigning each ticket booth a **booth number (0–1023)** when it opens for the day. Booths never argue over numbers again — the number is baked into every ticket they print.
+Each machine is assigned a slot number (0–1023) when it starts up. After that it never coordinates again — the slot number is baked into every ID it generates.
 
 #### Q: Can't I just hardcode the machine id in each server's config?
 
@@ -358,11 +354,11 @@ serves them locally, and refills when exhausted.
 - **Trade-off:** a crashed node "wastes" its unused block (fine — keyspace is huge); ids aren't strictly time-ordered globally.
 - HA: replicate the counter store; the block claim must be atomic (`INCRBY`).
 
-### Plain-English: claim a roll of tickets, don't ask per ticket
+### Claim a block of ids, don't ask per id
 
-Snowflake needs no central counter at all. A **ticket server** *does* keep one central counter — but instead of asking it for every single number, each machine grabs a whole **roll of tickets** at once and hands them out locally.
+Snowflake needs no central counter at all. A **ticket server** *does* keep one central counter — but instead of asking it for every single number, each machine claims a whole **block of ids** at once and hands them out locally.
 
-Analogy: a cashier doesn't radio head office for each receipt number. They tear off a **book of pre-numbered receipts (say #1000–#1999)**, use them one by one, and only radio back when the book runs out to grab the next book.
+A machine reserves a block (say #1000–#1999) in one atomic operation, serves those ids one by one from memory, and only goes back to the central counter when the block runs out to reserve the next block.
 
 ```java
 class RangeAllocator {
@@ -412,7 +408,7 @@ UUIDv7 / ULID = [ 48-bit millisecond timestamp | random bits ]
 - **Cons:** 128-bit (bigger than Snowflake's 64-bit); slightly less compact as a key.
 - Use when you want zero coordination and don't need 64-bit compactness.
 
-### Plain-English: UUIDv4 fixed to be sortable
+### UUIDv4 fixed to be sortable
 
 Remember UUIDv4's flaw (§1): it's *pure random*, so it's unsortable and murders your B-tree. UUIDv7/ULID keep the "zero coordination" superpower of a UUID but **move a timestamp into the front bits** — the same trick Snowflake uses to become time-sortable.
 
@@ -462,11 +458,11 @@ Rule of thumb: **want dead-simple + no machine-id ops → UUIDv7/ULID.** **Want 
 | **Epoch exhaustion** | 41 bits ≈ 69 years from your custom epoch — pick a **recent epoch** so you get the full range |
 | **Leap seconds / NTP slew** | Prefer monotonic clock for `lastTs` comparison |
 
-### Plain-English: Snowflake's Achilles' heel is the clock
+### Snowflake's weak point is the clock
 
-Snowflake's uniqueness leans on **time always moving forward.** The scary part: computer clocks *don't* always move forward. **NTP** (the service that keeps clocks accurate) occasionally **nudges the clock backwards** to correct drift. If our timestamp suddenly jumps into the past, we can **re-generate an ID we already handed out** → collision.
+Snowflake's uniqueness leans on **time always moving forward.** The problem: computer clocks *don't* always move forward. **NTP** (the service that keeps clocks accurate) occasionally **nudges the clock backwards** to correct drift. If our timestamp suddenly jumps into the past, we can **re-generate an ID we already handed out** → collision.
 
-Analogy: the ticket machine stamps the *time* on each ticket. If someone secretly winds the wall clock **back** 3 seconds, the machine will start re-stamping times (and thus ticket numbers) it already used a moment ago. Two people end up with "#57." Disaster.
+Concretely: if the clock is wound **back** a few milliseconds, the generator will re-produce timestamps it already used a moment ago, and with the sequence reset to 0 it can emit the exact same `(timestamp, machineId, sequence)` combination twice — a duplicate ID.
 
 #### Q: What exactly happens if the clock goes backwards?
 

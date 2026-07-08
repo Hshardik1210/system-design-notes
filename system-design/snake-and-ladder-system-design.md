@@ -2,7 +2,7 @@
 
 > A classic **object-oriented design (LLD)** problem. Model a board game: an N×N board with **snakes** and **ladders**, multiple **players** taking turns rolling a **dice**, moving until someone reaches the last cell. Interviewers grade your **class model, extensibility, and design patterns** — not scale.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (real-world analogies, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand the design.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand the design.
 
 ---
 
@@ -34,9 +34,9 @@
 
 > **Clarify:** exact landing to win, or overshoot allowed? Extra turn on 6? Number of dice? Single machine (LLD) or networked multiplayer (adds a server + state sync)?
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
-Think of the physical board game you played as a kid. There's a **printed board** with numbered squares (1 to 100), some squares have a **ladder** drawn on them (land there → climb up, shortcut forward) and some have a **snake** (land there → slide down, penalty backward). Everyone puts a **token** on square 0, and you take turns **rolling a die** and moving your token forward. First token to reach square 100 wins.
+The physical board game. There's a **printed board** with numbered squares (1 to 100), some squares have a **ladder** drawn on them (land there → climb up, shortcut forward) and some have a **snake** (land there → slide down, penalty backward). Everyone puts a **token** on square 0, and you take turns **rolling a die** and moving your token forward. First token to reach square 100 wins.
 
 Our job is **not** to make a fast, scalable web service. Our job is to write the *rules of the game* as clean, well-organized classes — so cleanly that a new rule ("give an extra turn when you roll a 6") can be bolted on without rewriting everything. That's what "low-level design" (LLD) means here: **good class modeling**, not big traffic.
 
@@ -67,7 +67,7 @@ Game ── has ─► Players (queue for turns), a Dice
 | `Player` | id, name, current position |
 | `Dice` | rolls 1..6 (× number of dice) |
 
-### Plain-English: turning the physical game into objects
+### Turning the physical game into objects
 
 The trick in any OOD problem is: **look at the real thing, and give each "noun" its own class.** Walk through a real Snake & Ladder box and the objects fall out on their own:
 
@@ -160,9 +160,9 @@ class Game {
 
 > **Key modeling insight:** represent **snakes and ladders as one `Jump` type** (start→end). A snake is a jump with `end < start`; a ladder has `end > start`. One abstraction, no duplicate logic.
 
-### Plain-English: reading the classes one at a time
+### Reading the classes one at a time
 
-The summary above shows all the classes crammed together. Let's walk each one slowly, like reading the instruction manual piece by piece. **Analogy: assembling a board-game box** — first the die, then the ladders/snakes stickers, then the squares, then the tokens, then the rulebook that ties it together.
+The summary above shows all the classes crammed together. Let's walk each one slowly, building up from the small pieces to the whole: first the dice, then the snakes/ladders (`Jump`), then the cells, then the players, then the `Game` that ties it together.
 
 #### `Dice` — the random number maker
 
@@ -305,9 +305,9 @@ play():
 - **Turn order** via a queue (round-robin).
 - **Win condition** and **overshoot** behavior are rule hooks (Strategy).
 
-### Plain-English: one turn, step by step
+### One turn, step by step
 
-**Analogy: a referee running the game.** Each round the referee (the loop) does the same little ritual, over and over, until someone wins:
+Each round the game loop runs the same steps, over and over, until someone wins:
 
 ```
 1. "Whose turn?"     → take the next player from the front of the line
@@ -318,7 +318,7 @@ play():
 6. "Back of the line"→ otherwise, wait for your next turn
 ```
 
-The loop is deliberately **boring and repetitive** — that's good. A game is just this ritual repeated. Here it is fully annotated in Java, mirroring the pseudo-code above:
+The loop is deliberately **boring and repetitive** — that's good. A game is just these steps repeated. Here it is fully annotated in Java, mirroring the pseudo-code above:
 
 ```java
 void play() {
@@ -376,13 +376,13 @@ Because a jump only triggers on the square you **land** on, not the squares you 
 
 > **Interview lead:** Strategy (rules), Factory/Builder (board/players setup), Singleton (game), State (lifecycle), Observer (move notifications). That set covers the follow-ups.
 
-### Plain-English: patterns are just "named good ideas"
+### Patterns are just named good ideas
 
 A **design pattern** is a reusable solution to a common problem — a *name* for a trick experienced developers keep reinventing. You don't need all nine; interviewers want to hear you say the right 3–4 for *this* problem and show one in code. Below are the ones that genuinely help here, in plain terms.
 
 #### Strategy — swap a rule without touching the loop
 
-**Analogy: house rules.** Your family plays "you must land exactly on 100 to win"; your friend's family plays "reach or pass 100." Same game, one rule differs. Strategy = wrap that rule in its own object so you can plug in either version.
+Two variants of the same game: one requires landing **exactly** on 100 to win, the other lets you **reach or pass** 100. Same game, one rule differs. Strategy = wrap that rule in its own object so you can plug in either version.
 
 ```java
 // The "hook": an interface describing ONE swappable rule.
@@ -420,7 +420,7 @@ Swapping `new ExactWinStrategy()` for `new OvershootWinStrategy()` changes the g
 
 #### Builder / Factory — assemble a complicated board readably
 
-**Analogy: ordering a custom pizza.** Rather than a constructor with ten arguments (easy to mess up the order), a **Builder** lets you spell out each choice by name, then `build()`.
+Rather than a constructor with ten arguments (easy to mess up the order), a **Builder** lets you spell out each choice by name, then `build()`.
 
 ```java
 class BoardBuilder {
@@ -433,7 +433,7 @@ class BoardBuilder {
     Board build()                          { return new Board(size, jumps); }
 }
 
-// Reads like plain English:
+// Reads naturally:
 Board board = new BoardBuilder()
         .size(100)
         .ladder(5, 25)
@@ -445,7 +445,7 @@ A **Factory** is the simpler cousin: a method like `createStandardBoard()` that 
 
 #### Observer — tell the outside world when something happens
 
-**Analogy: a sports commentator.** The game plays on; separately, commentators (UI, logger, scoreboard) *watch* and react to each move — without the game caring who's listening.
+The game plays on; separately, observers (UI, logger, scoreboard) *watch* and react to each move — without the game caring who's listening.
 
 ```java
 interface MoveObserver {
@@ -488,9 +488,9 @@ For a throwaway script, yes. But the interviewer is testing whether you *recogni
 - **New win rules** → new `WinStrategy`.
 - **Networked multiplayer** → wrap `Game` behind a server; sync state (turn, positions) to clients over WebSocket; server is authoritative (prevents cheating). Persist game state (below).
 
-### Plain-English: "extensible" = new features without surgery
+### "Extensible" = new features without surgery
 
-The real test of a good design: *can I add a feature by writing new code, instead of rewriting old code?* The gold standard is the **Open/Closed Principle** — code should be **open** to new behavior but **closed** to being edited. **Analogy: adding a new board-game expansion pack** — you snap in new pieces; you don't reprint the base game.
+The real test of a good design: *can I add a feature by writing new code, instead of rewriting old code?* The gold standard is the **Open/Closed Principle** — code should be **open** to new behavior but **closed** to being edited.
 
 #### Example — adding a "teleport" tile without touching the loop
 
@@ -537,9 +537,9 @@ CREATE TABLE move_log ( move_id BIGINT PRIMARY KEY, game_id BIGINT, player_id BI
 
 > **Tables to consider:** game, game_player, board_jump, move_log (for replay/audit). For online multiplayer, add users, sessions, and a Redis room/turn state.
 
-### Plain-English: why save the game to a database at all?
+### Why save the game to a database at all?
 
-For a single-player program on one machine, you don't — everything lives in memory (RAM) and vanishes when the program ends, which is fine. You only need a **database** when the game must **survive** beyond the program run: online multiplayer where a player disconnects and rejoins, or "resume your saved game later." **Analogy: taking a photo of the board** so you can put the pieces back exactly if the game gets bumped.
+For a single-player program on one machine, you don't — everything lives in memory (RAM) and vanishes when the program ends, which is fine. You only need a **database** when the game must **survive** beyond the program run: online multiplayer where a player disconnects and rejoins, or "resume your saved game later."
 
 #### Q: How do the classes map to these tables?
 

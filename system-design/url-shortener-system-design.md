@@ -2,7 +2,7 @@
 
 > **Core challenge:** turn a long URL into a short, unique code, then **redirect at very low latency** under a **read-heavy** load (reads ≫ writes, ~100:1). The hard parts are **generating unique short codes without a bottleneck**, **serving redirects from cache/edge**, and **surviving hot links + abuse**. Examples: bit.ly, TinyURL, t.co (Twitter), lnkd.in (LinkedIn).
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (bit.ly/TinyURL analogies, annotated example code, and the exact confusions that trip up beginners). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated example code, and the exact confusions that trip up beginners). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -53,7 +53,7 @@ redirect: sho.rt/aB3xY7 ──► [ code → long URL lookup ] ──► HTTP 30
 
 > The whole system is **two endpoints** (`create`, `redirect`) over a **key-value map**. The interview is about doing that at **billions of rows, tens of thousands of reads/sec, low latency, and no duplicate codes** — plus abuse handling.
 
-### Plain-English: what problem are we even solving?
+### What problem are we even solving?
 
 Think about **bit.ly** or **TinyURL**. You have an ugly, gigantic link:
 
@@ -69,7 +69,7 @@ https://bit.ly/aB3xY7
 
 Now `aB3xY7` is the **short code**. When anyone opens `bit.ly/aB3xY7`, bit.ly looks up "what long URL does `aB3xY7` point to?" and **bounces the browser** to the real Airbnb page. That "bounce" is an HTTP **redirect** (§11).
 
-So the entire product is really just a **two-column notebook**:
+So the entire product is really just a **two-column table**:
 
 ```
 short code   →   long URL
@@ -82,7 +82,7 @@ tk9Qm2       →   https://docs.google.com/document/d/...
 
 That imbalance is the single most important fact about this system.
 
-### Plain-English: why is this "hard" if it's just a notebook?
+### Why is this "hard" if it's just a lookup table?
 
 A `HashMap<String, String>` on your laptop does exactly this. It gets hard only because of **scale + a few rules**:
 
@@ -92,7 +92,7 @@ A `HashMap<String, String>` on your laptop does exactly this. It gets hard only 
 | What makes it read-heavy? | People **create** a link once but **click** it thousands of times. Reads ≫ writes (~100:1), so we optimize the *read* (redirect) path above all. |
 | What's the actual hard part? | (1) Generating a **short, unique** code with no two links colliding, and (2) serving the redirect **fast** (from cache/CDN) even when a link goes viral. |
 
-> Analogy: it's like a **coat check** at a theater. You hand over your coat (long URL) and get a small numbered ticket (short code). Later you show the ticket and get your coat back (redirect). Making a ticket is quick and rare; thousands of people redeeming tickets at once is the busy part.
+> In short: creating a mapping is quick and rare; serving huge volumes of lookups for the same codes is the busy part, and it's what the design optimizes for.
 
 ---
 
@@ -268,7 +268,7 @@ Sequential counter → `base62(1), base62(2), …` are adjacent codes → an att
 - Using a **KGS with random keys**, or
 - **Salting/permuting** the counter (e.g., multiply by a large coprime mod keyspace, or Feistel/`XOR` scramble) so consecutive IDs map to scattered codes.
 
-### Plain-English: what "base62" actually means
+### What "base62" actually means
 
 You already know **base10** (normal numbers): 10 digits `0-9`. When you run out (9 → 10) you add a new place. **Base62** is the same idea with **62 symbols** instead of 10:
 
@@ -324,9 +324,9 @@ built backwards: "12" → reverse → "21"
 so id 125  →  code "21"
 ```
 
-> Analogy: it's like an **odometer with 62 digits on each wheel** instead of 10. The wheels just roll over less often, so you reach big numbers with fewer wheels (shorter codes).
+> Like decimal place-value, each position "rolls over" only after 62 symbols instead of 10, so you reach large numbers with fewer positions — i.e. shorter codes.
 
-### Plain-English: base62 Q&A
+### base62 Q&A
 
 #### Q: Why 62? Why not use all 64 base64 symbols to be even shorter?
 
@@ -414,20 +414,18 @@ On create: pop a key from the in-memory batch — no collision check needed
 
 > **Interview one-liner:** "I'd use range allocation off a central counter — nodes grab blocks of 1,000 IDs, so coordination is rare and codes stay short. If enumeration is a concern I'd use a KGS with random pre-generated keys, or scramble the counter before base62."
 
-### Plain-English: why can't one machine just do `count++`?
+### Why can't one machine just do `count++`?
 
 A single counter (`AUTO_INCREMENT` or one variable) is the obvious answer, and it's *correct* — the problem is it doesn't **scale** and it's a **single point of failure**:
 
 - Every create anywhere in the world must talk to that **one** counter → it becomes a bottleneck and a queue.
 - If that one machine dies, **nobody can create links** until it's back.
 
-But we run **many** app servers for scale. If each one keeps its own counter, they'd all hand out `1, 2, 3…` and **collide**. So we need a way for many servers to mint unique numbers **without constantly coordinating**.
+But we run **many** app servers for scale. If each one keeps its own counter, they'd all hand out `1, 2, 3…` and **collide**. So we need a way for many servers to mint unique numbers **without constantly coordinating**. The fix is to let each server claim a large block of numbers at once and hand them out locally, only coordinating when a block runs out.
 
-> Analogy: a **deli counter with "take a number" tickets**. If there were one shared ticket printer and everyone had to walk to it for a single ticket, there'd be a huge line. Instead, each clerk tears off a **strip of 100 tickets** at once and hands them out from their own strip. They only walk back to the printer when their strip runs out.
+### Range allocation with code
 
-### Plain-English: range allocation with code
-
-That "grab a strip of 100" is exactly **range allocation** — the most common answer.
+Claiming a block up front is exactly **range allocation** — the most common answer.
 
 ```java
 @Component
@@ -468,7 +466,7 @@ Server B claims [2000, 3000)   →  hands out 2000,2001,... locally, no network
 - **No collisions** — Redis's atomic `INCRBY` guarantees no two servers get the same block.
 - **Crash is cheap** — if Server A dies with unused ids in `[1000,2000)`, those numbers are just **skipped forever**. The keyspace is trillions, so we don't care about gaps.
 
-### Plain-English: ID generation Q&A
+### ID generation Q&A
 
 #### Q: Range allocator vs Snowflake vs KGS — when do I reach for each?
 
@@ -553,7 +551,7 @@ CREATE TABLE click_stats_daily (
 
 Custom aliases live in the **same `url` table** — `code` is just user-supplied instead of generated. Uniqueness is enforced by the `PRIMARY KEY`; reject with `409` if taken. Reserve system words (`api`, `admin`, `login`) via a blocklist.
 
-### Plain-English: the data model is basically one big dictionary
+### The data model is basically one big dictionary
 
 Forget "database" for a second. The core storage is a **dictionary / hash map**:
 
@@ -570,7 +568,7 @@ Forget "database" for a second. The core storage is a **dictionary / hash map**:
 
 Every operation is a **single-key lookup** — "give me the value for key `aB3xY7`." There are **no** joins, no "find all URLs where…", no range scans on the hot path. That's why a **key-value store** (DynamoDB, Cassandra) fits so perfectly, and why it scales: single-key lookups shard cleanly across machines.
 
-> Analogy: it's a **phone book** where you always know the exact name you're looking up. You never "scan the whole book" — you jump straight to the entry. That's the fastest thing a database can do.
+> Because every request already knows the exact key, the store never scans — it jumps straight to the entry, which is the fastest access pattern a database has.
 
 #### Reading the schema line by line
 
@@ -591,7 +589,7 @@ Two beginner-facing ideas hide in there:
 - **`PRIMARY KEY` on `code`** is what makes collisions *impossible to store*. If two creates ever tried the same code, the second `INSERT` fails — the database itself is our safety net.
 - **`is_active` = soft delete.** Instead of truly deleting a row (which loses history and can break analytics), we just flip a flag. The redirect checks it and returns `410 Gone`.
 
-### Plain-English: data model Q&A
+### Data model Q&A
 
 #### Q: Why store `long_url_hash` — isn't the long URL already there?
 
@@ -716,7 +714,7 @@ INSERT → PK violation → regenerate (new random / rehash with salt) → retry
 ```
 > Range allocation / KGS **never collide**, so no retry loop is needed on the write path.
 
-### Plain-English: the redirect handler, line by line
+### The redirect handler, line by line
 
 The redirect is the busiest, most important piece of code in the whole system, yet it does **almost nothing** — that's the point. Here it is as a small Spring controller:
 
@@ -765,16 +763,15 @@ The important beginner takeaways:
 - **Analytics is "fire-and-forget"** (step 6) — we hand the click event to Kafka and immediately move on. We never block the user's redirect waiting for logging.
 - **The response is just a header** (step 7) — `302` + `Location:`. The browser then goes to the long URL itself. We do *not* fetch or proxy the target page.
 
-> Analogy: the redirect is a **receptionist who only points**. You say a ticket number, they glance at a sticky note (cache), point you down the correct hallway (Location header), and jot a tally mark *after* you've already started walking (async analytics). They never walk you there themselves.
+> The redirect only *points*: it reads the code, looks it up in the cache, returns a `Location` header, and records the click asynchronously after responding. It never fetches or proxies the destination page itself.
 
-### Plain-English: create vs redirect — who does the hard work?
+### Create vs redirect — who does the hard work?
 
 | | **Create** (`POST /shorten`) | **Redirect** (`GET /{code}`) |
 | --- | --- | --- |
 | How often | Rare (~40/sec) | Constant (~thousands/sec) |
 | Hard part | Get a unique code, persist durably | Be **fast** — answer from cache |
 | Touches DB? | Yes, one write | Ideally **no** (cache/CDN hit) |
-| Analogy | Printing a new coat-check ticket | Redeeming an existing ticket |
 
 #### Q: Why warm the cache on create (step 4 of the write flow)?
 
@@ -826,13 +823,11 @@ No false negatives → safe to short-circuit non-existent codes. Also useful to 
 
 A viral link expiring from cache → thousands of simultaneous misses hammer one DB shard. Mitigate with **request coalescing** (single-flight: one loader fetches, others wait) and/or slightly randomized TTLs.
 
-### Plain-English: why caching is the entire game here
+### Why caching is the entire game here
 
 Recall the system is **read-heavy** (~100 reads per write). A single viral link — say a bit.ly link in a celebrity tweet — might be clicked **millions of times**. If every click hit the database, the DB would melt. But every one of those clicks wants the **exact same answer** (`aB3xY7 → the same long URL`), and that answer **never changes**.
 
-That's the perfect situation for a **cache**: compute the answer once, keep it in fast memory (Redis), and serve millions of clicks from there without ever touching the database.
-
-> Analogy: a **coat-check clerk who memorizes the regulars**. The first time you show ticket #42 they walk to the back to find your coat (DB read). After that, they *remember* where #42 lives and hand it over instantly (cache hit) — no trip to the back.
+That's the perfect situation for a **cache**: compute the answer once, keep it in fast memory (Redis), and serve millions of clicks from there without ever touching the database. The first lookup for a code reads from the DB and stores the result; every subsequent lookup is served from memory.
 
 #### Cache-aside in code (the pattern used on every miss)
 
@@ -853,7 +848,7 @@ String getLongUrl(String code) {
 
 "Cache-aside" = the app checks the cache, and only on a miss loads from the DB and *puts it aside* in the cache for next time. Because our data is **immutable**, we can use a **long TTL** (hours/days) with no fear of serving something stale.
 
-### Plain-English: caching Q&A
+### Caching Q&A
 
 #### Q: What's a "negative cache" / tombstone, and why do I need one?
 
@@ -915,7 +910,7 @@ A `301` redirect is even cacheable by the **user's own browser** — after the f
 
 > **Rule of thumb:** use **302** (or `307`) if you need **click analytics** or the ability to **change/expire** a link — most shorteners do. Use **301** if you want minimum load and don't need per-visit tracking.
 
-### Plain-English: what a "redirect" even is
+### What a "redirect" even is
 
 When your browser asks for `sho.rt/aB3xY7`, our server doesn't send back a web page. It sends back a tiny reply that basically says: *"That's not here — go to this other address instead,"* along with a status code (**301** or **302**) and a `Location:` header holding the long URL. The browser then automatically goes to that long URL. The user just sees the destination page load; the hop is invisible.
 
@@ -927,11 +922,10 @@ Browser  ──GET https://airbnb.com/rooms/123──►  airbnb.com   (goes on 
 
 The **only** difference between 301 and 302 is one word: **"permanently"** vs **"temporarily."** That one word changes whether the browser bothers to ask us again next time.
 
-> Analogy: a **"we've moved!" sign on a shop door**.
-> - **301 (permanent):** "We've moved to Main St — **forever**." You memorize it and next time drive **straight to Main St**, never passing the old shop. (Browser caches it → future clicks skip our server.)
-> - **302 (temporary):** "We're **temporarily** operating from Main St today." You still come to the **old door each time** to check, because tomorrow it might change. (Browser asks us every time → we see every click.)
+> - **301 (permanent):** the browser treats the mapping as fixed, caches it, and on future clicks goes **straight to the long URL** without asking our server again → future clicks skip us (and we lose their analytics).
+> - **302 (temporary):** the browser assumes the mapping may change, so it **asks our server on every click** → we see every click and can expire or repoint the link.
 
-### Plain-English: 301 vs 302 Q&A
+### 301 vs 302 Q&A
 
 #### Q: If 301 is faster and lighter, why doesn't everyone use it?
 

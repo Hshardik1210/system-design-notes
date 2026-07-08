@@ -2,7 +2,7 @@
 
 > A classic **OOD/LLD** problem, and the textbook example of the **State pattern**: a machine that takes money, lets you select a product, dispenses it, and returns change. Interviewers grade your **state machine and class model**.
 
-> **How to read this doc:** each section has the dense interview summary first, then a **Plain-English** deep dive (a real snack/drink machine analogy, annotated Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -30,9 +30,9 @@
 
 > **Clarify:** exact change only, or make change? Card payments? Multiple items per transaction?
 
-### Plain-English: what are we actually building?
+### What are we actually building?
 
-Picture the snack machine in an office hallway. You walk up, feed in a ₹10 coin and a ₹20 note, punch **A4** for a Coke (₹25), and it drops the can plus your ₹5 change. Boring to use — surprisingly fiddly to *model correctly in code*, which is exactly why interviewers love it.
+A snack machine: you feed in a ₹10 coin and a ₹20 note, punch **A4** for a Coke (₹25), and it drops the can plus your ₹5 change. Boring to use — surprisingly fiddly to *model correctly in code*, which is exactly why interviewers love it.
 
 Break the machine into the **nouns** (things it has) and the **verbs** (things you do to it):
 
@@ -74,16 +74,16 @@ IDLE ──insertMoney──► HAS_MONEY ──selectProduct──► DISPENSIN
 
 > Each state **only allows valid actions** — e.g. you can't select a product in `IDLE`. That guard logic living in state objects is the whole point of the pattern.
 
-### Plain-English: the machine has "moods"
+### The states and how they behave
 
-Think of the machine as having a few **moods**, and its buttons behave differently depending on the mood it's in right now:
+The machine is always in exactly one of a few **states**, and its buttons behave differently depending on the state it's in right now:
 
-- **IDLE** — "I'm waiting. Give me money." (Pressing a product button here just flashes *"insert money first."*)
-- **HAS_MONEY** — "You've paid. Add more, pick something, or cancel for a refund."
-- **DISPENSING** — "Working on it — dropping your snack and counting your change." (A brief, busy moment; it ignores buttons.)
-- **OUT_OF_STOCK** — "That slot's empty, pick something else."
+- **IDLE** — waiting for money. (Pressing a product button here just flashes *"insert money first."*)
+- **HAS_MONEY** — money is in. Add more, pick something, or cancel for a refund.
+- **DISPENSING** — busy dropping your snack and counting your change. A brief, busy moment; it ignores buttons.
+- **OUT_OF_STOCK** — that slot's empty, pick something else.
 
-The only way to move between moods is a specific action, like a board game where each square tells you which moves are legal:
+The only way to move between states is a specific action; each state defines which actions are legal:
 
 ```
 [IDLE]  --insert ₹30-->  [HAS_MONEY]  --press A4 (Coke ₹25)-->  [DISPENSING]
@@ -95,19 +95,19 @@ The only way to move between moods is a specific action, like a board game where
 
 #### Q: What's a "finite state machine (FSM)"?
 
-Just a fancy name for "a thing that is always in exactly **one** of a fixed list of moods (states), and only certain moves take it from one mood to another." *Finite* = the list of moods is small and known ahead of time (here: 4). Traffic lights (Red → Green → Yellow → Red) and microwaves are FSMs too. The vending machine is the canonical coding example.
+Just a fancy name for "a thing that is always in exactly **one** of a fixed list of states, and only certain moves take it from one state to another." *Finite* = the list of states is small and known ahead of time (here: 4). Traffic lights (Red → Green → Yellow → Red) and microwaves are FSMs too. The vending machine is the canonical coding example.
 
 #### Q: What is the "State pattern," in one sentence?
 
-**Make each mood its own class**, and let the machine hand off ("delegate") every action to whichever mood-object it's currently holding. Instead of one giant method full of `if (state == IDLE) ... else if (state == HAS_MONEY) ...`, you have an `IdleState` object and a `HasMoneyState` object, and each one *only* knows how to behave in that situation. The machine just says "hey current-state, handle this button press" (see the code in §3).
+**Make each state its own class**, and let the machine hand off ("delegate") every action to whichever state object it's currently holding. Instead of one giant method full of `if (state == IDLE) ... else if (state == HAS_MONEY) ...`, you have an `IdleState` object and a `HasMoneyState` object, and each one *only* knows how to behave in that situation. The machine just forwards each button press to its current state object (see the code in §3).
 
 #### Q: What happens on an "invalid transition," like selecting a product in IDLE?
 
-The current state simply **refuses** it. `IdleState.selectProduct(...)` throws *"insert money first"* and the mood does **not** change — you stay IDLE. That's the beauty: each state is a bouncer that only lets legal moves through, so illegal moves can't quietly corrupt the machine. No move is "handled everywhere"; each move is only truly implemented in the states where it makes sense.
+The current state simply **refuses** it. `IdleState.selectProduct(...)` throws *"insert money first"* and the state does **not** change — you stay IDLE. That's the beauty: each state is a bouncer that only lets legal moves through, so illegal moves can't quietly corrupt the machine. No move is "handled everywhere"; each move is only truly implemented in the states where it makes sense.
 
 #### Q: Why is DISPENSING its own state instead of just doing it inside "select"?
 
-Because dispensing is a real, momentary situation where the machine should **ignore new input** (you shouldn't be able to insert more money or select again while a can is dropping). Modeling it as a distinct mood makes "I'm busy, buttons do nothing right now" explicit and safe, instead of hoping no one presses anything during the split second of work.
+Because dispensing is a real, momentary situation where the machine should **ignore new input** (you shouldn't be able to insert more money or select again while a can is dropping). Modeling it as a distinct state makes "I'm busy, buttons do nothing right now" explicit and safe, instead of hoping no one presses anything during the split second of work.
 
 ---
 
@@ -173,7 +173,7 @@ class Product { String code; String name; int price; int stock; }
 interface ChangeStrategy { List<Coin> makeChange(int amount, Inventory cash); }  // greedy
 ```
 
-### Plain-English: the class model, piece by piece
+### The class model, piece by piece
 
 The summary above is the compact interview version. Here's the same design spelled out with heavy annotations, building it up from the small pieces (money, product, inventory) to the big machine and its states.
 
@@ -229,10 +229,10 @@ class Inventory {
 
 #### Piece 4 — The `State` interface and the four states
 
-This is the pattern itself. Every state implements the **same four actions**, but each state only does something meaningful for the actions that are *legal* in that mood; the rest throw.
+This is the pattern itself. Every state implements the **same four actions**, but each state only does something meaningful for the actions that are *legal* in that state; the rest throw.
 
 ```java
-// Every mood must be able to (attempt to) handle every action.
+// Every state must be able to (attempt to) handle every action.
 // It's up to each state whether the action is legal or an error.
 interface State {
     void insertMoney(VendingMachine m, int amount);
@@ -243,13 +243,13 @@ interface State {
 ```
 
 ```java
-// MOOD 1: waiting for money. Only inserting money is legal.
+// STATE 1: waiting for money. Only inserting money is legal.
 class IdleState implements State {
     public void insertMoney(VendingMachine m, int amt) {
         m.addBalance(amt);          // remember how much has been put in
-        m.setState(m.hasMoney);     // mood changes: IDLE → HAS_MONEY
+        m.setState(m.hasMoney);     // state changes: IDLE → HAS_MONEY
     }
-    // everything else is illegal here — refuse it, mood stays IDLE
+    // everything else is illegal here — refuse it, state stays IDLE
     public void selectProduct(VendingMachine m, String c){ throw new IllegalStateException("Insert money first"); }
     public void dispense(VendingMachine m)               { throw new IllegalStateException("No selection"); }
     public void cancel(VendingMachine m)                 { /* nothing to refund */ }
@@ -257,7 +257,7 @@ class IdleState implements State {
 ```
 
 ```java
-// MOOD 2: money is in. You can add more, pick a product, or cancel.
+// STATE 2: money is in. You can add more, pick a product, or cancel.
 class HasMoneyState implements State {
     public void insertMoney(VendingMachine m, int amt) {
         m.addBalance(amt);          // topping up — stay in HAS_MONEY
@@ -269,7 +269,7 @@ class HasMoneyState implements State {
         if (m.getBalance() < p.price)  throw new InsufficientFunds(p.price - m.getBalance()); // pay more
 
         m.setSelected(p);
-        m.setState(m.dispensing);   // mood changes: HAS_MONEY → DISPENSING
+        m.setState(m.dispensing);   // state changes: HAS_MONEY → DISPENSING
         m.dispense();               // kick off the actual drop
     }
 
@@ -277,13 +277,13 @@ class HasMoneyState implements State {
 
     public void cancel(VendingMachine m) {
         m.refund();                 // hand back the exact inserted balance
-        m.setState(m.idle);         // mood changes: HAS_MONEY → IDLE
+        m.setState(m.idle);         // state changes: HAS_MONEY → IDLE
     }
 }
 ```
 
 ```java
-// MOOD 3: busy dropping the item + change. Ignores new input.
+// STATE 3: busy dropping the item + change. Ignores new input.
 class DispensingState implements State {
     public void dispense(VendingMachine m) {
         Product p = m.getSelected();
@@ -292,7 +292,7 @@ class DispensingState implements State {
         m.dispenseProduct(p);                       // *clunk* — drop the can
         m.returnChange(change);                     // give change (via ChangeStrategy)
         m.reset();                                  // clear balance + selection
-        m.setState(m.idle);                         // mood changes: DISPENSING → IDLE
+        m.setState(m.idle);                         // state changes: DISPENSING → IDLE
     }
     // insertMoney / selectProduct / cancel are intentionally no-ops or throw:
     // the machine is mid-transaction and shouldn't accept new input.
@@ -301,11 +301,11 @@ class DispensingState implements State {
 
 #### Piece 5 — `VendingMachine`: the context that delegates
 
-The machine holds the shared data (balance, selected product, inventories) and **one reference to the current state**. Every public action is a one-liner that just forwards to the current state — *the machine itself contains no `if (mood == ...)` logic at all.*
+The machine holds the shared data (balance, selected product, inventories) and **one reference to the current state**. Every public action is a one-liner that just forwards to the current state — *the machine itself contains no `if (state == ...)` logic at all.*
 
 ```java
 class VendingMachine {
-    // the four mood-objects, created once and reused (they're stateless)
+    // the four state objects, created once and reused (they're stateless)
     final State idle = new IdleState();
     final State hasMoney = new HasMoneyState();
     final State dispensing = new DispensingState();
@@ -317,7 +317,7 @@ class VendingMachine {
     private Inventory cashInventory;         // coins available to give as change
     private ChangeStrategy changeStrategy;   // HOW to make change (see Strategy)
 
-    // --- public actions: each just DELEGATES to the current mood ---
+    // --- public actions: each just DELEGATES to the current state ---
     void insertMoney(int a)     { state.insertMoney(this, a); }
     void selectProduct(String c){ state.selectProduct(this, c); }
     void dispense()             { state.dispense(this); }
@@ -353,7 +353,7 @@ new VendingMachine()          state = IDLE,      balance = 0
 
 #### Q: Why do the state objects take `VendingMachine m` as a parameter?
 
-Because the states are **stateless bouncers** — they hold no data themselves; the data (balance, selected, inventory) all lives on the machine. So when `IdleState` needs to record money, it calls back into the machine: `m.addBalance(amt)`. This lets us create each state **once** and share it (they're like rule-books, not per-transaction objects).
+Because the states are **stateless** — they hold no data themselves; the data (balance, selected, inventory) all lives on the machine. So when `IdleState` needs to record money, it calls back into the machine: `m.addBalance(amt)`. This lets us create each state **once** and share it (they're shared, stateless objects, not per-transaction objects).
 
 #### Q: What is `ChangeStrategy` and why is it separate?
 
@@ -386,9 +386,9 @@ Two safeguards: (1) `cashInventory` tracks the coins physically available, and t
 
 Two inventories, don't confuse them: **product stock** (cans per slot) and **cash inventory** (coins for change). Product stock is checked in `HasMoneyState.selectProduct` (`p.stock == 0` → `OutOfStock`) and decremented in `DispensingState.dispense` (`p.stock--`) — i.e. only when the can actually drops, so a cancelled or failed transaction never miscounts stock.
 
-#### Q: Where do the mood transitions actually happen?
+#### Q: Where do the state transitions actually happen?
 
-Only inside the state methods, via `m.setState(...)`. That's deliberate — the *states* own the transition rules, so all the "what mood comes next" logic lives in exactly one place per state, never scattered across the machine. That's why there's no giant `switch` in `VendingMachine`.
+Only inside the state methods, via `m.setState(...)`. That's deliberate — the *states* own the transition rules, so all the "what state comes next" logic lives in exactly one place per state, never scattered across the machine. That's why there's no giant `switch` in `VendingMachine`.
 
 ---
 
@@ -405,13 +405,13 @@ Only inside the state methods, via `m.setState(...)`. That's deliberate — the 
 
 > **Interview lead:** this is *the* **State pattern** question. Lead with the state machine + State objects; add Strategy for change-making, Singleton for the machine.
 
-### Plain-English: which pattern does what, with a snack-machine picture
+### Which pattern does what
 
 Each pattern maps to a very concrete part of the real machine:
 
-| Pattern | Real machine picture | What it buys you |
+| Pattern | Real machine part | What it buys you |
 | --- | --- | --- |
-| **State** ⭐ | The machine's "mood" (waiting / paid / dropping) that changes which buttons work | Kills the `if/else` swamp; each mood is a self-contained rule-book |
+| **State** ⭐ | The machine's current state (waiting / paid / dropping) that changes which buttons work | Kills the `if/else` swamp; each state is a self-contained rulebook |
 | **Strategy** | The change-making brain — "biggest coins first" vs "exact only" | Swap *how* change is made without touching the states |
 | **Singleton** | There is **one** physical machine in the hallway | One authoritative object owning balance/inventory — no confusing duplicates |
 | **Factory** | The loading dock that builds `Product`/payment objects | Add new products or payment types without editing everywhere |
@@ -425,7 +425,7 @@ Common confusion; the structures look identical, but the **intent** differs:
 - **State** swaps behavior based on the object's own **internal situation, and the object flips itself between states** as things happen (IDLE → HAS_MONEY → DISPENSING). The transitions are the whole point.
 - **Strategy** is a behavior **you (or config) pick once and it just stays** — the machine doesn't spontaneously switch from greedy to exact-change mid-sale. No self-driven transitions.
 
-One-liner: *State = "the machine changes its own mood over time"; Strategy = "plug in an algorithm and leave it."*
+One-liner: *State = "the machine changes its own state over time"; Strategy = "plug in an algorithm and leave it."*
 
 #### Q: Why Singleton for the machine?
 
@@ -457,13 +457,13 @@ When stock runs low, several things need to know: the front **display** ("SOLD O
 > **"What if two things happen at once / invalid action?"**
 > "Invalid actions throw in the current state (e.g. dispense with no selection). State transitions are the single source of truth; the machine holds balance, selected product, and inventories."
 
-### Plain-English: answering the follow-up questions
+### Answering the follow-up questions
 
 The cheat-sheet lines are what you *say*; here's the reasoning so you can defend them.
 
 #### Q: How do I "lead with the state machine" without rambling?
 
-Draw the four moods and the arrows between them **first** (the diagram in §2), then say one sentence: *"Each mood is a class implementing a common `State` interface; the machine delegates every action to its current state, which only permits legal moves."* That single move — data on the machine, behavior in the states — is what they're grading. Everything else (Strategy, Singleton) is a bonus you sprinkle after.
+Draw the four states and the arrows between them **first** (the diagram in §2), then say one sentence: *"Each state is a class implementing a common `State` interface; the machine delegates every action to its current state, which only permits legal moves."* That single move — data on the machine, behavior in the states — is what they're grading. Everything else (Strategy, Singleton) is a bonus you sprinkle after.
 
 #### Q: What about concurrency — two people using it at once?
 

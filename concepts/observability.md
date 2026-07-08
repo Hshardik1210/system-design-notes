@@ -2,7 +2,7 @@
 
 > **Goal:** understand what a distributed system is doing and why — to detect, diagnose, and prevent problems. The three pillars are **logs, metrics, traces**; the operational contract is **SLI / SLO / SLA**. Interviewers expect you to add an "observability" section to any design.
 
-> **How to read this doc:** each section has the dense summary first, then a **Plain-English** deep dive (a running **car dashboard** analogy — gauges = metrics, trip log = logs, GPS route = traces — annotated examples, and the exact confusions that come up while learning). Skim the summaries for revision; read the plain-English parts to actually understand.
+> **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated examples and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
 
@@ -27,14 +27,12 @@
 
 > You monitor for known failure modes; observability lets you debug the unknown ones.
 
-### Plain-English: monitoring vs observability
+### Monitoring vs observability
 
-Think of your **car dashboard** (this analogy runs through the whole doc).
+- **Monitoring** = the specific signals someone decided ahead of time to watch: error-rate alerts, a latency dashboard, a disk-space check. Each was predicted and wired up in advance. When one fires, you know *that* known thing happened.
+- **Observability** = collecting rich enough raw data (metrics + logs + traces) that when something *unpredicted* happens, you can investigate and figure it out after the fact — even though nobody built a dedicated alert for it.
 
-- **Monitoring** = the warning lights the manufacturer decided you'd need: the fuel light, the engine-temperature light, the "check engine" light. Someone predicted *these specific* problems ahead of time and wired up a light for each. When one turns on, you know *that* known thing happened.
-- **Observability** = having enough raw information (a full gauge cluster, a trip computer, a mechanic's diagnostic port) that when something *weird and unpredicted* happens — the car pulls slightly to the left only above 80 km/h in the rain — you can actually investigate and figure it out, even though nobody built a dedicated warning light for it.
-
-So monitoring answers **"is the thing I worried about happening?"** and observability answers **"something is off — what on earth is going on?"** A system is *observable* if you can ask brand-new questions of it after the fact without having to ship new code first.
+So monitoring answers **"is the thing I worried about happening?"** and observability answers **"something is off — what is going on?"** A system is *observable* if you can ask brand-new questions of it after the fact without having to ship new code first.
 
 #### Q: Isn't this just a fancy word for monitoring?
 
@@ -45,7 +43,7 @@ They overlap, but the distinction is about **new questions**:
 
 #### Q: If I have good monitoring, do I still need observability?
 
-Yes. Monitoring tells you the **known** house is on fire. Observability is what lets you find the **unknown** short-circuit behind the wall that no smoke detector was pointed at. Real incidents are usually the ones nobody predicted — that's exactly where observability earns its keep.
+Yes. Monitoring tells you when a **known** failure mode occurs. Observability is what lets you diagnose the **unknown** failure that no alert was set up for. Real incidents are usually the ones nobody predicted — that's exactly where observability earns its keep.
 
 ---
 
@@ -59,13 +57,13 @@ Yes. Monitoring tells you the **known** house is on fire. Observability is what 
 
 Together: metrics **detect**, traces **localize**, logs **explain**.
 
-### Plain-English: the three pillars as a car dashboard
+### The three pillars
 
-Picture one road trip in your car. Three totally different tools tell you three different kinds of things:
+Three different tools answer three different kinds of question:
 
-- **Gauges (metrics)** — the speedometer, fuel gauge, RPM, temperature. Always-on **numbers** that tell you *how much / how fast / how hot*, right now and over time. They're cheap (just numbers) and great for spotting "something's off" — the temp gauge is climbing! But a gauge never tells you *why* or *what specifically* happened.
-- **Trip log / glovebox notebook (logs)** — a written entry for each notable event: "10:04 — refueled 30 L at Shell", "11:20 — warning chime, dashboard flashed", "11:22 — pulled over". Each entry is **a specific thing that happened**, with details. Perfect for "what exactly occurred at 11:20?" — but useless for "what's my *average* speed" (you'd have to read thousands of entries).
-- **GPS route (traces)** — the full path of one journey, hop by hop: home → highway → toll booth → exit → office, **with how long each leg took**. This is what shows you *where* the time went: "the toll booth leg took 25 minutes — that's the slow part."
+- **Metrics** — always-on **numbers**: request rate, error rate, latency, CPU, queue depth, right now and over time. Cheap to store and aggregate, and great for spotting "something's off" (error rate is climbing). But a metric never tells you *why* or *what specifically* happened.
+- **Logs** — a timestamped record for each notable event, with details: which user, which order, which error code. Each entry is **a specific thing that happened**. Perfect for "what exactly occurred at 11:20?" — but expensive for aggregate questions like "what's the average latency" (you'd have to scan huge numbers of entries).
+- **Traces** — the full path of **one request** across services, hop by hop, **with how long each hop took**. This shows *where* the time went: "the DB hop took 300ms — that's the slow part."
 
 Now map it to a software request:
 
@@ -101,13 +99,11 @@ Numeric time-series, cheap to store and aggregate.
 - **Percentiles > averages** — p99 latency reveals tail pain that an average hides.
 - Tools: Prometheus, Grafana, Datadog. Beware **high-cardinality** labels (userId) blowing up storage.
 
-### Plain-English: the three gauge types
+### The three metric types
 
-Back to the dashboard. The three metric **types** are just three kinds of gauges:
-
-- **Counter = the odometer.** It only ever goes **up** (monotonic). Total kilometres driven, total requests served, total errors. You never care about its raw value so much as *how fast it's climbing* — "500 km added today" = "requests_total went up by 500 this second = 500 req/s."
-- **Gauge = the fuel/speed needle.** A **point-in-time** value that goes up **and** down: current speed, fuel level, current memory used, queue depth, active connections right now.
-- **Histogram = a tally of how long things took, bucketed.** Instead of one number, it records "how many requests fell in 0–10ms, 10–50ms, 50–100ms, 100ms+." From those buckets you compute **percentiles** (p50/p95/p99) — "99% of requests finished under 800ms."
+- **Counter** — a value that only ever goes **up** (monotonic): total requests served, total errors. You rarely care about its raw value, only *how fast it's climbing* — "requests_total went up by 500 this second = 500 req/s."
+- **Gauge** — a **point-in-time** value that goes up **and** down: current memory used, queue depth, active connections right now.
+- **Histogram** — a bucketed tally of how long things took: "how many requests fell in 0–10ms, 10–50ms, 50–100ms, 100ms+." From those buckets you compute **percentiles** (p50/p95/p99) — "99% of requests finished under 800ms."
 
 #### Annotated example: a counter and a histogram
 
@@ -131,14 +127,14 @@ latency.record(() -> handleRequest());  // times the call, drops it in the right
 
 A dashboard then does the math for you: **rate** = how fast `http_requests_total` climbs, **error %** = `errors_total` rate ÷ `requests_total` rate, **p99** = read off the histogram.
 
-#### Plain-English: RED and USE (which numbers to actually track)
+#### RED and USE (which numbers to actually track)
 
 Don't track random numbers — track these two well-known checklists:
 
 - **RED** — for **services** (things handling requests): **R**ate (requests/sec), **E**rrors (how many failed), **D**uration (how long they took, as percentiles). "Is my service healthy from the caller's point of view?"
-- **USE** — for **resources** (CPU, disk, memory, a queue): **U**tilization (how busy, e.g. 80% CPU), **S**aturation (how much work is *waiting* — queue length), **E**rrors. "Is this piece of hardware/resource the bottleneck?"
+- **USE** — for **resources** (CPU, disk, memory, a queue): **U**tilization (how busy, e.g. 80% CPU), **S**aturation (how much work is *waiting* — queue length), **E**rrors. "Is this resource the bottleneck?"
 
-Dashboard analogy: RED is watching how the **car is performing for the driver** (speed, stalls, delays); USE is watching the **engine internals** (RPM, oil temp, is anything redlining).
+RED describes the service from the caller's perspective (throughput, failures, latency); USE describes a resource's internal health (how busy, how backed up, failing).
 
 #### Q: What is "high cardinality" and why does everyone warn about it?
 
@@ -172,9 +168,9 @@ Timestamped records of events.
 - **Never log secrets/PII** (tokens, card numbers, message bodies).
 - Ship to a central store (ELK/OpenSearch, Loki, Splunk) — don't grep boxes.
 
-### Plain-English: logs are the trip diary
+### Structured logs and correlation ids
 
-A log line is one entry in the car's trip diary: *at this time, this specific thing happened.* The whole art of good logging is making those entries **searchable** and **safe**.
+A log line records one event: *at this time, this specific thing happened.* The whole art of good logging is making those entries **searchable** and **safe**.
 
 #### Annotated example: structured vs unstructured
 
@@ -200,7 +196,7 @@ A log line is one entry in the car's trip diary: *at this time, this specific th
 
 With structured logs you can run queries like `level:ERROR AND service:payment-svc AND error_code:CARD_DECLINED` across your whole fleet in seconds. With plain text you're stuck grepping and regexing.
 
-**Why the correlation ids matter so much:** `trace_id` / `request_id` are the thread that stitches a single user's journey back together across dozens of services and thousands of interleaved log lines. Without them, logs from different requests are hopelessly tangled — like every car in the city writing into the *same* shared diary with no license plate on any entry.
+**Why the correlation ids matter so much:** `trace_id` / `request_id` are the thread that stitches a single request back together across dozens of services and thousands of interleaved log lines. Without them, logs from different requests are hopelessly tangled — you can't tell which lines belong to which request.
 
 #### Q: If I have metrics, why do I still need logs?
 
@@ -238,23 +234,23 @@ trace_id = abc123
 - Pinpoints **which service/hop** caused latency or errors.
 - Tools: OpenTelemetry (standard), Jaeger, Zipkin, Datadog APM. Usually **sampled** (e.g. 1%).
 
-### Plain-English: a trace is the GPS route of one request
+### A trace is the full path of one request
 
-Your metrics said "checkout is slow." But checkout calls 6 other services — **which one** is the slow hop? That's exactly what a **trace** answers: it's the GPS breadcrumb trail of **one single request** as it hops between services, timing every leg.
+Your metrics said "checkout is slow." But checkout calls 6 other services — **which one** is the slow hop? That's exactly what a **trace** answers: it records **one single request** as it hops between services, timing every hop.
 
-- A **trace** = the whole journey (one `trace_id`).
-- A **span** = one leg of that journey (one operation in one service), with a start time, an end time, and tags.
+- A **trace** = the full path of one request (one `trace_id`).
+- A **span** = one hop of that path (one operation in one service), with a start time, an end time, and tags.
 - Spans nest into a **tree**: the gateway span contains the order-svc span, which contains the db-query span, etc.
 
 ```
-trace_id = abc123                     ← one request's whole journey
+trace_id = abc123                     ← one request's full path
   span: gateway        [0–2ms]        ← parent span
     span: order-svc    [2–40ms]
       span: db query   [5–30ms]   ← 25ms here = the slow hop! this is your culprit
       span: payment    [31–39ms]
 ```
 
-Reading it like a GPS route: the total trip took 40ms, and the "db query" leg ate 25ms of it — so you go optimize *that* query, not the payment call.
+Reading it: the total request took 40ms, and the "db query" hop ate 25ms of it — so you go optimize *that* query, not the payment call.
 
 #### Annotated example: creating a span and propagating context
 
@@ -282,7 +278,7 @@ traceparent: 00-abc123def456...-00f067aa0ba902b7-01
              version                               flags
 ```
 
-Without propagation, each service would create its own disconnected trace and you'd lose the end-to-end picture — like each leg of your trip being logged as a *separate* journey with no way to link them.
+Without propagation, each service would create its own disconnected trace and you'd lose the end-to-end picture — each hop would be recorded as a *separate* trace with no way to link them.
 
 #### Q: What's the difference between a trace and a log?
 
@@ -290,7 +286,7 @@ A **log** is a single point-in-time entry ("payment declined at 11:20"). A **tra
 
 #### Q: Why is tracing "sampled" (only ~1%)? Won't I miss things?
 
-At millions of requests, storing a full trace for **every** request is hugely expensive and mostly redundant (the 999,999 healthy requests look identical). So you keep a **sample** — e.g. 1% random, often with "always keep traces that errored or were slow" (**tail-based sampling**). You still get a statistically representative view of latency, plus the interesting (slow/failed) ones. It's like a GPS that saves every trip that hit heavy traffic, but only 1-in-100 of the smooth ones.
+At millions of requests, storing a full trace for **every** request is hugely expensive and mostly redundant (the 999,999 healthy requests look identical). So you keep a **sample** — e.g. 1% random, often with "always keep traces that errored or were slow" (**tail-based sampling**). You still get a statistically representative view of latency, plus all the interesting (slow/failed) ones, while dropping most of the identical healthy ones.
 
 ---
 
@@ -305,19 +301,19 @@ At millions of requests, storing a full trace for **every** request is hugely ex
 
 > **Error budget** balances reliability vs velocity: if you're within budget, ship features; if you've burned it, freeze and fix reliability. SLA ⊇ SLO (SLA looser, with legal teeth); set SLOs stricter than SLAs.
 
-### Plain-English: SLI vs SLO vs SLA (the confusing three)
+### SLI vs SLO vs SLA (the confusing three)
 
 These three look alike but sit at very different levels. Read them as a chain, **measurement → goal → promise**:
 
-- **SLI = the measurement.** A number you actually collect. "99.95% of requests succeeded this week." (It comes straight from your metrics — see §3.) SLI = **I**ndicator = the *reading on the gauge*.
+- **SLI = the measurement.** A number you actually collect. "99.95% of requests succeeded this week." (It comes straight from your metrics — see §3.) SLI = **I**ndicator = the *measured signal*.
 - **SLO = your internal goal for that number.** "We want success ≥ 99.9% over 30 days." SLO = **O**bjective = the *target you set yourself*. No lawyers involved; it's your team's bar.
 - **SLA = the promise to the customer, with penalties.** "If uptime drops below 99.9%, you get a refund." SLA = **A**greement = a *contract* with money/legal consequences attached.
 
-Dashboard analogy: the **SLI** is the fuel gauge reading (say, 15%). Your personal **SLO** is "I never let it drop below 10%." The **SLA** is the rental company's rule: "return the car below empty and you're charged a €50 fee." Notice you set your **SLO stricter** than the externally-enforced line, so you have a safety margin before real consequences hit.
+Note you set your **SLO stricter** than the SLA, so there's a safety margin before the contractual (penalty-bearing) threshold is ever at risk.
 
 > **Why SLO stricter than SLA?** If your public promise (SLA) is 99.9% and you *aim* internally at exactly 99.9%, any bad week breaks the contract. So you aim higher internally (e.g. SLO 99.95%) to keep a buffer before the SLA (and its penalties) is ever at risk. SLA ⊇ SLO — the SLA is the looser, legally-binding outer line.
 
-#### Plain-English: error budget = your allowance to fail
+#### Error budget = your allowance to fail
 
 If your SLO is 99.9% success, then **0.1% is allowed to fail** — that 0.1% is your **error budget**. It's a concrete, spendable allowance:
 
@@ -333,7 +329,7 @@ The clever part is what you *do* with it:
 - **Budget remaining?** You can afford risk — ship features fast, do that risky migration.
 - **Budget burned?** You've used up your allowed failure for the month → **freeze new features, fix reliability** until you're back in budget.
 
-It turns "how much reliability work vs feature work?" from an argument into a **number**. Analogy: it's a monthly data allowance — under the cap, stream freely; blow past it and you throttle everything until next cycle.
+It turns "how much reliability work vs feature work?" from an argument into a **number**: a fixed monthly allowance you spend on risk, and once it's gone you stop taking risks until it resets.
 
 #### Q: So which one do I get paged about?
 
@@ -348,9 +344,9 @@ You alert on **burning the error budget too fast** (see §7), derived from your 
 - Avoid **alert fatigue** (too many noisy alerts → ignored). Use burn-rate alerts on the error budget.
 - Have **runbooks** for each alert.
 
-### Plain-English: alert on what the driver feels, not every sensor
+### Alert on user-facing symptoms, not every metric
 
-Your car has hundreds of sensors. If **every** one could set off a loud alarm, you'd get a blaring cabin over a slightly-warm tyre and you'd start ignoring all of them — including the real "engine on fire" one. That's **alert fatigue**, and it's the number-one way alerting fails.
+A system emits hundreds of low-level metrics. If **every** one could page you, you'd be woken for a single node at slightly-high CPU and you'd start ignoring all of them — including the one real outage. That's **alert fatigue**, and it's the number-one way alerting fails.
 
 The fix: **page a human only for symptoms the user actually feels** — high error rate, high latency, the site being down, the error budget burning fast. Everything else (a single node at 75% CPU, a transient blip) goes to a **dashboard or a ticket**, not someone's phone at 3am.
 
@@ -379,7 +375,7 @@ The fix: **page a human only for symptoms the user actually feels** — high err
 
 The good rule has three things the bad one lacks: it's a **symptom** (errors users see), it's **sustained** (`for: 5m`, no flapping), and it links a **runbook** — the step-by-step "here's how to respond." Every page should be **actionable**: if there's nothing to do, it shouldn't page.
 
-#### Plain-English: burn-rate alerts (the modern way)
+#### Burn-rate alerts (the modern way)
 
 Instead of alerting on a raw threshold, alert on **how fast you're eating the error budget** (§6). Burning slowly? A ticket is fine. Burning so fast you'll exhaust the whole month's budget in an hour? **Page now.** This ties alerts directly to real user-impact and cuts noise — a small, brief error blip barely dents the budget and won't wake anyone.
 
