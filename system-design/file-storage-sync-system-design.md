@@ -176,13 +176,7 @@ Unlike most system-design problems where the "client" is just a browser, here th
 | **Indexer** | Keep a small **local database**: "this file = these chunk hashes," plus my sync **cursor** |
 | **Syncer** | Talk to the server: ask what changed, upload/download the actual chunk bytes |
 
-And on the server side, three components with clean responsibilities:
-
-```
-Metadata Service      → files, versions, chunk lists, permissions, the change journal
-Block Store (S3)      → raw chunk bytes, addressed by their content hash
-Notification Service  → signals "your folder changed" so the device knows to sync
-```
+(The three server-side components — Metadata Service, Block Store, Notification Service — are listed in the architecture summary above.)
 
 #### Q: Why does the client talk to metadata FIRST, then transfer chunks separately?
 

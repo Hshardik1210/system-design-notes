@@ -978,54 +978,7 @@ States with no moves out — the game is over. `DELIVERED`, `CANCELLED`, and `PA
 
 ## B6. Core Algorithms
 
-### Place order (Saga + validation chain + idempotency)
-
-```
-placeOrder(cmd):
-    if exists(cmd.idempotencyKey): return existing        # idempotent
-    validateChain(cmd)                                     # open? available? serviceable? price?
-    total = price(cmd)                                     # strategy + decorator
-    BEGIN TX
-        order = insert(status=PENDING_PAYMENT)
-        insert outbox(...)                                 # for reliable events
-    COMMIT
-    pay = payment.charge(order)                            # circuit breaker
-    if pay.success: order→PLACED; emit ORDER_PLACED
-    else:           order→PAYMENT_FAILED
-```
-
-### Dispatch (candidate → score → offer loop)
-
-```
-onReadyish(order):
-    candidates = geo.nearbyRiders(restaurant, 3km) filter idle
-    ranked = strategy.rank(candidates, order)             # distance, direction, load, ready time
-    for rider in ranked:
-        if claimRider(rider, order):                       # atomic Redis lock
-            offer(rider); await accept (timeout Ns)
-            if accepted: order→RIDER_ASSIGNED; break
-            else: release lock; continue
-```
-
-### Live location ingest
-
-```
-onPing(riderId, lat, lng):
-    GEOADD riders:online lng lat rider:{id}   # update index
-    SET loc:rider:{id} {lat,lng,ts} EX 30     # latest value
-    publish location to Kafka (sampled)        # for tracking + analytics
-    # NEVER write to orders DB
-```
-
-### Cancellation + refund (compensation)
-
-```
-cancel(order):
-    if status in [DELIVERED, OUT_FOR_DELIVERY]: reject or partial
-    order→CANCELLED
-    if payment==PAID: refund.initiate(order)   # saga compensation
-    release rider lock if held; notify parties
-```
+> The four core algorithms — place order (saga + validation chain + idempotency), dispatch (candidate → score → offer loop), live location ingest, and cancellation + refund (compensation) — are shown as fully annotated Java in the deep dive below.
 
 ### The four core algorithms
 

@@ -149,8 +149,6 @@ Two feeds: a **subreddit feed** and a **personalized home feed** (merge of subsc
 r/soccer's hot list  ──►  computed ONCE  ──►  cached  ──►  read by ALL 30M subscribers
 ```
 
-`r/soccer`'s hot list is identical for everyone, so it's ranked **once** and the result is shared. Rebuilding a personalized ranked list for each of 30M subscribers would be push; making each reader re-rank all posts on every visit would be pull. Computing once and sharing the result beats both.
-
 Your **home feed** is then just a per-user merge: grab the top slice of each subreddit you follow, merge-and-rank those slices, and cache the small merged result.
 
 ```java

@@ -192,12 +192,7 @@ BACK queues (politeness): B1..Bm, each mapped to ONE host at a time
                           a HEAP of (nextFetchTime, backQueue) picks which host is due
 ```
 
-```
-enqueue(url): prioritizer → pick front queue by priority
-route to back: a router maps url's host → a back queue (one host per back queue)
-fetch loop: pop the host with the earliest nextFetchTime from the heap
-            fetch one URL from its back queue → set nextFetchTime = now + crawlDelay(host)
-```
+> `enqueue` (prioritize → route to a host's back queue) and `next` (pop the due host, fetch, re-arm its timer) are shown as annotated code in the deep dive below.
 
 | Concern | Mechanism |
 | --- | --- |
@@ -319,13 +314,7 @@ Avoid re-crawling the same URL and storing near-duplicate content.
 | **URL dedup** | **Normalize** the URL, then check a **seen-set**; a **Bloom filter** gives O(1) membership at 10B scale (no false negatives → "definitely new" is trustworthy; a "maybe seen" is verified in the KV store) |
 | **Content dedup** | Hash the page: exact = SHA; **near-duplicate = SimHash/MinHash** (mirror sites, boilerplate) → skip |
 
-```
-if not bloom.mightContain(normUrl):        # definitely new
-    add to frontier + set bloom + persist to seen-set
-else:                                       # maybe seen → verify in KV (avoid false-positive skip)
-    if kv.contains(normUrl): skip
-```
-
+- The bloom-check-then-verify-in-KV logic is shown as annotated code (`isNew`) in the deep dive below.
 - **URL normalization:** lowercase host, strip fragments (`#...`), sort query params, resolve relative → absolute, drop tracking params, canonicalize (`http`↔`https`, trailing slash).
 
 ### Two kinds of "we already have this"

@@ -517,16 +517,9 @@ Every post has a **privacy scope**; visibility is checked **on read** (never lea
 | CUSTOM | Specific lists / except-people |
 | ONLY_ME | Author |
 
-```
-canView(viewer, post):
-  PUBLIC → yes
-  FRIENDS → viewer ∈ friends(author)
-  CUSTOM → check allow/deny lists
-  + author hasn't blocked viewer
-```
-
 - Enforced at **feed build + post fetch**; a blocked user never sees your content.
 - Privacy filtering happens **during candidate generation** so restricted posts never enter a feed.
+- `canView(viewer, post)` = blocked-check first, then the scope (PUBLIC/FRIENDS/CUSTOM/ONLY_ME) — full annotated version in the deep dive below.
 
 ### Privacy is checked on every read
 

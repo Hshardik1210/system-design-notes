@@ -55,8 +55,6 @@ You might assume "a room is either free or taken." Two twists make hotels specia
 - **Twist 1 — you book a *type*, not a specific room.** You don't ask for "room 412"; you ask for "a Deluxe room." The hotel has, say, 10 identical Deluxe rooms. As long as **at least one** is free, you're fine. So we track a **count** ("8 of 10 Deluxe booked"), not individual rooms.
 - **Twist 2 — a booking spans *multiple nights*.** "July 10–13" means you need a Deluxe free on the **10th AND the 11th AND the 12th**. If even one of those nights is sold out, the whole stay is impossible.
 
-The stay is bookable only if a room of that type is free on *every* night of the range — if any single night is sold out, the whole booking fails.
-
 Here's the count-per-night idea as a tiny table — one row per (room type, night):
 
 ```
@@ -277,20 +275,7 @@ Because availability changes **night by night**. `RoomType.totalRooms` is the "n
 
 ## 6. Booking Flow & Overbooking Prevention
 
-```
-book(hotel, roomType, checkIn, checkOut, guest):
-  BEGIN TX
-    # atomic conditional increment for EVERY night in the range
-    UPDATE room_inventory
-       SET booked_count = booked_count + 1
-     WHERE hotel_id=? AND room_type_id=? AND date >= checkIn AND date < checkOut
-       AND booked_count < total_count
-    if rows_affected != number_of_nights:      # some night was full
-        ROLLBACK → NO_AVAILABILITY
-    INSERT reservation (status = PENDING_PAYMENT)   # or HELD with TTL
-  COMMIT
-  → initiate payment; success → CONFIRMED; fail/timeout → release (decrement each night)
-```
+- The booking flow is an **atomic conditional increment for every night** in the range inside one transaction, then a `rows_affected == nights` check (roll back if any night was full), then `INSERT reservation (PENDING_PAYMENT)` and payment. (Full annotated SQL + Java in the deep dive below.)
 
 | Technique | Note |
 | --- | --- |
@@ -748,8 +733,6 @@ Guest  BookingSvc  Inventory  Payment  Kafka
 ### What a "saga" is, and why we need one
 
 A booking touches **several services** — Inventory, Payment, then messaging. In a single database you'd wrap them in one transaction and "all or nothing" comes free. But these are **separate services** (separate databases), so there's no single transaction spanning them. A **saga** is the workaround: do the steps **one at a time**, and if a later step fails, run **compensating actions** to undo the earlier ones.
-
-Across separate services there's no single "cancel everything" transaction. If a later step fails after earlier ones already committed, you must explicitly undo the earlier ones — that manual undo is **compensation**.
 
 The booking saga, happy path vs failure:
 

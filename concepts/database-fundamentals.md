@@ -75,10 +75,6 @@ CREATE TABLE users (
 
 No. It means the *database* doesn't force a shape — but your **application code still expects one**. If half your documents have `email` and half don't, your code has to handle both. You've just moved the schema from the database into your app. Good NoSQL modeling starts from *"what queries will I run?"* and stores data pre-shaped for those.
 
-#### Q: When do I actually pick NoSQL over SQL?
-
-Reach for NoSQL when you need **massive horizontal scale** (spread across many machines), **flexible/evolving data**, or **very high write throughput**, and you can tolerate **eventual consistency**. Stay with SQL when you need **multi-row transactions**, **relationships/joins**, and **strong correctness** (money, inventory). Most real systems use **both** (polyglot persistence): SQL for orders/payments, Redis for cache, Cassandra for the event firehose.
-
 #### Q: Which NoSQL family do I use?
 
 Match the family to the shape of your access pattern: **Key-Value** (Redis) for "give me the value for this key" (caching, sessions); **Document** (MongoDB) for self-contained entities (a product with its variants); **Wide-Column** (Cassandra) for write-heavy time-series; **Graph** (Neo4j) for "friends of friends" relationship traversal.

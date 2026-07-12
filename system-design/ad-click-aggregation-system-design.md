@@ -345,10 +345,6 @@ This is the **same fast-but-approximate + slow-but-exact split** that shows up e
 
 The fast path protects **freshness** (live numbers now); the slow path guarantees **accuracy** (the final invoice).
 
-#### Q: What if we wrongly flag a real click (false positive)?
-
-That's why we **archive even the dropped clicks to S3** (`s3.archive(c)` above). Nothing is truly deleted — if a filter was too aggressive, the batch layer can re-examine the raw record and add legit clicks back. We'd rather review from the full record than lose data forever.
-
 > **One line:** a bot is caught by *behaving inhumanly* — too fast, too many, wrong origin, no conversions. We score clicks on those signals in a **fast rule-based filter before counting** (blocklists + rate limits), then a **heavier ML/batch pass during reconciliation** catches the subtle fraud and refunds it.
 
 ---
@@ -381,8 +377,6 @@ aggregate: count(clicks), unique_users (HyperLogLog), sum(revenue)
 #### Q: Are the 50k (or millions of) events held in memory as an ArrayList?
 
 **No — the most important optimization.** We do **not** keep events. We keep only a **running count**.
-
-The idea: keep a running tally and discard each event after adding 1 to the count, rather than storing every event.
 
 ```
 click for ad 123 arrives → counter[123] = counter[123] + 1 → THROW AWAY the click

@@ -152,18 +152,6 @@ A **64-bit** integer = time + machine + sequence, generated **locally** with no 
           ~69 years            1024 machines   4096 ids/ms/machine
 ```
 
-```
-nextId():
-    now = currentMillis()
-    if now == lastTs:
-        sequence = (sequence + 1) & 4095
-        if sequence == 0: now = waitNextMillis()   # this ms is exhausted (>4096 ids)
-    else:
-        sequence = 0
-    lastTs = now
-    return ((now - epoch) << 22) | (machineId << 12) | sequence
-```
-
 | Field | Role | Tunable |
 | --- | --- | --- |
 | **Timestamp** | Time-sortable + ~69 years from a **custom epoch** | more bits → longer lifespan |
@@ -174,6 +162,7 @@ nextId():
 - **No coordination** per ID (only the one-time machine-id assignment).
 - **k-sorted**: IDs increase with time → great for DB primary keys, time-range scans, and cursors.
 - **Bit layout is tunable** to your scale (e.g., more machine bits if you have >1024 nodes, fewer sequence bits).
+- Full annotated `nextId()` in the deep dive below.
 
 ### A Snowflake ID is one 64-bit number in 3 parts
 

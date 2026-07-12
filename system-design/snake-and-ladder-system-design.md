@@ -101,68 +101,11 @@ Square 0 is "off the board / at the starting line" — the token hasn't entered 
 
 ## 3. Class Design
 
-```java
-class Dice {
-    private final int count;
-    Dice(int count) { this.count = count; }
-    int roll() { /* sum of `count` random 1..6 */ }
-}
-
-class Jump {                    // unifies snake AND ladder
-    int start;                  // cell you land on
-    int end;                    // where you're taken (end<start = snake, end>start = ladder)
-}
-
-class Cell {
-    int position;
-    Jump jump;                  // null if plain cell
-}
-
-class Player {
-    String id;
-    String name;
-    int position = 0;           // 0 = off-board / start
-}
-
-class Board {
-    int size;                   // e.g. 100
-    Cell[] cells;
-    Board(int size, List<Jump> snakes, List<Jump> ladders) {
-        // build cells; attach jumps at their start positions
-    }
-    int getFinalPosition(int landed) {           // apply snake/ladder if present
-        if (landed > size) return -1;            // overshoot (if exact-win rule)
-        Cell c = cells[landed];
-        return (c.jump != null) ? c.jump.end : landed;
-    }
-}
-
-class Game {
-    private final Board board;
-    private final Dice dice;
-    private final Deque<Player> players;         // turn queue (round-robin)
-    private Player winner;
-
-    void play() {
-        while (winner == null) {
-            Player p = players.poll();            // whose turn
-            int roll = dice.roll();
-            int target = p.position + roll;
-            int finalPos = board.getFinalPosition(target);
-            if (finalPos == board.size) { winner = p; break; }   // win
-            if (finalPos != -1) p.position = finalPos;           // else overshoot → stay
-            players.offer(p);                     // back of the queue
-            // (rule hooks: extra turn on 6, etc.)
-        }
-    }
-}
-```
-
 > **Key modeling insight:** represent **snakes and ladders as one `Jump` type** (start→end). A snake is a jump with `end < start`; a ladder has `end > start`. One abstraction, no duplicate logic.
 
 ### Reading the classes one at a time
 
-The summary above shows all the classes crammed together. Let's walk each one slowly, building up from the small pieces to the whole: first the dice, then the snakes/ladders (`Jump`), then the cells, then the players, then the `Game` that ties it together.
+Let's walk each class slowly, building up from the small pieces to the whole: first the dice, then the snakes/ladders (`Jump`), then the cells, then the players, then the `Game` that ties it together.
 
 #### `Dice` — the random number maker
 
@@ -288,22 +231,9 @@ It's the "you overshot" signal. Under the *exact-win* rule, if you're on square 
 
 ## 4. Game Loop / Algorithm
 
-```
-play():
-    while no winner:
-        player = nextInTurnQueue()
-        roll = dice.roll()
-        target = player.position + roll
-        if target > boardSize:            # exact-win rule → overshoot, skip move
-            requeue(player); continue
-        final = board.applyJumpIfAny(target)   # snake/ladder
-        player.position = final
-        if final == boardSize: winner = player; break
-        requeue(player)                    # (or give extra turn if roll==6)
-```
-
 - **Turn order** via a queue (round-robin).
 - **Win condition** and **overshoot** behavior are rule hooks (Strategy).
+- Full annotated loop below.
 
 ### One turn, step by step
 
@@ -318,7 +248,7 @@ Each round the game loop runs the same steps, over and over, until someone wins:
 6. "Back of the line"→ otherwise, wait for your next turn
 ```
 
-The loop is deliberately **boring and repetitive** — that's good. A game is just these steps repeated. Here it is fully annotated in Java, mirroring the pseudo-code above:
+The loop is deliberately **boring and repetitive** — that's good. A game is just these steps repeated. Here it is fully annotated in Java:
 
 ```java
 void play() {

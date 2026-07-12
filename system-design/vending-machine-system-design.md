@@ -113,69 +113,11 @@ Because dispensing is a real, momentary situation where the machine should **ign
 
 ## 3. Class Design
 
-```java
-interface State {
-    void insertMoney(VendingMachine m, int amount);
-    void selectProduct(VendingMachine m, String code);
-    void dispense(VendingMachine m);
-    void cancel(VendingMachine m);
-}
-
-class IdleState implements State {
-    public void insertMoney(VendingMachine m, int amt) { m.addBalance(amt); m.setState(m.hasMoney); }
-    public void selectProduct(VendingMachine m, String c){ throw new IllegalState("Insert money first"); }
-    public void dispense(VendingMachine m)               { throw new IllegalState("No selection"); }
-    public void cancel(VendingMachine m)                 { /* nothing */ }
-}
-
-class HasMoneyState implements State {
-    public void insertMoney(VendingMachine m, int amt) { m.addBalance(amt); }
-    public void selectProduct(VendingMachine m, String code) {
-        Product p = m.getProduct(code);
-        if (p == null || p.stock == 0) throw new OutOfStock(code);
-        if (m.getBalance() < p.price)  throw new InsufficientFunds(p.price - m.getBalance());
-        m.setSelected(p); m.setState(m.dispensing); m.dispense();   // proceed
-    }
-    public void dispense(VendingMachine m) { /* invalid here */ }
-    public void cancel(VendingMachine m)   { m.refund(); m.setState(m.idle); }
-}
-
-class DispensingState implements State {
-    public void dispense(VendingMachine m) {
-        Product p = m.getSelected();
-        p.stock--;
-        int change = m.getBalance() - p.price;
-        m.dispenseProduct(p);
-        m.returnChange(change);        // ChangeStrategy (greedy coins)
-        m.reset(); m.setState(m.idle);
-    }
-    // other actions invalid in this transient state
-}
-
-class VendingMachine {
-    final State idle = new IdleState(), hasMoney = new HasMoneyState(), dispensing = new DispensingState();
-    private State state = idle;
-    private int balance;
-    private Product selected;
-    private Map<String, Product> slots;         // code → product (price, stock)
-    private Inventory cashInventory;             // coins/notes for change
-    private ChangeStrategy changeStrategy;
-
-    // delegate to current state
-    void insertMoney(int a){ state.insertMoney(this, a); }
-    void selectProduct(String c){ state.selectProduct(this, c); }
-    void dispense(){ state.dispense(this); }
-    void cancel(){ state.cancel(this); }
-    // ... setters/getters used by states
-}
-
-class Product { String code; String name; int price; int stock; }
-interface ChangeStrategy { List<Coin> makeChange(int amount, Inventory cash); }  // greedy
-```
+The full class model is built up in the annotated walkthrough below.
 
 ### The class model, piece by piece
 
-The summary above is the compact interview version. Here's the same design spelled out with heavy annotations, building it up from the small pieces (money, product, inventory) to the big machine and its states.
+Here's the design spelled out with heavy annotations, building it up from the small pieces (money, product, inventory) to the big machine and its states.
 
 #### Piece 1 — Money: `Coin` / `Note` as enums
 

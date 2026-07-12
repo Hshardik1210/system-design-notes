@@ -68,15 +68,6 @@ No — and the difference is the mindset. A database is the **source of truth**:
 
 ### Cache-Aside (lazy loading) — most common
 
-```
-read(key):
-    v = cache.get(key)
-    if v == null:                 # cache miss
-        v = db.get(key)
-        cache.set(key, v, ttl)
-    return v
-```
-
 - **App manages the cache.** Cache only holds what's actually requested.
 - ✅ Resilient (cache down → still hit DB), simple.
 - ❌ First request is a miss; cache can go stale; **thundering herd** on miss.
@@ -138,22 +129,10 @@ If the cache (Redis) goes **down**, cache-aside code still works: every `cache.g
 
 ### Write-Through
 
-```
-write(key, v):
-    cache.set(key, v)
-    db.set(key, v)     # synchronously
-```
-
 - ✅ Cache always consistent with DB.
 - ❌ Slower writes (two hops); caches data that may never be read.
 
 ### Write-Back (write-behind)
-
-```
-write(key, v):
-    cache.set(key, v)
-    queue async flush → db   # later, batched
-```
 
 - ✅ **Fast writes**, absorbs bursts.
 - ❌ **Risk of data loss** if cache dies before flush; more complex.

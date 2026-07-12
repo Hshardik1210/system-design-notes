@@ -227,13 +227,6 @@ Partition 2:  [o2][o5][o8]      →
 
 When a producer sends a message:
 
-```
-if message has a key:
-    partition = hash(key) % numPartitions      # same key → same partition (ordering!)
-else:
-    partition = round-robin / sticky            # spread evenly, no ordering guarantee
-```
-
 - **With a key** (e.g. `user_id`) → all messages with that key land on the same partition → ordered per key + even-ish distribution.
 - **Without a key** → spread across partitions for max throughput, but no per-entity ordering.
 

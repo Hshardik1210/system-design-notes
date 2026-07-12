@@ -383,8 +383,6 @@ That single choice is called **fan-out**, and there are two extremes.
 
 The moment I post, immediately **copy the post's id into the feed of every one of my followers**. When you open the app, your feed is already sitting there, pre-built.
 
-The work happens up front, at post time; reading is then instant because the feed is already built.
-
 ```java
 // Runs when a post is created (triggered by POST_CREATED on Kafka)
 void fanOutOnWrite(Post post) {
@@ -403,8 +401,6 @@ void fanOutOnWrite(Post post) {
 #### Fan-out on READ (pull) — do the work when you open the app
 
 Store nothing ahead of time. When you open the app, **go gather** the recent posts from everyone you follow, right then.
-
-Nothing is precomputed, so every read must query all the accounts you follow — cheap on write, but expensive on every read.
 
 ```java
 // Runs when a user opens the app

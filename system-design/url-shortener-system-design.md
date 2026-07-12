@@ -682,21 +682,7 @@ POST /shorten { longUrl, customAlias?, expiresAt? }
 
 ### Redirect (read path — the hot path)
 
-```
-GET /{code}
-
-1. longUrl = cache.get(code)               # Redis, cache-aside
-2. on HIT (not a tombstone) → go to 5
-3. on MISS:
-       row = db.get(code)                  # replica; primary if just-created
-       if not found      → cache.setNegative(code, short ttl); return 404
-       if expired/disabled → return 410
-       cache.set(code, row.longUrl, ttl)
-       longUrl = row.longUrl
-4. (negative hit / tombstone) → return 404
-5. emit click event → Kafka (fire-and-forget; NEVER block on this)
-6. return 301/302  Location: longUrl
-```
+- Cache lookup → on miss read the DB (404 if unknown, 410 if expired/disabled) → warm the cache → emit the click event async → return 301/302. (Full annotated version in **The redirect handler, line by line** deep dive below.)
 
 > The redirect does the **minimum work**: one cache lookup, one header. Analytics is fired async. Target: served from cache/CDN >99% of the time.
 

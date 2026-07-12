@@ -1475,70 +1475,7 @@ deliverPush(job):
     else: SENT
 ```
 
-### Retry with exponential backoff
-
-```
-handleFailure(job, attempt):
-    attempt_count++
-    if attempt_count >= MAX_RETRIES:
-        kafka.publish(DLQ_topic, job)
-        update attempt status=FAILED
-        return
-
-    base  = backoff[attempt_count]    # 0, 1m, 5m, 30m
-    delay = base + rand(0, base/2)    # JITTER — avoid thundering herd on provider recovery
-    update attempt: status=RETRYING, next_retry_at=now+delay
-    kafka.publish(delayed_retry_topic, job, delay)
-```
-
-### Idempotency (DB + worker)
-
-```
-# API level
-INSERT INTO notifications (notification_key, ...)
-ON CONFLICT (notification_key) DO NOTHING
-→ if 0 rows inserted, return existing notification_id
-
-# Worker level
-SELECT status FROM notification_attempts
-WHERE notification_id=? AND channel=?
-if status == SENT: return (skip duplicate Kafka message)
-```
-
-### Rate limiting (Redis)
-
-```
-key = "notif_count:{userId}:{type}:{yyyy-MM-dd}"
-count = INCR key
-if count == 1: EXPIRE key end_of_day
-if count > limit(type): return false
-return true
-
-limits:
-  PROMOTION: 5/day
-  OTP: unlimited (but short TTL on message itself)
-```
-
-### Campaign fan-out
-
-```
-runCampaign(campaignId):
-    users = segmentService.streamUsers(campaign.segmentId)  // cursor, don't load all in memory
-    batch = []
-    for user in users:
-        batch.append(user.id)
-        if len(batch) >= BATCH_SIZE:          // e.g. 5000
-            insert campaign_batches(batch)
-            kafka.publish("campaign-batch", { campaignId, userIds: batch })
-            batch = clear()
-    update campaign.total_users
-    campaign.status = RUNNING
-
-// Campaign consumer (per user in batch):
-for userId in batch.userIds:
-    orchestrator.send(SendRequest(userId, campaign.type, campaign.channels, ...))
-    increment campaign.sent_count
-```
+> Retry (exponential backoff + jitter → DLQ), idempotency (API `ON CONFLICT DO NOTHING` + worker `attempt.status == SENT` skip), rate limiting (Redis `INCR` + daily TTL), and campaign fan-out (stream segment → batch → enqueue) are shown as annotated Java in the **one confusion at a time** deep dive below.
 
 ### Scheduled dispatch (cron)
 

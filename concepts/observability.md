@@ -309,8 +309,6 @@ These three look alike but sit at very different levels. Read them as a chain, *
 - **SLO = your internal goal for that number.** "We want success ≥ 99.9% over 30 days." SLO = **O**bjective = the *target you set yourself*. No lawyers involved; it's your team's bar.
 - **SLA = the promise to the customer, with penalties.** "If uptime drops below 99.9%, you get a refund." SLA = **A**greement = a *contract* with money/legal consequences attached.
 
-Note you set your **SLO stricter** than the SLA, so there's a safety margin before the contractual (penalty-bearing) threshold is ever at risk.
-
 > **Why SLO stricter than SLA?** If your public promise (SLA) is 99.9% and you *aim* internally at exactly 99.9%, any bad week breaks the contract. So you aim higher internally (e.g. SLO 99.95%) to keep a buffer before the SLA (and its penalties) is ever at risk. SLA ⊇ SLO — the SLA is the looser, legally-binding outer line.
 
 #### Error budget = your allowance to fail

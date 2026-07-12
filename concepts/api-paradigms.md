@@ -81,16 +81,7 @@ Because `GET /users/123` is a plain URL with no side effects, any layer in betwe
 
 ## 2. GraphQL
 
-A single endpoint; the **client specifies exactly what it wants** in a query.
-
-```graphql
-query {
-  user(id: 123) {
-    name
-    posts(last: 3) { title likes }
-  }
-}
-```
+A single endpoint; the **client specifies exactly what it wants** in a query. *(full annotated query + response in the deep dive below)*
 
 | Pros | Cons |
 | --- | --- |
@@ -269,10 +260,6 @@ So they're three different questions: *which thing?* (REST), *which action?* (RP
 - **Over-fetching** = the response contains **more than you needed** (asked for a name, got the whole user object). Wastes bandwidth.
 - **Under-fetching** = a single response has **too little**, so you make **extra round-trips** (get the user, *then* separately get their posts → the N+1 problem).
 - **REST suffers from both** (fixed response shape + one-resource-per-URL). **GraphQL fixes both** by letting the client name exactly the fields and nest related data into one request.
-
-#### Q: When is gRPC the right call in an interview answer?
-
-Say gRPC when the scenario is **internal, high-volume, latency-sensitive** service-to-service traffic — e.g. an order service calling a payments service calling an inventory service, thousands of times a second — or when you need **streaming**. Don't propose gRPC as the thing a mobile app or third-party developer talks to directly; that's REST/GraphQL's job, with gRPC hidden behind the gateway.
 
 #### Q: How does versioning work, and why does it differ per style?
 

@@ -109,51 +109,14 @@ By convention here: **head = MRU** (just used), **tail = LRU** (stalest). Every 
 
 ## 3. Implementation
 
-```java
-class LRUCache {
-    class Node { int key, val; Node prev, next; }
-    private final int capacity;
-    private final Map<Integer, Node> map = new HashMap<>();
-    private final Node head, tail;                 // sentinels
-
-    LRUCache(int capacity) {
-        this.capacity = capacity;
-        head = new Node(); tail = new Node();
-        head.next = tail; tail.prev = head;        // empty list
-    }
-
-    int get(int key) {
-        Node n = map.get(key);
-        if (n == null) return -1;                  // miss
-        moveToFront(n);                            // mark MRU
-        return n.val;
-    }
-
-    void put(int key, int val) {
-        Node n = map.get(key);
-        if (n != null) { n.val = val; moveToFront(n); return; }
-        if (map.size() == capacity) {              // evict LRU
-            Node lru = tail.prev;
-            remove(lru); map.remove(lru.key);
-        }
-        Node fresh = new Node(); fresh.key = key; fresh.val = val;
-        map.put(key, fresh); addFront(fresh);
-    }
-
-    // ---- O(1) DLL helpers ----
-    private void remove(Node n) { n.prev.next = n.next; n.next.prev = n.prev; }
-    private void addFront(Node n){ n.next = head.next; n.prev = head; head.next.prev = n; head.next = n; }
-    private void moveToFront(Node n){ remove(n); addFront(n); }
-}
-```
-
 - **Sentinel head/tail** nodes remove edge-case null checks.
 - `get`, `put`, evict are all **O(1)**.
 - In practice: Java's `LinkedHashMap(accessOrder=true)` implements this; Redis uses **approximate LRU** (sampling) to save memory.
+- Full annotated implementation below.
 
-### The same code, fully annotated
+### The implementation, annotated
 
-Here's the identical logic with a comment on every meaningful line:
+Here's the full class with a comment on every meaningful line:
 
 ```java
 class LRUCache {

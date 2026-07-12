@@ -228,15 +228,7 @@ Because "clustered" means the rows are **physically stored** in that order, and 
 
 > An index that contains **all columns a query needs** → the DB answers from the index alone, **never touching the table**.
 
-```sql
--- Query:
-SELECT email, name FROM users WHERE email = 'a@gmail.com';
-
--- Covering index:
-CREATE INDEX idx_users_email_name ON users (email, name);
-```
-
-👉 No row fetch → much faster. (This is an "index-only scan".)
+👉 No row fetch → much faster. (This is an "index-only scan".) *(Full annotated example in the deep dive below.)*
 
 ### When the index answers the whole question
 

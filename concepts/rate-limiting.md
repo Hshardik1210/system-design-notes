@@ -58,13 +58,6 @@ The chosen field becomes the **key** for that client's private counter. This is 
 
 Count requests per fixed window (e.g. per minute); reset at the boundary.
 
-```
-key = user:123:minute:1010
-INCR key                       # atomic
-if count > limit: reject
-EXPIRE key 60
-```
-
 | Pros | Cons |
 | --- | --- |
 | Dead simple, low memory | **Boundary burst**: 2× limit possible across the edge of two windows |
@@ -110,14 +103,6 @@ In about **one second** you allowed **200 requests** — double the limit — be
 
 Store a **timestamp per request**; count those within the last window.
 
-```
-now = time()
-ZREMRANGEBYSCORE key 0 (now - window)   # drop old
-ZADD key now now
-count = ZCARD key
-if count > limit: reject
-```
-
 | Pros | Cons |
 | --- | --- |
 | **Exact**, no boundary burst | **Memory-heavy** (stores every timestamp); costly at scale |
@@ -158,12 +143,6 @@ Because it stores **one entry per request**, not one number. If a user makes 10,
 ### 3️⃣ Sliding Window Counter (the practical favorite)
 
 Approximate the sliding window by **weighting the previous window's count**.
-
-```
-rate = curr_count
-     + prev_count * (overlap fraction of previous window)
-if rate > limit: reject
-```
 
 | Pros | Cons |
 | --- | --- |
@@ -206,13 +185,6 @@ It **assumes requests were spread evenly** across the previous minute, so it est
 ### 4️⃣ Token Bucket (most popular)
 
 A bucket holds up to `capacity` tokens; tokens **refill at a fixed rate**. Each request consumes one token; empty bucket → reject.
-
-```
-refill: tokens = min(capacity, tokens + rate * elapsed)
-on request:
-    if tokens >= 1: tokens -= 1; allow
-    else: reject
-```
 
 | Pros | Cons |
 | --- | --- |
@@ -266,11 +238,6 @@ A counter asks *"how many so far this minute?"* and resets hard on the boundary.
 ### 5️⃣ Leaky Bucket (queue / shaper)
 
 Requests enter a queue (bucket); processed (leak) at a **constant rate**; overflow → reject.
-
-```
-queue requests; process at fixed rate R
-if queue full: reject
-```
 
 | Pros | Cons |
 | --- | --- |
@@ -364,11 +331,6 @@ Rule of thumb: **token bucket = protect *yourself* while staying responsive; lea
 - Store counters/tokens in **Redis**; use **atomic** ops (`INCR`, or a **Lua script** for token bucket) to avoid races.
 - **Race condition:** read-modify-write across instances → use atomic Redis commands / Lua so the check+decrement is one step.
 - **Latency vs accuracy:** a local in-memory limiter is fast but approximate; a central Redis limiter is accurate but adds a hop. Hybrid: local pre-check + periodic sync.
-
-```lua
--- token bucket in one atomic Redis Lua call (sketch)
--- refill based on elapsed time, then try to consume 1 token
-```
 
 ### Sharing counters across instances
 

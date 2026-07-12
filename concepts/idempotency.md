@@ -175,16 +175,6 @@ No. Idempotency is a promise about **server state**, not about the exact bytes y
 
 > Sometimes you don't need a key at all — you can **design the operation** so retries are harmless. "How would you *make* this idempotent?" is a common follow-up.
 
-### Absolute vs relative updates
-
-```
-balance = balance + 100     ❌ NOT idempotent (each retry adds 100)
-balance = 100               ✅ idempotent (same final value every time)
-
-seat.status = 'BOOKED'      ✅ idempotent (setting to same value)
-counter++                   ❌ NOT idempotent
-```
-
 ### Techniques
 
 | Technique | Example |

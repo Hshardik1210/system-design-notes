@@ -302,11 +302,6 @@ key → first node clockwise = primary; next 2 distinct nodes clockwise = replic
 
 Plain consistent hashing can still overload one node if a **key is hot** or arcs are uneven. **Consistent hashing with bounded loads** caps each node at `(1+ε)·average`; if the target node is "full", the key spills to the next node clockwise → no node exceeds the cap.
 
-### How many virtual nodes?
-
-- Too few → uneven distribution; too many → more memory + slower ring ops.
-- Typical: **~100–200 vnodes per physical node** balances distribution vs overhead.
-
 ### Alternatives
 
 | Technique | Idea | When |
@@ -346,8 +341,6 @@ List<String> replicasFor(String key, int rf) {
 #### Bounded loads — the fix for a hot key
 
 Vnodes even out *arcs*, but a **single hot key** (one product everyone hammers on Black Friday) still lands on one server and can overwhelm it. **Consistent hashing with bounded loads** caps each server at `(1+ε)·average` load; if a key's target server is already "full", the key **spills to the next server clockwise** that has room.
-
-In other words, each server has a capacity cap. If a key's assigned server is already at capacity, the key is placed on the next server clockwise that has room. No single server exceeds its cap; the excess spreads to neighbors.
 
 #### The alternatives, in one breath
 

@@ -2,6 +2,8 @@
 
 > **Core challenge:** **Never double-book a seat.** If two users try to book the same seat, exactly **one** must succeed. Almost every design decision below exists to guarantee this.
 
+> **How to read this doc:** each section has the dense interview summary first, then the deep dive (annotated SQL/flows, plus the exact confusions that come up while learning — look for the `Q:` callouts). Skim the summaries for revision; read the deep dives to actually understand.
+
 ---
 
 ## Contents
@@ -369,6 +371,10 @@ else:
 
 > The DB's **row-level locking + atomic execution** guarantees a single winner — even at the exact same microsecond. **No external locks needed.**
 
+#### Q: Why is a single conditional `UPDATE` safe, but `SELECT` then `UPDATE` isn't?
+
+Because the danger is the **gap** between checking and acting. With two separate statements, all 10 users run their `SELECT` first (everyone sees `AVAILABLE`), *then* their `UPDATE` — so all 10 write. With one `UPDATE ... WHERE status='AVAILABLE'`, the check and the write are the **same, un-interruptible operation**: the database only lets one transaction touch that row at a time, so the first flips it and the other nine now match `0` rows. There's no in-between moment for a second user to sneak into.
+
 ---
 
 ## 11. Pessimistic vs Optimistic Locking
@@ -444,6 +450,10 @@ Our `WHERE status = 'AVAILABLE'` update **is optimistic locking without a versio
 | Best for seat booking | ❌ | ✅ |
 
 > **Mental model:** Pessimistic = "wait your turn." Optimistic = "race, and only one wins."
+
+#### Q: In an interview, which one do I pick — and how do I justify it?
+
+Say **optimistic (condition-based) locking**, and justify it from the *shape* of the problem: seat booking is a **race, not a queue** — thousands of users converge on a few hot seats for a very short operation, and it's fine for the losers to fail fast and pick another seat. Pessimistic `SELECT ... FOR UPDATE` would make 9,999 users *wait* on one locked row (spinners, timeouts, poor scale), which only makes sense when conflicts are rare and blocking is cheap (e.g. banking). One line to land it: *"I don't lock first and make people wait; I attempt the conditional update and let the DB pick a single winner."*
 
 ---
 
@@ -560,6 +570,10 @@ redis.delete("seat_lock:show42:A1")
 > **Edge case:** if the Redis key expires early while U1 is still paying, U2 may grab the Redis lock — but the **DB conditional update still prevents double booking**. The DB is the safety net.
 >
 > **Releasing safely:** delete the Redis key only if you still own it (check value, or use a Lua compare-and-delete) so you don't delete someone else's lock. This is the **Redlock** debate territory — for correctness, the DB is the real guard.
+
+#### Q: If the DB conditional update is already race-proof, why add Redis at all?
+
+Redis isn't there for *correctness* — the DB already guarantees a single winner. It's there to **protect the DB from contention**. On a blockbuster on-sale, tens of thousands of requests can hammer the same few hot seat rows; making all of them reach the database (and fight over row locks) is expensive. The Redis `SET NX` acts as a **cheap front-door gatekeeper** that rejects the obvious losers in-memory, so only the likely winner proceeds to the DB. Think **Redis = fast bouncer, DB = final judge** — you can drop Redis and still be correct, just slower under spikes.
 
 ---
 
@@ -682,6 +696,10 @@ Implementation: client generates a UUID `Idempotency-Key`; server stores it with
 
 If payment fails → release seats (compensation)
 ```
+
+#### Q: Why a saga? Why not wrap all three steps in one DB transaction?
+
+Because step 2 — **payment** — talks to an **external gateway** that can take seconds and might time out or fail unpredictably. You can't hold a database transaction (and its row locks) open across a slow third-party call; it would block hot seats and pile up connections. A saga instead breaks the flow into **separate local steps**, each committed on its own, with a **compensating action** to undo earlier steps if a later one fails (payment fails → release the seats). It's the "no distributed transaction across services" answer: you trade one big all-or-nothing transaction for a sequence of small ones plus explicit undo.
 
 ### If payment is async (event-driven saga)
 

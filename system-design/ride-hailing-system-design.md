@@ -830,18 +830,6 @@ It's a **self-balancing lever** pulling both sides toward equilibrium:
 
 It's the same dynamic as airline or hotel prices rising on peak dates: a higher price nudges some to shift plans and draws more supply, smoothing the crunch.
 
-#### Q: Why "lock the quote"? What's the bug it prevents?
-
-Surge changes every few seconds. If you saw "₹240" on the estimate screen but we recomputed at "Confirm," a surge tick could charge you "₹300" — a nasty surprise. So `estimate` freezes the price into a **`quoteId`** (§4) for a short window; `POST /rides` uses that frozen number.
-
-```
-8:00:00  estimate → surge 1.2×, fare ₹240, quoteId "q_9"   (frozen for 2 min)
-8:00:15  surge in the cell jumps to 1.8× (a burst of requests)
-8:00:20  rider taps Confirm with quoteId "q_9" → still charged ₹240  ✅ (not ₹360)
-```
-
-This makes pricing **predictable and fair**: the number you agreed to is the number you pay, even if the world changed in the 20 seconds you hesitated.
-
 ---
 
 ## 12. Payments

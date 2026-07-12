@@ -106,20 +106,45 @@ Downstream: firing 10M jobs at once can overwhelm targets → rate-limit + jitte
 ## 4. Architecture
 
 ```
-API → Job Store (DB)                 ← submit/cancel/update jobs
-        │
-   ┌────▼────────────────┐
-   │ Scheduler / Poller   │  finds DUE jobs, claims + enqueues   (leader or partitioned)
-   └────┬────────────────┘
-        ▼
-     Queue (Kafka/SQS)     ── decouples scheduling from execution
-        ▼
-   Worker pool  → run job → record result → if recurring, compute + persist next_run
-        ▼
-   Result store (job_runs) + DLQ (exhausted jobs)
+              submit / cancel / update jobs
+                          │ (REST)
+                          ▼
+                  ┌───────────────┐
+                  │  API Service  │
+                  └───────┬───────┘
+                          │ persist job (status=SCHEDULED, next_run=T)
+                          ▼
+       ┌─────────────────────────────────────┐
+       │            Job Store (DB)            │ ◄── durable source of truth
+       │        jobs  ·  job_runs            │
+       └──▲──────────────────────────┬───────┘
+          │                          │  ① poll "who's due?"
+   record │                          │     SELECT … WHERE next_run<=now()
+   result │                          │  ② claim the row (win the race)
+ / next_run                          ▼
+       ┌──┴──────────────────────────────────┐
+       │        Scheduler / Poller  (HA)      │  only ONE fires each job:
+       │      leader election  OR  sharding   │   • leader = single active node
+       └──────────────────┬──────────────────┘   • shard  = owns hash(job_id) slice
+                          │ ③ enqueue due job
+                          ▼
+                 ┌──────────────────────┐
+                 │   Queue (Kafka/SQS)   │  decouples "decide" from "do"; absorbs bursts
+                 └───────────┬──────────┘
+                          │ ④ pull
+                          ▼
+       ┌─────────────────────────────────────┐
+       │             Worker Pool             │  runs the actual job; scales independently
+       └──┬───────────────────────────┬──────┘
+          │ success                    │ failed after N retries
+          │ • record run in job_runs   ▼
+          │ • recurring → compute   ┌─────────┐
+          │   next_run, re-arm      │   DLQ   │  exhausted jobs → inspect / replay
+          └── back to Job Store ──► └─────────┘
 ```
 
 - **Separate scheduling from execution:** the scheduler only decides *what's due* and enqueues; **workers** do the actual work + scale independently (like the Notification system).
+- **Follow the numbers:** ① the scheduler polls the DB for due jobs → ② claims each one so no other scheduler double-fires it → ③ drops it on the queue → ④ a worker pulls and runs it, then writes the result back (and, if recurring, re-arms `next_run`); jobs that exhaust their retries land in the **DLQ**.
 
 ### The three roles
 
@@ -187,13 +212,7 @@ Timing wheel: buckets[0..N-1]; a job at T lands in bucket (T/tick) % N; the curs
   Far-future jobs → a coarser "overflow" wheel, promoted down as time nears (hierarchical).
 ```
 
-> **Common answer:** **DB (durable truth) + time-bucketed index/poll**, or a **Redis ZSET** as a fast due-index backed by the DB. In-process near-term timers use a **timing wheel**.
-
-```
-every tick:
-  due = jobs where next_run <= now() AND status = SCHEDULED   (current bucket)
-  for each due job: claim atomically + enqueue
-```
+> **Common answer:** **DB (durable truth) + time-bucketed index/poll**, or a **Redis ZSET** as a fast due-index backed by the DB. In-process near-term timers use a **timing wheel**. (The per-tick "find due → claim → enqueue" loop is shown as annotated code in the deep dive below.)
 
 ### The "don't scan every job" problem
 
@@ -426,13 +445,7 @@ The **atomic claim above still applies within either** — it's your last line o
 
 ## 7. Recurring Jobs (cron)
 
-```
-On job completion (or at claim time) for a recurring job:
-   next_run = cronParser.next(cron_expr, from = scheduled_time)   # from SCHEDULED time, not now → no drift
-   INSERT/UPDATE the next occurrence with status = SCHEDULED
-```
-
-- Parse the cron expression (Quartz-style) → next fire time; base it on the **scheduled** time to avoid drift.
+- Parse the cron expression (Quartz-style) → next fire time; base it on the **scheduled** time to avoid drift. (The `scheduleNext` re-arm — compute `next_run` from the scheduled time, set status `SCHEDULED` — is shown as annotated code in the deep dive below.)
 - **Missed windows** (system down over a fire time) → policy: **skip**, **run-once-catchup**, or **run-all-missed** (per job).
 - Timezone/DST-aware cron for wall-clock schedules.
 
@@ -498,13 +511,7 @@ void handleMissed(Job job, Instant downSince, Instant backAt) {
 
 ## 8. Retries, Failures & DLQ
 
-```
-job fails → attempt++
-   if attempt < max: reschedule next_run = now + backoff (WITH JITTER)
-   else: status = FAILED → DLQ + alert
-```
-
-- Exponential backoff **with jitter** (avoid a thundering herd of simultaneous retries — see Kafka note).
+- Exponential backoff **with jitter** (avoid a thundering herd of simultaneous retries — see Kafka note). (The `attempt++` → backoff-reschedule-or-DLQ logic is shown as annotated code in the deep dive below.)
 - **DLQ** for jobs that exhaust retries → manual inspection/replay.
 - **Timeouts** — a job running too long → kill + retry (lease expiry handles crashed workers).
 

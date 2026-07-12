@@ -614,7 +614,6 @@ GET user:123   →  hit Redis (RAM)   → answer in microseconds
 ```
 
 - It's not just strings — Redis offers ready-made structures (lists, hashes, **sorted sets** for leaderboards, counters, geo), which is why one line does what'd be a whole subsystem elsewhere.
-- **Key caveat:** Redis is fast for lookups **by key**, not for *searching content*. `GET user:123` is instant; "find users whose name contains 'har'" is a **search** job → Elasticsearch (§10). (And don't confuse **ElastiCache**, the managed Redis cache, with **Elasticsearch**, the search engine.)
 
 #### Q: If it's just RAM, do I lose everything on restart?
 

@@ -346,16 +346,6 @@ o.deleted = true;
 
 Because each op refers to an **absolute id** (not a position that shifts), two replicas can apply the same set of ops in **any order** and still land on identical text. That property is called **commutativity**, and it's the whole magic of CRDTs.
 
-#### Q: OT vs CRDT — what's the actual difference?
-
-| | **OT** | **CRDT** |
-| --- | --- | --- |
-| The trick | Rewrite (transform) shifting **positions** | Give each char a permanent **id** so order doesn't matter |
-| Needs a central server? | **Yes** (one authority orders + transforms) | **No** (ops merge anywhere, even peer-to-peer) |
-| Main cost | Transform functions are hard to write correctly | Extra metadata: every char carries an id + deleted chars linger as tombstones |
-| Great for offline / P2P? | Harder | **Natural fit** |
-| Famous users | Google Docs | Figma, Yjs/Automerge, Apple Notes |
-
 #### Q: What is a "tombstone" and why keep deleted characters around?
 
 A **tombstone** is a character you mark as deleted instead of actually removing. Why keep it? Imagine you delete char `L(4)` while, at the same time, a teammate inserts a character "right after `L(4)`". If you truly erased `L(4)`, their insert would point at a **hole** and merges could disagree. Keeping the tombstone gives every replica a stable anchor so merges stay consistent. The downside: tombstones pile up (memory), so they're **garbage-collected** once every replica has definitely seen the delete (see §14).

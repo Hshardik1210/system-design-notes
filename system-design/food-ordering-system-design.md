@@ -693,16 +693,7 @@ Ephemeral, per-user, in **Redis**. Recompute price/coupons server-side at checko
 
 ### Order placement (synchronous, idempotent)
 
-```
-POST /orders  (Idempotency-Key)
-1. Idempotency check: key seen? → return existing order (no double-charge)
-2. Validate: restaurant open? items available? price unchanged? address serviceable?
-3. Compute total (subtotal + delivery fee + surge − discount)
-4. Create order (status = PENDING_PAYMENT) in ONE transaction
-5. Initiate payment (§15)
-6. On payment success → status = PLACED → emit ORDER_PLACED event (Kafka)
-7. Return confirmation + ETA
-```
+- Idempotency check → validate (restaurant open? items available? price unchanged? address serviceable?) → compute total → create order (`PENDING_PAYMENT`) in one transaction → initiate payment → on success flip to `PLACED` and emit `ORDER_PLACED` → return confirmation + ETA. (Full annotated version in **The checkout, step by step** deep dive below.)
 
 > **Idempotency** (same pattern as the Notification / e-commerce notes): unique `idempotency_key` on `orders` → a retried "Place Order" tap never creates two orders or two charges.
 
@@ -853,16 +844,7 @@ Assign each order to the **best** available rider — minimizing total delivery 
 
 ### Basic flow
 
-```
-On ORDER_PLACED (and when food is nearly ready):
-1. Candidate riders = GEOSEARCH near the restaurant (e.g. within 3 km), status = idle/eligible
-2. Score each candidate:
-      score = f(distance_to_restaurant, direction match, current_load,
-                rider_rating, time_to_food_ready, fairness/earnings)
-3. Offer to the best rider → they accept/reject within N seconds
-4. On reject/timeout → offer to next best
-5. On accept → order.status = RIDER_ASSIGNED, rider.current_order = orderId
-```
+- On `ORDER_PLACED` (and when food is nearly ready): geo-search idle candidate riders near the restaurant (~3 km) → score each (distance, direction match, current load, rating, time-to-food-ready, fairness) → offer to the best with an accept timeout → on reject/timeout offer the next → on accept set `RIDER_ASSIGNED`. (Full annotated version in **Finding the right rider for the job** deep dive below.)
 
 ### Batching (order pooling)
 

@@ -435,18 +435,7 @@ Bob owes Alice 300, Carol owes Bob 300
   → simplify: Carol owes Alice 300 (Bob drops out) → 1 payment instead of 2
 ```
 
-**Algorithm (greedy min-cash-flow):**
-```
-1. Compute each person's NET balance = total_paid_for_others − total_they_owe
-   (creditors: net > 0, debtors: net < 0;  Σ = 0)
-2. Push creditors into a MAX-heap, debtors into a MAX-heap (by abs amount)
-3. Repeat:
-     take biggest creditor C and biggest debtor D
-     amt = min(C.net, |D.net|)
-     record "D pays C amt"; C.net -= amt; D.net += amt
-     drop whoever hit 0; re-push the other
-   until both heaps empty
-```
+**Algorithm (greedy min-cash-flow):** compute each person's net balance, then repeatedly match the biggest creditor with the biggest debtor (max-heaps) and settle the smaller amount until all are zero. (Full annotated Java in the deep dive below.)
 
 **Worked example:**
 ```

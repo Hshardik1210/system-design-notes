@@ -464,14 +464,7 @@ def start_playback(user, video_id):
     }
 ```
 
-Then the player, on its own, talks to the **CDN** (for bytes) and the **DRM license server** (for the key) — never bothering your backend for the actual video:
-
-```
-1. Player → Playback API      : "can I watch video X?"  → gets manifest URL + DRM URL (signed)
-2. Player → CDN (nearest edge): GET manifest → GET segment0, segment1, ...   ← the heavy traffic
-3. Player → DRM license server: "give me the decryption key" (for protected content)
-4. Player                     : decrypt → decode → show pixels; keep ABR loop + send heartbeats
-```
+Then the player, on its own, talks to the **CDN** (for bytes) and the **DRM license server** (for the key) — never bothering your backend for the actual video (the full step-by-step is the summary flow at the top of this section).
 
 #### Q: What's an "entitlement check"? Isn't that just login?
 

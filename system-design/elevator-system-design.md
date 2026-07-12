@@ -106,53 +106,11 @@ Because from a *car's* point of view they're the same thing once assigned: **"a 
 
 ## 3. Class Design
 
-```java
-enum Direction { UP, DOWN, IDLE }
-enum ElevatorState { MOVING, STOPPED, DOORS_OPEN, MAINTENANCE }
+The full class model is spelled out in the annotated walkthrough below.
 
-class Request {                 // unify hall + car calls
-    int floor;                  // source (hall) or target (car)
-    Direction direction;        // for hall calls
-    boolean internal;
-}
+### The classes, annotated
 
-class Elevator {
-    int id;
-    int currentFloor;
-    Direction direction = IDLE;
-    ElevatorState state = STOPPED;
-    TreeSet<Integer> upStops;   // sorted stops going up
-    TreeSet<Integer> downStops; // sorted stops going down
-
-    void addStop(int floor) { /* into up/down set based on position/direction */ }
-    void step() {               // one tick: move toward next stop, open doors if arrived
-        // SCAN: keep going in `direction` serving stops, then reverse
-    }
-}
-
-interface DispatchStrategy {
-    Elevator selectElevator(List<Elevator> elevators, Request hallCall);
-}
-class NearestCarStrategy implements DispatchStrategy { /* min cost by distance+direction */ }
-
-class ElevatorSystem {
-    List<Elevator> elevators;
-    DispatchStrategy dispatcher;
-
-    void requestElevator(int floor, Direction dir) {          // external
-        Elevator e = dispatcher.selectElevator(elevators, new Request(floor, dir));
-        e.addStop(floor);
-    }
-    void selectFloor(int elevatorId, int target) {            // internal
-        elevators.get(elevatorId).addStop(target);
-    }
-    void step() { elevators.forEach(Elevator::step); }         // simulation tick
-}
-```
-
-### The classes, fully annotated
-
-The summary above is the skeleton. Here is the same design **spelled out** so you can see exactly what each field does. Nothing new conceptually — just the blanks filled in.
+Here is the design **spelled out** so you can see exactly what each field does.
 
 First the small value types — an `enum` is just a fixed set of named constants:
 
@@ -265,15 +223,7 @@ class ElevatorSystem {
 The interesting algorithmic part.
 
 - **Per-elevator movement: SCAN / LOOK ("elevator algorithm")** — keep moving in one direction serving all stops, then reverse. Efficient + starvation-free.
-- **Hall-call dispatch (which elevator):** score each elevator by a cost function:
-
-```
-cost(elevator, hallCall) = f(distance to the call,
-                             whether it's already heading that way,
-                             current load / number of pending stops)
-pick the minimum-cost elevator   # NearestCar / "collective control"
-```
-
+- **Hall-call dispatch (which elevator):** score each elevator by a cost function — `cost = f(distance to the call, whether it's already heading that way, current load)` — and pick the minimum-cost elevator (NearestCar / "collective control"). (Full annotated `cost()` in the deep dive below.)
 - Swap strategies (nearest-car, energy-optimized, zoned/express) via **Strategy**.
 
 ### How ONE car decides its route (SCAN / LOOK)

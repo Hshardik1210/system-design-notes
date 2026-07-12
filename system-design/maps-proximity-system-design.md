@@ -271,19 +271,11 @@ You might think: just index `lat` and `lng` and do `WHERE lat BETWEEN ... AND ln
 
 ## 6. Proximity Search ("nearby")
 
-```
-search(lat, lng, radiusKm):
-  level = pick cell precision so the circle spans a few cells
-  cells = [cell(lat,lng,level)] + its neighbor cells        # cover radius + boundaries
-  candidates = union of points in those cells
-  filter: haversine(point, query) <= radius                 # exact distance
-  sort by distance (+ rating/relevance); return top-N
-```
-
 - **Neighbor cells** handle the boundary case (a nearby point can sit in an adjacent cell).
 - **Dense areas (Manhattan):** a cell may hold huge counts → **finer cells (quadtree adapts)** or cap/paginate; adaptively increase precision.
 - **Sparse areas / large radius:** widen to coarser cells so you don't query thousands.
 - **Static places** → precompute a geo-index (S2/PostGIS/Elasticsearch geo), **cache hot cells**.
+- Full annotated `searchNearby()` in the deep dive below.
 
 ### The two-step approach (narrow, then measure)
 

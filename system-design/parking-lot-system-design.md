@@ -413,16 +413,7 @@ No — and cramming all ten in is a red flag. Lead with the five that genuinely 
 
 ## 5. Spot Assignment Strategy
 
-```
-parkVehicle(vehicle):
-    for floor in floors (nearest-to-entry first):
-        spot = assignmentStrategy.find(floor, vehicle)   # smallest compatible free spot
-        if spot and spot.assign(vehicle):                # atomic CAS FREE→OCCUPIED
-            return issueTicket(vehicle, spot)
-    throw ParkingFullException(vehicleType)
-```
-
-Assignment strategies (swappable): **best-fit** (smallest compatible spot — maximizes utilization), **nearest to gate**, **by floor preference**, **EV-first for EVs**.
+Assignment strategies (swappable): **best-fit** (smallest compatible spot — maximizes utilization), **nearest to gate**, **by floor preference**, **EV-first for EVs**. (The `parkVehicle` flow — walk floors → `find` a compatible spot → atomic CAS claim → issue ticket, else `ParkingFullException` — is shown as annotated code in the deep dive below.)
 
 ### How a spot actually gets chosen
 
@@ -453,7 +444,7 @@ class BestFitStrategy implements SpotAssignmentStrategy {
 
 #### The full park flow, annotated
 
-The pseudocode at the top of this section, written out:
+The full `parkVehicle` flow, written out:
 
 ```java
 Ticket parkVehicle(Vehicle vehicle) {

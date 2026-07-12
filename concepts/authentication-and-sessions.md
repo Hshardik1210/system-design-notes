@@ -439,11 +439,6 @@ It's a tiny, in-memory Redis GET (sub-millisecond), so it's *fast* — but it's 
 6. Logout → server DELETES the refresh token → user can't get new access tokens
 ```
 
-### Why short access + long refresh?
-
-- Long-lived access token → if **stolen**, attacker has access for the whole lifetime ❌.
-- Short access + controllable refresh → **security + usability balance** ✅.
-
 ### Why split into short access + long refresh
 
 You issue two tokens with different jobs:

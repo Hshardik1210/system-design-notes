@@ -611,10 +611,6 @@ Reserve inventory   reserve stock    release stock
 Charge payment      charge card      refund
 ```
 
-#### Q: Why not just use a distributed transaction (2PC)?
-
-2PC *can* make several systems commit atomically, but it does so by holding **locks** on every participant while a central **coordinator** runs a prepare→commit handshake. That blocks, scales poorly, and if the coordinator dies mid-protocol everyone is stuck (a single point of failure). At scale we prefer the saga: each step commits **independently and immediately**, and we clean up failures with compensations. We trade *strong atomic* consistency for *eventual* consistency plus high availability.
-
 #### Q: If steps already committed, "rollback" isn't a real rollback — right?
 
 Correct, and this is the mental leap. A saga does **not** rewind time like a database `ROLLBACK`. The order really was created; the inventory really was reserved. Compensation issues **new forward actions** that *semantically* cancel the old ones (a refund is a new transaction, not an erasure of the charge). The end state looks "as if nothing happened," but the history shows both the action and its compensation.
@@ -837,10 +833,6 @@ void onPaymentFailed(OrderEvent e) {
 
 - **Orchestration** when the flow is **complex, has many steps, or needs clear visibility/debugging** — one place holds the state machine, so it's easy to see "we're stuck on CHARGE_PAYMENT." Slightly tighter coupling (services must expose commands), and the orchestrator must persist its state (see the subsection above). Tools: Temporal, Camunda, AWS Step Functions.
 - **Choreography** when you want **loose coupling and few steps** — services just publish/subscribe to events and don't know about each other. Great for autonomy, but the workflow is **implicit and spread across services**, which makes it hard to debug ("who's supposed to react next?") and easy to accidentally create event spaghetti.
-
-#### Q: "Distributed vs centralized control" — what does that actually mean here?
-
-In **choreography** the decision logic is *distributed*: each service independently decides its next move from the events it sees. In **orchestration** it's *centralized*: one orchestrator decides every next move. Same steps, same compensations — the only question is whether the "what happens next" logic lives in one brain or is scattered across many.
 
 ---
 
