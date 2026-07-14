@@ -21,10 +21,13 @@
 - [11. API Design](#11-api-design)
 - [12. Sequences](#12-sequences)
 - [13. Consistency & Edge Cases](#13-consistency--edge-cases)
-- [14. Design Patterns (that can be used)](#14-design-patterns-that-can-be-used)
-- [15. Scaling & Failure](#15-scaling--failure)
-- [16. Interview Cheat Sheet](#16-interview-cheat-sheet)
-- [17. Final Takeaways](#17-final-takeaways)
+- [14. Scaling & Failure](#14-scaling--failure)
+- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
+- [16. Reels](#16-reels)
+- [17. Consistency & CAP Tradeoffs](#17-consistency--cap-tradeoffs)
+- [18. How to Drive the Interview (framework)](#18-how-to-drive-the-interview-framework)
+- [19. Design Patterns (that can be used)](#19-design-patterns-that-can-be-used)
+- [20. Final Takeaways](#20-final-takeaways)
 
 ---
 
@@ -58,11 +61,11 @@ The two halves map to the two subsystems:
 - The **media pipeline** takes your original photo, produces several sizes of it, and distributes copies to CDN edges worldwide so delivery is fast.
 - The **feed** decides *which* posts land in your feed based on who you follow. That's fan-out + ranking.
 
-#### Q: Why compare it to both Twitter *and* YouTube — isn't that two systems?
+### Why compare it to both Twitter and YouTube
 
-Yes, and that's the whole point. Most feed apps (Twitter) are text-first, so they're "just" a fan-out problem. Most video apps (YouTube) are media-first, so they're "just" a pipeline + CDN problem. Instagram is unusual because it's **genuinely both at once** — heavy media *and* a personalized follow feed. When interviewing, saying "this is YouTube's media half plus Twitter's feed half" instantly shows you see the shape of the problem.
+It looks like two systems bolted together, and that's the whole point. Most feed apps (Twitter) are text-first, so they're "just" a fan-out problem. Most video apps (YouTube) are media-first, so they're "just" a pipeline + CDN problem. Instagram is unusual because it's **genuinely both at once** — heavy media *and* a personalized follow feed. When interviewing, saying "this is YouTube's media half plus Twitter's feed half" instantly shows you see the shape of the problem.
 
-#### Q: What's a "unidirectional follow graph" and why does it matter?
+### The unidirectional follow graph
 
 - **Bidirectional (Facebook friends):** if we're friends, I see your posts and you see mine — it's mutual, always symmetric.
 - **Unidirectional (Instagram/Twitter follow):** I can follow a celebrity who has *no idea I exist*. The arrow goes one way.
@@ -95,9 +98,9 @@ Strong consistency  → "everyone sees the exact same thing at the exact same in
 Eventual consistency → "everyone converges to the same thing within a few seconds"  (social feeds) — cheap, fast
 ```
 
-#### Q: Why does "read-heavy" change the design so much?
+### Why "read-heavy" changes the design so much
 
-Because for every *one* time you post a photo, that photo might be *viewed* millions of times. So:
+For every *one* time you post a photo, that photo might be *viewed* millions of times. So:
 
 ```
 writes (uploads)  : rare-ish
@@ -153,7 +156,7 @@ posts table row:  { post_id: 42, author: 7, caption: "sunset", media_url: "https
                                                                 └── just a string; the 3 MB file lives in S3+CDN
 ```
 
-#### Q: What does "the origin is barely touched" mean?
+### What "the origin is barely touched" means
 
 The **origin** = your own blob store (the master copy). The **CDN** = hundreds of cache servers near users. When 10M people view a photo, the CDN serves ~9.99M of them from a nearby edge cache; only the *first* request in each region ("cache miss") reaches your origin. So your own servers see a tiny trickle of the actual view traffic. That's how a startup-sized origin can survive Instagram-sized read volume.
 
@@ -189,7 +192,7 @@ At first this box-diagram looks like overkill — why not one big program? Becau
 | **Story Service** | Stories with 24h TTL | Ephemeral data, different lifecycle |
 | **Explore/Search** | Recommend content you don't follow | ML + search index (Elasticsearch) |
 
-#### Q: What is Kafka doing sitting in the middle of all this?
+### What Kafka is doing sitting in the middle of all this
 
 Kafka is a **message queue / event log**. When something happens, a service **publishes an event** to Kafka instead of directly calling ten other services. Everyone interested **subscribes**.
 
@@ -202,9 +205,9 @@ You post a photo →  Post Service drops a "POST_CREATED" event on Kafka
  (put in feeds)    (make searchable)   (tell followers)    (count it)
 ```
 
-Why this is huge: the Post Service doesn't need to *know* about search, notifications, or analytics. It just shouts "new post!" and moves on. You can add a new listener (say, a fraud detector) **later without changing the Post Service at all**. This decoupling is the **Observer / Pub-Sub** pattern (§14).
+Why this is huge: the Post Service doesn't need to *know* about search, notifications, or analytics. It just shouts "new post!" and moves on. You can add a new listener (say, a fraud detector) **later without changing the Post Service at all**. This decoupling is the **Observer / Pub-Sub** pattern (§19).
 
-#### Q: Isn't calling other services directly simpler?
+#### Q: Isn't calling other services directly simpler than routing everything through Kafka?
 
 For 2 services, yes. For 10 services during a traffic spike, no — direct calls create a fragile web where one slow service stalls everyone. Kafka acts as a **buffer**: if the notification service is down, events pile up safely in Kafka and get processed when it recovers, instead of failing the user's upload.
 
@@ -241,7 +244,7 @@ The signature part (shares DNA with the Video Streaming note).
 
 The upload is decoupled from processing: the client uploads the original quickly and gets a response immediately, while the heavy work (making sizes, transcoding) happens afterward in the background. **Fast drop-off now, processing later.**
 
-#### Q: What is a "pre-signed upload URL" and why not just upload to the Media Service?
+### Pre-signed upload URLs — why not just upload to the Media Service?
 
 A pre-signed URL is a **temporary, permission-stamped link straight into the blob store** (S3). The Media Service says "here's a link that lets you PUT one file into this exact spot for the next 10 minutes," and the client uploads the big file *directly to S3* — the file bytes never pass through your app servers.
 
@@ -257,7 +260,7 @@ httpClient.put(res.url, fileBytes);   // 3 MB goes S3-direct — app servers unt
 
 Why: routing every 3 MB (or 300 MB video) upload *through* your servers would waste their bandwidth and CPU. Pre-signed URLs let S3 absorb the heavy lifting. Your server only handles the tiny "give me a URL" request.
 
-#### Q: What actually happens after the file lands in S3?
+### What happens after the file lands in S3
 
 An event fires and **background workers** do the slow work. Here's the pipeline in code shape:
 
@@ -286,12 +289,12 @@ public void process(MediaUploadedEvent e) {
 
 **Why make multiple sizes up front?** So each screen downloads only what it needs. Sending a 3 MB full-res photo to fill a 150px profile-grid thumbnail wastes ~95% of the bytes. Pre-making a `thumb` means the grid loads instantly.
 
-#### Q: What's blurhash, and what's EXIF stripping?
+### Blurhash and EXIF stripping
 
 - **Blurhash** = a ~30-character string that encodes a *blurry* version of the image. The app shows that instant colored blur while the real photo downloads, so you never stare at a blank gray box. (Think of it as a "loading preview" baked into the metadata.)
 - **EXIF stripping** = photos secretly embed the **GPS location and camera model** in their metadata. Instagram deletes that before publishing so you don't accidentally leak your home address in a selfie. Pure privacy.
 
-#### Q: Why "parallel + retryable"? What if transcoding fails?
+### Why "parallel + retryable" — what happens if transcoding fails
 
 Each variant is an independent task, so many workers crunch them **in parallel** (fast). And media work is flaky (a transcode can OOM or time out), so each task is **retryable** — if the `full` size fails, that *one* task re-runs without redoing the others. After N failures the post is marked `FAILED` and the user is told. This is the **Producer-Consumer** pattern: Kafka holds the "to-do" jobs, a pool of workers consumes them.
 
@@ -313,7 +316,7 @@ Without CDN:  user in Tokyo ──────── 10,000 km ─────�
 With CDN:     user in Tokyo ─► CDN edge in Tokyo (already has the photo)            (fast, 10ms)
 ```
 
-#### Q: How does a file get to the Tokyo edge in the first place?
+### How a file gets to the Tokyo edge in the first place
 
 Lazily, on the **first** request (a "cache miss"):
 
@@ -325,9 +328,9 @@ Lazily, on the **first** request (a "cache miss"):
 
 So the origin is hit **once per region per file**, and the CDN absorbs the millions of repeat reads. That's why "origin barely touched" (§3).
 
-#### Q: Why "serve the right size per context"?
+### Why "serve the right size per context"
 
-Because bandwidth is the #1 cost. The client requests a *different variant URL* depending on where the image appears:
+Bandwidth is the #1 cost. The client requests a *different variant URL* depending on where the image appears:
 
 ```java
 String urlFor(Post p, DisplayContext ctx) {
@@ -341,20 +344,38 @@ String urlFor(Post p, DisplayContext ctx) {
 
 Showing the `thumb` in a grid of 30 photos downloads ~300 KB total instead of ~90 MB of full-res. Massive savings, multiplied by billions of views.
 
-#### Q: What does "immutable URLs → cache forever" mean? And signed URLs?
+### Immutable URLs → cache forever, and signed URLs
 
 - **Immutable URL:** each processed variant gets a **unique URL that never changes its content** (e.g. `.../42_feed_v1.jpg`). Because the bytes at that URL will *never* change, the CDN can cache it essentially forever (long TTL) — no need to re-check the origin. If you edit the media, you publish a *new* URL, you never overwrite the old one.
 - **Signed URL:** for **private** content, the URL carries a short-lived cryptographic signature (`?expires=...&sig=...`). Without a valid, unexpired signature the CDN refuses to serve the file — so a leaked link stops working after a few minutes. Public posts skip this; private posts and Stories use it.
 
-#### Q: What's "adaptive bitrate (HLS)" for video?
+### Adaptive bitrate (HLS) for video
 
 Instead of one video file, you store the same video at several qualities (360p, 720p, 1080p) chopped into small chunks. The player **switches quality on the fly** based on your network: on strong Wi-Fi it grabs 1080p chunks; when you walk into an elevator and Wi-Fi drops, it seamlessly downgrades to 360p so playback never stalls. (Same idea as the Video Streaming note.)
+
+### CDN cache invalidation when a post is deleted
+
+Because media URLs are immutable and cached with a long TTL, deleting a post can't rely on "the cache will expire soon" — the edge might hold that photo for days.
+
+> ⚠️ **pitfall:** a **CDN purge** (telling every edge to drop a URL) is slow and rate-limited — you cannot purge millions of URLs synchronously on every delete, and a global purge can take seconds to minutes to propagate. Never block the delete request on it.
+
+The practical approach separates *access control* from *cache cleanup*:
+
+```
+1. Delete → flip post to tombstoned in DB (instant; feed hydration now filters it out, §13)
+2. For PRIVATE/sensitive media → issue an async CDN purge for those specific URLs
+3. For public media → let it age out via TTL; the tombstone already hides it from every feed/profile
+```
+
+So the *authoritative* "it's gone" happens at the DB (hydration skips it immediately); the CDN purge is a **best-effort async cleanup**, not the enforcement point. Signed-URL content is doubly safe — even a still-cached object stops serving once its signature expires.
 
 ---
 
 ## 7. Follow Graph & Feed (fan-out + ranking)
 
 Unidirectional **follow** graph + **fan-out** feed (same trade-offs as Twitter; see [Fan-Out / Fan-In](../concepts/fan-out-fan-in.md)).
+
+> 💡 **tip:** "**fan-out on write**" = do the work *when someone posts* (copy the post into followers' feeds). "**fan-out on read**" = do the work *when someone opens the app* (gather followees' posts live). Whenever you hear "fan-out," ask *"at write time or read time?"* — that single question frames the entire feed design.
 
 | Model | Trade-off |
 | --- | --- |
@@ -397,6 +418,8 @@ void fanOutOnWrite(Post post) {
 
 - ✅ **Reads are instant** — the feed is already built. Perfect for a read-heavy app.
 - ❌ **Writes explode for popular accounts.** If a celebrity with 100M followers posts, this loop does **100 million writes** for one post. That's **write amplification** — the killer problem.
+
+> ⚠️ **pitfall:** never fan-out-on-write **synchronously** inside the post request. Even for a normal account with a few thousand followers, doing thousands of Redis writes before returning would make posting feel slow. Fan-out runs **async off `POST_CREATED`** (Kafka) — the user's post returns instantly and feeds fill in a beat later.
 
 #### Fan-out on READ (pull) — do the work when you open the app
 
@@ -456,7 +479,7 @@ FeedItem hydrate(long postId) {
 
 Bonus: this is the **CQRS + Materialized View** pattern — the precomputed feed is a fast read-model; the source-of-truth posts live separately.
 
-#### Q: What is "ranking" and why not just show newest-first?
+### Ranking — why not just show newest-first
 
 Newest-first (pure chronological) buries good posts under noise. **Ranking** scores each candidate post and sorts best-first using signals like:
 
@@ -466,7 +489,7 @@ score = f(recency, engagement (likes/comments), affinity (how much you interact 
 
 That's the "ML rank" box. It's why your feed shows your best friend's photo above a stranger's, even if the stranger posted more recently.
 
-#### Q: How do private accounts fit in?
+### How private accounts fit in
 
 A follow row has a `status`: `PENDING` or `ACCEPTED`. For a **private** account, a new follow starts as `PENDING` and the owner must **approve** it. Fan-out only pushes a post to followers whose follow is `ACCEPTED`:
 
@@ -477,6 +500,22 @@ List<Long> followers = graph.followersOf(authorId).stream()
 ```
 
 So requesting to follow a private account does **not** let you see their posts until they tap "Approve."
+
+### Push notifications are just another fan-out
+
+Likes, comments, new-follower alerts, and "someone you follow just posted" pushes are **the same fan-out problem wearing a different hat**: an event happens, and it must reach N interested devices. They ride the exact same event backbone as the feed.
+
+```
+LIKE / COMMENT / FOLLOW / POST_CREATED on Kafka
+        │
+        ▼
+ Notification service → build message → device-token store → APNs (iOS) / FCM (Android)
+```
+
+- **Targeted events** (like/comment/follow) fan out to **one** recipient — trivial.
+- **"New post from someone you follow"** has the *same celebrity skew* as the feed: a celebrity posting could notify 100M people. So the same **hybrid** instinct applies — throttle/batch/coalesce (e.g. "3 people you follow posted") and treat these as **best-effort**, not guaranteed.
+
+> 💡 **tip:** notifications are **fire-and-forget over Kafka** — if the push service is briefly down, events buffer and drain later; a lost like-notification is annoying, not a correctness bug. Contrast with the feed, which is rebuildable from source-of-truth data.
 
 ---
 
@@ -498,13 +537,15 @@ Story = media with expires_at = created_at + 24h
 
 - View-state writes are huge (every view of every story) but **ephemeral** → cheap store + TTL.
 
+> 💡 **tip:** **TTL** (time-to-live) = "auto-delete after N seconds." Stamp `expires_at` once and the data cleans *itself* up — you never write a per-item deletion timer. It's the recurring trick for anything short-lived (Stories, story-views, feed cache entries).
+
 ### Stories = posts with a 24h expiry
 
 A Story is basically a post that **auto-deletes after 24 hours**. That one twist (temporary) changes how you store it.
 
 Because a Story is temporary, you don't need the permanent, carefully-archived storage a normal post gets — you just need it *fast* while it's live, then let it expire.
 
-#### Q: How does "expires after 24h" actually work?
+### How "expires after 24h" actually works
 
 You don't run a timer per story. You just **stamp an `expires_at` timestamp** and let two mechanisms handle it:
 
@@ -521,7 +562,7 @@ s.setExpiresAt(now().plusHours(24));   // the self-destruct time is just a colum
 
 So "expiry" = *filter out expired ones on read* + *a janitor cleans up later*. Simple and cheap.
 
-#### Q: What's the "stories tray" and how is it built?
+### The "stories tray" and how it's built
 
 The tray = that row of circles at the top of the app (one per person you follow who has an active story). It's assembled at read time from your followees' unexpired stories, grouped by author, with **unseen ones shown first** (that's why the colorful ring means "unwatched"):
 
@@ -537,7 +578,7 @@ List<StoryBubble> tray(long userId) {
 }
 ```
 
-#### Q: "View-state writes are huge but ephemeral" — what does that mean?
+### "View-state writes are huge but ephemeral"
 
 Instagram tracks **who viewed each story** (to show you the "seen by" list and the unseen ring). Every single view of every single story = a write. That's an enormous write volume. But here's the relief: that data only matters for 24 hours, then it's garbage.
 
@@ -548,6 +589,28 @@ story_views keyed by (story_id, viewer_id)  →  written on every view (huge vol
 ```
 
 Because it's short-lived, you can use a cheap, fast, write-optimized store and never worry about it piling up forever — the TTL is your free garbage collector.
+
+### The TTL sweeper, mechanically
+
+"Expired" content is hidden **the instant it's stale** (the `expires_at > now()` filter on read), but the *bytes and rows* still need reclaiming. Two layers do that, and it's worth knowing which does what:
+
+| Layer | Mechanism | Reclaims |
+| --- | --- | --- |
+| **Cache (Redis)** | native per-key **TTL** — Redis evicts on its own | tray/view-state cache entries |
+| **DB rows** | a **sweeper** job scans `WHERE expires_at < now()` in batches and deletes | `stories` / `story_views` rows |
+| **Blob media** | sweeper enqueues the media keys → async blob delete + CDN age-out | the actual image/video bytes |
+
+```java
+@Scheduled(fixedDelay = 60_000)   // every ~1 min, like a cron
+void sweepExpiredStories() {
+    List<Story> dead = stories.findExpired(now(), /*batch*/ 1000);  // WHERE expires_at < now()
+    for (Story s : dead) blob.enqueueDelete(s.mediaRef());          // reclaim bytes async
+    stories.deleteAll(dead);                                        // reclaim rows
+    // story_views rows expire with their story (same TTL) → self-cleaning
+}
+```
+
+Key point: **correctness never depends on the sweeper running on time.** Reads already filter by `expires_at`, so a story is invisible the moment it expires even if the janitor is late — the sweeper only reclaims space, it isn't the enforcement point (same philosophy as the CDN purge in §6).
 
 ---
 
@@ -563,7 +626,7 @@ Your **home feed** shows people you *chose* to follow. **Explore** shows content
 
 Explore surfaces content from accounts you don't follow, chosen by a recommender based on what you've engaged with — the mechanism that drives discovery.
 
-#### Q: How does it decide what to show a stranger's content to me?
+### How it decides which strangers' content to show you
 
 Two stages — **candidate generation** then **ranking** (a very common recommender-system shape):
 
@@ -583,14 +646,54 @@ List<Post> explore(long userId) {
 
 Stage 1 is fast-and-rough (get ~1000 maybes); Stage 2 is slow-and-precise (rank them well). You do the expensive ranking on only the survivors, not the whole catalog.
 
-#### Q: What's Elasticsearch / "embedding similarity" doing here?
+### What Elasticsearch and "embedding similarity" are doing here
 
 - **Elasticsearch** = a search engine that finds posts by text/hashtag/caption quickly.
 - **Embeddings** = each post (and each user's taste) is turned into a list of numbers (a vector) capturing "what it's about." Two posts with **nearby vectors** are similar in vibe, even without shared words. "Similar to what you liked" = "find posts whose vector is close to yours." This is rebuilt continuously as new posts and new engagement flow in.
 
+> 💡 **tip:** an **embedding** is just "meaning as coordinates." A model reads a photo/caption and outputs, say, 256 numbers so that *similar content lands near each other in space*. "Recommend more like this" then becomes a geometry problem: **find the nearest vectors** — no keywords required.
+
+#### Q: How does the two-stage recommender actually work, and is this Elasticsearch or a vector DB?
+
+Explore (and modern feed ranking) is a **two-stage funnel**, because you can't run an expensive ML model over billions of posts per request:
+
+```
+Stage 1 — CANDIDATE GENERATION (cheap, wide):  billions of posts → ~1,000 plausible ones
+   sources: trending, hashtags/topics, "users like you liked", and
+            ANN vector search ("posts near your taste embedding")
+Stage 2 — RANKING (expensive, narrow):         ~1,000 → ranked top ~50
+   a heavier ML model scores predicted engagement (p(like), p(save), watch-time)
+   using rich features (affinity, freshness, media type, author quality)
+```
+
+The point of the split: **be rough-and-cheap on the many, precise-and-costly on the few.** You only pay for the good ranking model on the ~1,000 survivors, never on the whole catalog.
+
+Which store powers Stage 1 depends on the *kind* of match:
+
+| Need | Store | Why |
+| --- | --- | --- |
+| Text / hashtag / caption lookup, faceted filters | **Elasticsearch** | inverted index — great at "posts tagged #sunset in the last day" |
+| "Semantically similar to this" (embedding nearest-neighbor) | **Vector DB / ANN index** (FAISS, Milvus, pgvector, ES kNN) | indexes vectors for **approximate nearest-neighbor (ANN)** search — finds close vectors in ms |
+
+In practice they're **complementary, not either/or**: ES handles keyword/lexical recall, the vector index handles semantic recall, and their candidate sets are merged before ranking. (Newer Elasticsearch even offers native kNN, blurring the line — but "text search → ES, similarity search → vector index" is the clean interview answer.)
+
 ---
 
 ## 10. Data Model (all tables)
+
+### Database & storage choices (which DB, and why at scale)
+
+No single database is best for every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question for the core data is always *"does this need strong consistency and transactions?"* User/post/follow metadata does (a follow must not silently double-insert, a post's counters must reconcile) — an RDBMS is the source of truth there. Everything derived or oversized (media bytes, feeds, search) goes elsewhere.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Users, posts (metadata), follows, likes, comments (**source of truth**) | **RDBMS** (sharded by `user_id`/`author_id`) | Structured rows with real relationships (`follows`, `likes` composite keys) and moderate write volume (100M posts/day is trivial per-shard) — ACID gives "one like per user" and "no duplicate follow" for free via primary keys. | Cassandra would need the app to hand-roll the uniqueness/dedup logic (`PRIMARY KEY(user_id, post_id)`) that a relational PK gives natively; not worth it until write volume outgrows a sharded RDBMS (§14 discusses this ceiling). |
+| Photo/video bytes, HLS renditions | **Blob store + CDN** (S3/CloudFront) | Multi-GB video and multi-size image variants are exactly what object storage + edge caching is built for — cheap, durable, served from the edge close to the viewer. | Storing bytes in the DB (even as `BLOB`) bloats every backup/replica and kills cache locality — the DB should hold a **pointer** (`variants JSONB`), never the pixels. |
+| Precomputed home feed, stories tray, hot counters | **Redis** (sorted sets) | Feed reads happen on every app open — millions/sec — and must return in single-digit ms. A **sorted set** (`feed:{userId}`) keeps post ids pre-ordered by time/rank so "give me my feed" is one `ZREVRANGE`, no query. | Re-querying `posts` + `follows` and joining on every feed load doesn't survive Instagram's read fan-out; the feed is derived/rebuildable, so it's safe to keep it in a fast, lossy cache instead of the durable store. |
+| Explore/search (users, hashtags, captions) | **Elasticsearch** | Full-text + faceted browse (hashtags, captions, trending) needs an inverted index, not `LIKE '%...%' ` scans. Rebuilt from the RDBMS via CDC, so it's a disposable read model. | The RDBMS has no relevance ranking or tokenized text search at this scale; ES is the CQRS read side dedicated to that job. |
+| Feed at extreme scale (optional) | **Cassandra** | If a single sharded RDBMS ever can't keep up with post-metadata write throughput (not likely at 100M posts/day, but relevant past that), Cassandra's LSM engine absorbs huge write volume with tunable consistency. | Reaching for Cassandra by default sacrifices the transactional guarantees (dedup, referential sanity) the RDBMS gives essentially free — only adopt it once write throughput, not correctness, is the bottleneck. |
+
+**Why RDBMS wins for the core graph/metadata, and how it scales:** the follow graph and post metadata need exact-once semantics (no duplicate follow, no double count) that eventually-consistent stores don't give without extra engineering — and the actual write volume (posts, follows, likes) is well within what a **sharded RDBMS** handles. We shard by `user_id` (§14: "shard = userId % N") so a user's own follows/posts/likes co-locate on one shard, keeping single-user reads/writes to a single machine; celebrities' massive *follower* counts are the skew case, handled by keeping fan-out hybrid (push+pull) rather than by resharding. Reads scale further with **read replicas** behind Redis — the DB is rarely hit for a feed render at all. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 CREATE TABLE users ( user_id BIGINT PRIMARY KEY, username VARCHAR(50) UNIQUE, name TEXT,
@@ -638,6 +741,18 @@ CREATE TABLE notifications ( notif_id BIGINT PRIMARY KEY, user_id BIGINT, type V
 
 > **Tables to consider:** users, follows, posts, post_media, likes, comments, stories, story_views, hashtags, post_hashtags, notifications, precomputed feeds (Redis), explore/search index (ES). DMs = separate chat system.
 
+### Indexes that matter
+
+A handful of indexes carry the hot paths; call these out explicitly in an interview:
+
+- **`follows(followee_id)` where `status='ACCEPTED'`** — the **fan-out** index: "who follows this author?" Without it, every post would scan the whole `follows` table. The `WHERE status='ACCEPTED'` makes it a **partial index** so pending requests are never even scanned.
+- **`follows(follower_id, followee_id)`** (the PK) — the *other* direction: "who do I follow?" for the pull path and profile checks.
+- **`posts(author_id, created_at DESC)`** — powers a profile grid and the celebrity **pull** ("recent posts by author"), and keeps them time-ordered without a sort.
+- **`stories(author_id, expires_at) where expires_at > now()`** — a **partial index** on *only live stories*, so tray assembly touches a tiny set instead of every story ever posted.
+- **`likes(user_id, post_id)`** / **`story_views(story_id, viewer_id)`** (PKs) — the composite keys double as dedup ("one like per user", "one view row per viewer").
+
+> 💡 **tip:** a **partial index** only indexes rows matching a predicate (`WHERE status='ACCEPTED'`, `WHERE expires_at > now()`). It stays small and fast *and* it stops the query from ever considering the irrelevant rows — the perfect fit for "only accepted follows" and "only live stories."
+
 ### Reading the schema
 
 Each table maps to one real-world thing. Walk through them as "who / what / relationships":
@@ -652,9 +767,9 @@ Each table maps to one real-world thing. Walk through them as "who / what / rela
 | `stories` / `story_views` | ephemeral content + who saw it | `expires_at` = the 24h self-destruct |
 | `hashtags` / `post_hashtags` | tags and the many-to-many link | powers search/Explore |
 
-#### Q: Why is `follows` keyed `(follower_id, followee_id)` and indexed on `followee_id`?
+### Why `follows` is keyed `(follower_id, followee_id)` and also indexed on `followee_id`
 
-Because you ask the graph **two opposite questions**, and each needs its own fast lookup:
+You ask the graph **two opposite questions**, and each needs its own fast lookup:
 
 ```sql
 -- "Who do I follow?" (build MY feed by pulling) → uses the primary key's follower_id
@@ -666,9 +781,9 @@ SELECT follower_id FROM follows WHERE followee_id = :author AND status = 'ACCEPT
 
 Without the second index, fanning out a post would require scanning the entire follows table. The `WHERE status='ACCEPTED'` in the index definition is a **partial index** — it only indexes accepted follows, so fan-out never even looks at pending requests.
 
-#### Q: Why does `posts` have NO image data, just a `status` and counts?
+### Why `posts` has no image data — just a `status` and counts
 
-Because (from §3) bytes live in blob+CDN, not the DB. The `posts` row is the tiny "fact card":
+As established in §3, bytes live in blob+CDN, not the DB. The `posts` row is the tiny "fact card":
 
 ```sql
 -- This is the WHOLE post row — notice: no image bytes, just a pointer lives in post_media
@@ -678,7 +793,7 @@ post_id | author_id | caption   | type  | status | like_count | created_at
 
 `status` matters because uploads are async (§5): the row is created as `PROCESSING`, and feeds **exclude** it until media finishes and it flips to `READY`. That's the **State** pattern guarding the post's lifecycle.
 
-#### Q: What does the `variants JSONB` in `post_media` hold?
+### What the `variants JSONB` in `post_media` holds
 
 The map of size → CDN URL, so hydration (§7) can pick the right one per context:
 
@@ -713,9 +828,9 @@ GET  /v1/explore
 
 The APIs mirror the design decisions above. Two patterns stand out.
 
-#### Q: Why is posting a photo TWO calls (upload-url then posts)?
+### Why posting a photo is TWO calls (upload-url then posts)
 
-Because of the decoupled upload-then-process flow (§5). You **can't** cram a 3 MB (or 300 MB video) upload into a normal JSON API call — so it's split:
+This follows the decoupled upload-then-process flow (§5). You **can't** cram a 3 MB (or 300 MB video) upload into a normal JSON API call — so it's split:
 
 ```
 1. POST /v1/media/upload-url      → server returns a pre-signed S3 link + a mediaId
@@ -726,7 +841,7 @@ Because of the decoupled upload-then-process flow (§5). You **can't** cram a 3 
 
 So the API "create post" call is tiny and instant; the heavy upload goes S3-direct, and processing happens in the background. The client polls or gets notified when `status` becomes `READY`.
 
-#### Q: What's `?cursor=` in `GET /v1/feed?cursor=`?
+### Cursor-based pagination — `?cursor=` in `GET /v1/feed?cursor=`
 
 **Cursor-based pagination.** Instead of "page 1, page 2" (which breaks when new posts shift everything), each response returns a **cursor** — a bookmark pointing at "where you stopped." The next request passes it back to continue from exactly there:
 
@@ -737,9 +852,9 @@ GET /v1/feed?cursor=eyJ...    → next 20 posts after the bookmark, no dupes/ski
 
 This is the right choice for infinite-scroll feeds where new content constantly arrives at the top — page numbers would show duplicates or gaps; a cursor stays stable.
 
-#### Q: Why separate `follow` and `follow-requests/{id}/approve`?
+### Why `follow` and `follow-requests/{id}/approve` are separate endpoints
 
-Because of private accounts (§7). Following a **public** account is instant (`POST /follow` → ACCEPTED). Following a **private** account creates a `PENDING` request that the owner must act on — hence a distinct `approve` endpoint they call. Two different real actions → two different endpoints.
+This follows from private accounts (§7). Following a **public** account is instant (`POST /follow` → ACCEPTED). Following a **private** account creates a `PENDING` request that the owner must act on — hence a distinct `approve` endpoint they call. Two different real actions → two different endpoints.
 
 ---
 
@@ -791,9 +906,9 @@ The reason your photo sometimes shows "posting..." for a moment is steps 3–4 r
 5. Returns one page; the cursor bookmarks where to continue on scroll
 ```
 
-#### Q: Why is the read path so much simpler/faster than the write path?
+### Why the read path is so much simpler/faster than the write path
 
-That's the whole strategy for a read-heavy app (§2): **push the hard work to write time so reads stay cheap.** Fan-out-on-write did the expensive "who should see this?" step already, so opening the app is mostly "read a ready-made list + freshen the details." One writer's effort saves a million readers' effort.
+This is the whole strategy for a read-heavy app (§2): **push the hard work to write time so reads stay cheap.** Fan-out-on-write did the expensive "who should see this?" step already, so opening the app is mostly "read a ready-made list + freshen the details." One writer's effort saves a million readers' effort.
 
 ---
 
@@ -814,7 +929,7 @@ That's the whole strategy for a read-heavy app (§2): **push the hard work to wr
 
 These are the "what happens if..." questions an interviewer loves. Each row is a real situation and a pragmatic answer.
 
-#### Q: Someone posts, but the media isn't done processing. What do people see?
+### What people see when a post's media isn't done processing yet
 
 Nothing — and that's on purpose. The post sits at `status=PROCESSING` and is **excluded from every feed** until media finishes and it flips to `READY`. This prevents a broken/blank post from appearing. It's the **State pattern** acting as a gate.
 
@@ -823,7 +938,7 @@ Nothing — and that's on purpose. The post sits at `status=PROCESSING` and is *
 if (post.status() != READY) return;   // don't show a half-baked post
 ```
 
-#### Q: What happens to a celebrity's post so it doesn't blow up fan-out?
+### How a celebrity's post avoids blowing up fan-out
 
 The system **skips the push** for celebrities and **pulls at read** instead (the hybrid from §7). Detecting "celebrity" is usually just a follower-count threshold:
 
@@ -845,9 +960,9 @@ FeedItem hydrate(long postId) {
 }
 ```
 
-#### Q: Why are like/comment counts "approximate"?
+### Why like/comment counts are "approximate"
 
-Because counting exactly, in real time, for a viral post getting thousands of likes per second would hammer the DB with contention (the classic hot-row problem). So counts are **aggregated asynchronously** and cached — you might see "10,402" when it's really "10,418" for a few seconds. For a social app that's totally fine (eventual consistency again). Money would need exact counts; likes don't.
+Counting exactly, in real time, for a viral post getting thousands of likes per second would hammer the DB with contention (the classic hot-row problem). So counts are **aggregated asynchronously** and cached — you might see "10,402" when it's really "10,418" for a few seconds. For a social app that's totally fine (eventual consistency again). Money would need exact counts; likes don't.
 
 #### Q: "Feed freshness is eventual" — is that a bug?
 
@@ -855,45 +970,7 @@ No, it's a deliberate trade. A brand-new post might take a few seconds to fan ou
 
 ---
 
-## 14. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Pipeline** | Media processing (resize→transcode→variants→publish) | Composable stages |
-| **Producer-Consumer** | Media workers + fan-out + counter aggregation (Kafka) | Parallel scale |
-| **Strategy** | Feed fan-out (push/pull/hybrid), ranking, explore recs | Swap algorithms |
-| **State** | Post status (PROCESSING→READY→FAILED) | Guarded lifecycle |
-| **Observer / Pub-Sub** | Post/like/media events → feed, notifications, index | Decouple |
-| **CQRS + Materialized View** | Precomputed feed vs write model | Fast reads |
-| **CDN / Cache-Aside** | Media + feed caching | Bandwidth + latency |
-| **TTL / Expiry** | Stories (24h) + view-state | Auto-cleanup ephemeral content |
-| **Facade** | Feed service over graph + posts + media + rank | Simple API |
-| **Repository** | Data access | Testable |
-
-### The patterns, in one line each with a "where"
-
-Patterns are just named solutions to recurring problems. Here's each one grounded in *this* app:
-
-| Pattern | The everyday idea | Where it shows up here |
-| --- | --- | --- |
-| **Pipeline** | An assembly line: output of one stage feeds the next | Media: resize → transcode → variants → publish |
-| **Producer-Consumer** | A to-do list many workers pull from | Media workers, fan-out, counters (via Kafka) |
-| **Strategy** | Swap the algorithm without changing callers | Feed fan-out (push/pull/hybrid), ranking |
-| **State** | An object with guarded life stages | Post PROCESSING → READY → FAILED |
-| **Observer / Pub-Sub** | Shout an event; interested parties react | POST_CREATED → feed, notifications, index |
-| **CQRS + Materialized View** | Separate the write model from a fast read model | Precomputed feed vs source-of-truth posts |
-| **CDN / Cache-Aside** | Keep copies close to the reader | Media at edges, feed in Redis |
-| **TTL / Expiry** | Data that deletes itself | Stories + view-state (24h) |
-| **Facade** | One simple door over a messy back room | Feed service hides graph+posts+media+rank |
-| **Repository** | A clean layer for data access | Testable DB access |
-
-#### Q: How do I actually use this table in an interview?
-
-Don't recite it. When you make a decision, **name the pattern** as justification: "I'll process media as a **pipeline** of retryable stages," or "feed fan-out is a **Strategy** so I can push for normal users and pull for celebrities." Naming the pattern signals you recognize the *shape* of the problem, which is exactly what interviewers score.
-
----
-
-## 15. Scaling & Failure
+## 14. Scaling & Failure
 
 - **Media** → blob + **CDN** (carries read bandwidth); multiple sizes save bandwidth; parallel + retryable processing.
 - **Feed** = hybrid fan-out + rank; celebrities pulled; store ids, hydrate media URLs.
@@ -915,7 +992,7 @@ The trick to scaling is that each subsystem has a *different* pressure and a *di
 | **Stories** | Massive short-lived writes | Ephemeral store + TTL auto-cleans |
 | **Counters** | Hot-row contention on viral posts | Async aggregation, approximate cached counts |
 
-#### Q: What actually breaks first under a traffic spike, and why is that OK?
+### What actually breaks first under a traffic spike, and why it's OK
 
 Usually the **feed build** and **media edges** feel it first. But the design is built to *degrade gracefully* rather than fall over:
 
@@ -925,13 +1002,13 @@ Usually the **feed build** and **media edges** feel it first. But the design is 
 
 This is the payoff of decoupling everything through Kafka and caches: a failure in one service becomes a *slowdown in one feature*, not a full outage. That's called **graceful degradation**, and it's the goal of the whole failure story.
 
-#### Q: What does "shard by user" mean for the follow graph?
+### What "shard by user" means for the follow graph
 
 The follow data is too big for one machine, so you split it across many by user id (e.g. `shard = userId % N`). All of one user's follows live on one shard, so "who do I follow?" hits a single machine. The tricky part is celebrities (billions of *followers*), which is exactly why fan-out goes hybrid instead of pushing to a giant single list.
 
 ---
 
-## 16. Interview Cheat Sheet
+## 15. Interview Cheat Sheet
 
 > **"How do you handle photo/video upload and delivery?"**
 > "Client uploads the original to blob via a pre-signed URL; an event triggers async workers that generate multiple sizes/thumbnails (strip EXIF, blurhash) and HLS for video, store variants in blob, push to **CDN**, and mark the post READY. Viewers fetch the right size from the nearest edge; the DB holds only small metadata."
@@ -945,9 +1022,116 @@ The follow data is too big for one machine, so you split it across many by user 
 > **"Instagram vs Facebook/Twitter?"**
 > "Unidirectional **follow** graph (like Twitter) with private-account approval, but **media-first** — a media pipeline + CDN (like YouTube) combined with fan-out feed, plus ephemeral Stories and ML-driven Explore."
 
+> **"How does Explore/Reels pick content you don't follow?"**
+> "A **two-stage recommender**: cheap **candidate generation** (trending + topics + embedding nearest-neighbor over your taste vector) narrows billions → ~1,000, then a heavier **ranking** model scores predicted engagement on just those. Text/hashtag recall from **Elasticsearch**, semantic recall from a **vector/ANN index**, merged then ranked."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Deleted celebrity post already in millions of feeds** | Don't scrub every feed cache. **Tombstone** in the posts table; **hydration skips it** on read (feed just shows one fewer). Media reclaimed async; private media gets a **CDN purge** (§6). |
+| **Fan-out backlog** (celebrity storm / worker lag) | Fan-out is async off Kafka → posts just land in feeds a few seconds late. Nothing lost; **feed freshness is eventual** by design. Celebrities are **pulled**, not pushed, so they don't create the storm in the first place. |
+| **Private-account fan-out** | Fan-out filters to `status='ACCEPTED'` followers only; a `PENDING` requester sees nothing until approval. Enforced again as an **ACL check on read**. |
+| **Hot counter** (viral post, 1000s of likes/sec) | Don't `UPDATE ... SET like_count = like_count+1` on one row (hot-row contention). **Async-aggregate** and cache an **approximate** count; exactness isn't needed for likes. |
+| **Media still processing** | Post sits at `PROCESSING`, **excluded from feeds** until it flips `READY` (State pattern) — no half-baked post appears. |
+| **Story expired but bytes still around** | Read filter (`expires_at > now()`) hides it instantly; a **TTL sweeper** reclaims rows/bytes later (§8). Correctness never waits on the sweeper. |
+
+> **Ultimate layer model:** CDN = absorb read bandwidth · precomputed feed (Redis) = absorb feed reads · hybrid fan-out = tame the celebrity · async counters = tame hot rows · TTL/tombstone = clean up without blocking.
+
 ---
 
-## 17. Final Takeaways
+## 16. Reels
+
+Reels are Instagram's short-form vertical video product. Architecturally they **reuse the media pipeline wholesale** but plug into a **different discovery surface** than the home feed.
+
+```
+Same as posts:  upload → transcode to HLS renditions → blob + CDN
+Different:       the Reels tab is a recommendation feed (mostly content you DON'T follow),
+                 not a follow-graph fan-out feed
+```
+
+### Reels tab vs Home feed vs Stories
+
+| Surface | Candidate pool | Ordering | Lifetime |
+| --- | --- | --- | --- |
+| **Home feed** | posts from people you **follow** (hybrid fan-out) | ML rank (recency/engagement/affinity) | permanent |
+| **Reels tab** | mostly accounts you **don't** follow (recommender) | ML rank for **watch-time / completion**, endless scroll | permanent |
+| **Stories** | followees' **unexpired** (24h) stories | unseen-first, chronological | ephemeral (§8) |
+
+The key insight: **same bytes, different brain.** A Reel's video runs through the identical transcode-to-HLS pipeline (§5) and is served from the same CDN (§6). What differs is the **candidate generation + ranking** — the Reels tab is essentially the Explore recommender (§9) specialized for video and optimized for *watch-time* rather than *likes*.
+
+### Why watch-time changes the ranking
+
+Home feed ranks for engagement (likes/comments/affinity). Reels ranks for **completion and watch-time** — did you watch it to the end, did you loop it, did you not swipe away. That signal drives an endless "just one more" scroll, so the ranking model's target label is different even though the two-stage funnel shape is the same.
+
+### Prefetch — why Reels feel instant
+
+> 💡 **tip:** the app **prefetches** the next few Reels' video chunks *while you're still watching the current one*, so the next swipe plays with zero buffering. Combined with CDN edge caching and adaptive bitrate (§6), the swipe feels instant. This is the same "do work ahead of time so the read is cheap" instinct as precomputing the feed.
+
+- Prefetch the **next N** candidates' first chunks (low bitrate first → upgrade on the fly).
+- Cache aggressively at the CDN edge — a viral Reel is served millions of times from cache, origin barely touched (§3).
+
+---
+
+## 17. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Instagram's answer is **mostly AP/eventual** — the opposite of a booking system — with a few narrow spots that need strong guarantees.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Follow dedup, likes/story-view uniqueness** | **CP** (strong, via PK) | the composite primary keys (`follows(follower_id, followee_id)`, `likes(user_id, post_id)`) make "one follow", "one like per user" an atomic DB guarantee — no double-follow, no double-like |
+| **Feed freshness** | **AP** (available + eventual) | a new post appearing a few seconds late is fine; the feed stays fast and always serves *something* |
+| **Like / comment / follower counters** | **Eventual** (approximate) | async-aggregated + cached; "10,402 vs 10,418" for a moment is harmless |
+| **Media readiness** | **CP-ish** (state gate) | a post is hidden until `PROCESSING → READY`, so nobody sees a half-processed post |
+| **Explore / notifications** | **Eventual** | downstream, async, retryable, best-effort |
+
+- The **write correctness** we care about is *uniqueness/dedup* (enforced by primary keys on a single source-of-truth row), **not** cross-entity transactions — Instagram has no "never double-book" invariant like BookMyShow.
+- Everything user-visible on the read path (feed, counts, Explore) is **eventually consistent across services** via Kafka fan-out, and that's a deliberate trade for scale.
+
+> One-liner: **"Strong consistency only where a primary key must dedup (follows, likes); eventual consistency everywhere the eye can't tell — feeds, counters, Explore."**
+
+---
+
+## 18. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–7.
+
+1. **Clarify requirements** (functional + NFRs; note "eventual consistency OK") — §2
+2. **Estimate scale** (read-heavy; media bytes vs metadata split) — §3
+3. **High-level architecture** (services + Kafka backbone) — §4
+4. **Data model** (metadata in DB, bytes in blob+CDN; indexes that matter) — §10
+5. **Deep dive: the two hard halves** → **media pipeline + CDN** and **feed fan-out** — §5–§7
+6. **Deep dive: Stories, Explore/Reels, counters** — §8, §9, §16
+7. **Address consistency, scale + edge cases** — §13, §14, §17
+
+> 🎤 **Lead with the shape:** open with *"this is YouTube's media pipeline + CDN glued to Twitter's follow-feed fan-out."* Then name the crux of each half — **write amplification on celebrity fan-out** and **serving exabytes of media cheaply** — and say you'll spend most time there. Naming the shape up front signals seniority.
+
+> 💡 **tip:** if asked to pick ONE thing to go deep on, choose **hybrid fan-out (push for normal, pull for celebrities)** — it's the single most-tested idea and it's where the interesting tradeoff lives.
+
+---
+
+## 19. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Pipeline** | Media processing (resize→transcode→variants→publish) | Composable stages |
+| **Producer-Consumer** | Media workers + fan-out + counter aggregation (Kafka) | Parallel scale |
+| **Strategy** | Feed fan-out (push/pull/hybrid), ranking, explore recs | Swap algorithms |
+| **State** | Post status (PROCESSING→READY→FAILED) | Guarded lifecycle |
+| **Observer / Pub-Sub** | Post/like/media events → feed, notifications, index | Decouple |
+| **CQRS + Materialized View** | Precomputed feed vs write model | Fast reads |
+| **CDN / Cache-Aside** | Media + feed caching | Bandwidth + latency |
+| **TTL / Expiry** | Stories (24h) + view-state | Auto-cleanup ephemeral content |
+| **Facade** | Feed service over graph + posts + media + rank | Simple API |
+| **Repository** | Data access | Testable |
+
+### How to actually use this table in an interview
+
+Don't recite it. When you make a decision, **name the pattern** as justification: "I'll process media as a **pipeline** of retryable stages," or "feed fan-out is a **Strategy** so I can push for normal users and pull for celebrities." Naming the pattern signals you recognize the *shape* of the problem, which is exactly what interviewers score.
+
+---
+
+## 20. Final Takeaways
 
 - Instagram = **media pipeline + CDN** (YouTube-like) **+ follow-feed fan-out** (Twitter-like).
 - **Upload → async process (sizes/HLS, EXIF-strip, blurhash) → blob + CDN**; DB holds only metadata + references.

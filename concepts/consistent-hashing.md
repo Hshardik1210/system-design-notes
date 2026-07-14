@@ -1,5 +1,7 @@
 # Consistent Hashing
 
+**What it is:** a way to map keys → nodes so that **adding/removing a node moves only ~1/N of keys** (not almost all). **Why it matters:** it makes caches and sharded databases *elastic* — you can scale up/down without a mass reshuffle.
+
 > **Problem it solves:** with plain `hash(key) % N`, adding/removing a node remaps **almost all keys** → cache misses / massive data movement. Consistent hashing remaps only **~1/N of keys**.
 
 > **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated pseudo-Java, and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
@@ -12,8 +14,11 @@
 - [2. The Core Idea — The Hash Ring](#2-the-core-idea--the-hash-ring)
 - [3. Virtual Nodes (vnodes) — fixing imbalance](#3-virtual-nodes-vnodes--fixing-imbalance)
 - [4. Walkthrough — Adding a Node](#4-walkthrough--adding-a-node)
+- [Worked Example — 8 keys, add & remove a node](#worked-example--8-keys-add--remove-a-node)
 - [5. Where It's Used](#5-where-its-used)
+- [When NOT to use](#when-not-to-use)
 - [6. Trade-offs](#6-trade-offs)
+- [Common Mistakes](#common-mistakes)
 - [7. Interview Cheat Sheet](#7-interview-cheat-sheet)
 - [8. Final Takeaways](#8-final-takeaways)
 
@@ -51,6 +56,19 @@ add 1 server → hash(key) % 5
 ```
 
 The point isn't that *no* key stays put — it's that on average only ~1/N keys keep their old home, so ~80% move when going 4→5. That's the disaster.
+
+### The rebalancing math, side by side
+
+How many keys move when the cluster grows by one node? With modulo, changing the divisor changes the result for almost everyone; with consistent hashing, only the arc "in front of" the newcomer changes hands (~1/new_N of keys).
+
+| Change | `hash % N` (keys remapped) | Consistent hashing (keys moved) |
+| --- | --- | --- |
+| 4 → 5 nodes | ~80% (only ~1/5 keep their slot) | ~20% (≈ 1/5) |
+| 5 → 6 nodes | ~83% | ~17% (≈ 1/6) |
+| 10 → 11 nodes | ~90% | ~9% (≈ 1/11) |
+| N → N+1 nodes | ~(1 − 1/N) → approaches 100% | ~1/(N+1) |
+
+> 💡 **The takeaway in one line:** modulo moves *almost everything* on every resize; consistent hashing moves *one node's share*. The bigger the cluster, the starker the gap.
 
 #### Q: Why not just pick a bigger N up front so I never resize?
 
@@ -170,6 +188,8 @@ Benefits:
 - On removal, a server's load spreads across **many** neighbors, not one.
 - Lets you weight heterogeneous servers (a bigger box gets more vnodes).
 
+> ⚠️ **Pitfall — vnodes do NOT fix a single hot key.** Virtual nodes only smooth out *uneven arcs* (some server owning too much of the ring by luck). A single **hot key** — one product everyone hammers on Black Friday — still hashes to **one** point and lands on **one** server no matter how many vnodes you add. For that you need **bounded loads** (§5), or caching/replicating that specific key.
+
 ### Why one server needs many spots on the clock
 
 **The problem, concretely.** With only 3 or 4 servers placed *once* each, the clock is lumpy. Random hashing rarely spaces them evenly — one server might end up owning a huge arc (say half the clock) just by luck, while another owns a sliver. So one machine gets swamped and another idles. Worse, if the machine owning the big arc dies, **its entire load dumps onto the single next server clockwise**, which may then also fall over (a cascade).
@@ -278,6 +298,59 @@ It doesn't need to. Every lookup is stateless: hash the key, walk clockwise, don
 
 ---
 
+## Worked Example — 8 keys, add & remove a node
+
+Let's make "only the arc changes owner" concrete with real numbers. Use a tiny ring `[0, 100)` (instead of `[0, 2³²)`) so positions are easy to eyeball. Four nodes and eight keys land at these positions:
+
+```
+Nodes:  A=10   B=35   C=60   D=85
+Keys:   K1=5   K2=20  K3=33  K4=47  K5=55  K6=70  K7=88  K8=95
+```
+
+Each key belongs to the **first node clockwise** (wrap past 100 → back to A):
+
+| Key | pos | first node clockwise | owner |
+| --- | --- | --- | --- |
+| K1 | 5 | A(10) | **A** |
+| K2 | 20 | B(35) | **B** |
+| K3 | 33 | B(35) | **B** |
+| K4 | 47 | C(60) | **C** |
+| K5 | 55 | C(60) | **C** |
+| K6 | 70 | D(85) | **D** |
+| K7 | 88 | wrap → A(10) | **A** |
+| K8 | 95 | wrap → A(10) | **A** |
+
+Owners now: `A={K1,K7,K8}  B={K2,K3}  C={K4,K5}  D={K6}`.
+
+### Add a 5th node `E` at position 50
+
+`E` lands between `B(35)` and `C(60)`, so it takes over the arc `(35, 50]` — the keys that used to walk past 50 to reach `C`.
+
+```
+before:  B(35) ─────────── keys 36..60 go to C ───────────► C(60)
+add E:   B(35) ──(36..50)──► E(50) ──(51..60)──► C(60)
+```
+
+- **K4 (pos 47)** was `C`, now the first node clockwise is `E(50)` → **K4 moves C → E**.
+- **K5 (pos 55)** is still `> 50`, so it keeps walking to `C(60)` → **unchanged**.
+- Everything else is untouched.
+
+**Result: exactly 1 of 8 keys moved** (K4). That's ~12%, in line with "≈ 1/newN = 1/5". With `hash % N` (4 → 5), ~6–7 of the 8 keys would have moved.
+
+### Remove node `C` (back on the original 4-node ring)
+
+Removing a node is the mirror image: its keys flow to the **next node clockwise**. `C(60)` owned `{K4, K5}`; the next node clockwise is `D(85)`.
+
+```
+before:  B(35) ──► C(60) ──► D(85)
+remove C: B(35) ─────────────► D(85)   (C's arc (35,60] now belongs to D)
+```
+
+- **K4 (47)** and **K5 (55)** move **C → D**. Nothing else changes.
+- Note the downside: **all** of `C`'s load landed on the single neighbor `D`. That cascade risk is exactly what **virtual nodes** (§3) prevent — `C`'s many scattered vnodes would have dumped its keys across *many* neighbors instead of one.
+
+---
+
 ## 5. Where It's Used
 
 - **Distributed caches** — Memcached clients, Redis Cluster (uses 16384 hash slots, a related idea).
@@ -297,6 +370,15 @@ key → first node clockwise = primary; next 2 distinct nodes clockwise = replic
 ```
 
 - This is exactly how **Cassandra/Dynamo** place replicas on the ring → data survives node loss, and reads/writes use a quorum of those RF nodes.
+
+### Who owns the ring? (membership)
+
+Every client that does a lookup must agree on **the same ring** — which nodes exist and where they sit. Two common ways to distribute that membership:
+
+- **Centralized config service** (ZooKeeper / etcd / a coordinator): one authoritative copy of the node list; clients watch it for changes. Simple and consistent, but the config service is a dependency and a potential bottleneck. Redis Cluster's slot map and many cache-client libraries lean this way.
+- **Gossip, Dynamo-style** (Cassandra, DynamoDB, Riak): there is no central owner — each node periodically gossips membership with peers, so the ring converges across the cluster on its own. No single point of failure, but membership is *eventually* consistent, so two nodes can briefly disagree during a change.
+
+> 💡 Whatever the mechanism, the ring itself is tiny (just `position → node`), so it's cheap to replicate to every client or node.
 
 ### Bounded loads (hot keys / skew)
 
@@ -348,6 +430,49 @@ Vnodes even out *arcs*, but a **single hot key** (one product everyone hammers o
 - **Jump consistent hash:** a tiny formula that maps a key to a bucket in `[0, N)` with minimal movement and zero memory — but you can only grow/shrink at the end, not remove an arbitrary node.
 - **Hash slots (Redis Cluster):** a fixed 16384 slots are handed out to nodes; a key maps to a slot, a slot maps to a node. Same "minimal movement on resize" goal, but ownership is explicit and easy to reshard.
 
+#### Sketch — rendezvous (HRW) hashing
+
+No ring, no vnodes: score the key against every node and pick the winner. Adding/removing a node only changes the keys whose winner *was* (or *becomes*) that node → still ~1/N movement.
+
+```java
+String pick(String key, List<String> nodes) {
+    String best = null;
+    long bestScore = Long.MIN_VALUE;
+    for (String node : nodes) {
+        long score = hash(key + ":" + node);   // combined hash of key AND node
+        if (score > bestScore) { bestScore = score; best = node; }
+    }
+    return best;   // highest score wins
+}
+```
+
+#### Sketch — jump consistent hash
+
+A tiny O(1), zero-memory formula mapping `key → bucket in [0, numBuckets)` with minimal movement — but buckets can only be added/removed at the *end*, so you can't drop an arbitrary node.
+
+```java
+int jumpHash(long key, int numBuckets) {
+    long b = -1, j = 0;
+    while (j < numBuckets) {
+        b = j;
+        key = key * 2862933555777941757L + 1;   // LCG step
+        j = (long) ((b + 1) * (double)(1L << 31) / ((key >>> 33) + 1));
+    }
+    return (int) b;
+}
+```
+
+---
+
+## When NOT to use
+
+Consistent hashing is not free (a ring to maintain, vnodes to tune). Reach for something simpler when:
+
+- **Small, fixed node count.** If `N` almost never changes (e.g. a stable 3-node cluster), plain `hash % N` is simpler, O(1), and zero-memory — the reshuffle cost you're avoiding rarely happens.
+- **You need to remove an *arbitrary* node cheaply.** Jump hash and hash-slot schemes are great at *growing*, but jump hash can't drop a node from the middle. If arbitrary removal matters, use ring-based consistent hashing (or plan slot migration).
+- **You need range scans / ordering.** Hashing destroys key order, so "give me all keys between X and Y" becomes a full scatter-gather. If ordered access is central, use **range partitioning** instead.
+- **Tiny/weighted set where a ring is overkill.** For a handful of weighted nodes, **rendezvous (HRW) hashing** gives the same ~1/N movement with no ring to maintain.
+
 ---
 
 ## 6. Trade-offs
@@ -397,6 +522,17 @@ Because the core operation is "**find the next position clockwise**", which is a
 #### Q: What's the cost compared to `hash % N`?
 
 `hash % N` is O(1) with zero memory but reshuffles everything on resize. Consistent hashing costs a little memory (the ring: N × vnodes entries) and O(log n) lookups, in exchange for moving only ~1/N of keys on resize. For any elastic or stateful cluster, that trade is overwhelmingly worth it.
+
+---
+
+## Common Mistakes
+
+- **Skipping vnodes.** One point per physical node makes the ring lumpy — some node owns a huge arc, and losing it cascades onto a single neighbor. Always use ~100–200 vnodes.
+- **Expecting vnodes to fix a hot key.** They balance *arcs*, not demand for one key. A hot key needs bounded loads, caching, or per-key replication.
+- **Forgetting the wrap-around.** A key past the last node must loop back to the first (`ceilingEntry == null` → `firstEntry`). Miss this and top-of-ring keys have no owner.
+- **Not skipping same-physical replicas.** When collecting RF copies clockwise, you must skip extra vnodes of the *same* machine — otherwise all "replicas" sit on one box and die together.
+- **Clients disagreeing on the ring.** If nodes/clients have different membership views, the same key routes to different nodes. Keep the ring in sync (config service or gossip).
+- **Hashing the wrong identity.** Hash a *stable* node id (not its IP/hostname if that changes on restart), or the node re-enters the ring at a new position and needlessly moves keys.
 
 ---
 

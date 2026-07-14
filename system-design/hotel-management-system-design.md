@@ -22,10 +22,15 @@
 - [12. API Design](#12-api-design)
 - [13. Sequences](#13-sequences)
 - [14. Consistency & Edge Cases](#14-consistency--edge-cases)
-- [15. Design Patterns (that can be used)](#15-design-patterns-that-can-be-used)
-- [16. Scaling & Failure](#16-scaling--failure)
-- [17. Interview Cheat Sheet](#17-interview-cheat-sheet)
-- [18. Final Takeaways](#18-final-takeaways)
+- [15. Scaling & Failure](#15-scaling--failure)
+- [16. Interview Cheat Sheet](#16-interview-cheat-sheet)
+- [17. Consistency & CAP Tradeoffs](#17-consistency--cap-tradeoffs)
+- [18. Dynamic Pricing](#18-dynamic-pricing)
+- [19. Domain Topics (Channel Manager, Housekeeping, Multi-Room)](#19-domain-topics-channel-manager-housekeeping-multi-room)
+- [20. Reliability & Observability](#20-reliability--observability)
+- [21. How to Drive the Interview (framework)](#21-how-to-drive-the-interview-framework)
+- [22. Design Patterns (that can be used)](#22-design-patterns-that-can-be-used)
+- [23. Final Takeaways](#23-final-takeaways)
 
 ---
 
@@ -67,9 +72,7 @@ Deluxe room type, 10 rooms total:
 
 A guest wanting July 10–13 is **rejected**, because the 12th is full — even though the 10th and 11th had space. That "all nights must be free" rule is the heart of §5 and §6.
 
-#### Q: Why not just track each physical room like a calendar (room 412 booked Jul 10–13)?
-
-You *can*, and small B&Bs do. But at scale it's wasteful and slow: guests don't care which of 10 identical Deluxe rooms they get, so forcing the system to pick "room 412" at booking time means locking specific rooms, juggling maintenance/cleaning, and doing far more work on the busiest code path. Tracking a **count per night** turns the hot path into one tiny integer update ("booked_count: 8 → 9") and defers picking an actual room key until **check-in** (see §9).
+You might reasonably ask: why not just track each physical room like a calendar (room 412 booked Jul 10–13)? You *can*, and small B&Bs do. But at scale it's wasteful and slow: guests don't care which of 10 identical Deluxe rooms they get, so forcing the system to pick "room 412" at booking time means locking specific rooms, juggling maintenance/cleaning, and doing far more work on the busiest code path. Tracking a **count per night** turns the hot path into one tiny integer update ("booked_count: 8 → 9") and defers picking an actual room key until **check-in** (see §9).
 
 ---
 
@@ -125,9 +128,39 @@ These numbers aren't trivia — each one points at a design decision.
 
 Reads dominate: for every booking there are hundreds of searches. So optimize reads (a fast, replicated index) and keep the rarer booking writes careful, exact, and serialized.
 
-#### Q: Why prune past-date inventory? Isn't deleting data risky?
+It's worth pausing on that pruning point, since deleting data can sound risky. The `room_inventory` table only answers "is this room free *going forward*." Once July 10 is in the past, nobody can book it, so its row is dead weight slowing every query and inflating storage. The *reservations* (who stayed, what they paid) are kept forever in the `reservations`/`payments` tables for history and accounting — we only prune the forward-looking **availability counters**, not the business records.
 
-The `room_inventory` table only answers "is this room free *going forward*." Once July 10 is in the past, nobody can book it, so its row is dead weight slowing every query and inflating storage. The *reservations* (who stayed, what they paid) are kept forever in the `reservations`/`payments` tables for history and accounting — we only prune the forward-looking **availability counters**, not the business records.
+### Doing the math (show the method)
+
+> Numbers are illustrative — the point is to **show the method**, not be exact.
+
+```
+Assume:
+  Hotels                     ~ 1M
+  Room types per hotel       ~ 3            → ~3M room types
+  Bookings per day           ~ 2M           (holiday peaks much higher)
+  Avg nights per booking     ~ 3            → ~6M night-increments/day
+
+Write QPS (bookings):
+  2M / 86,400s               ~ 23 bookings/sec average
+  Peak (10–20x on holidays)  ~ 250–500 bookings/sec
+  Each booking touches ~3 night-rows → ~750–1,500 row updates/sec at peak
+
+Read QPS (search/browse):
+  ~100–1,000x writes         ~ tens of thousands of searches/sec at peak
+
+Inventory row growth (the big table):
+  1M hotels × 3 types × 365 nights   ~ 1.1B rows / booking-year
+  Row ~ 40 bytes                     ~ 44 GB/year (before indexes)
+  Booking window ~ 1–2 yrs forward → steady-state size is BOUNDED, not ever-growing,
+     because a daily prune drops nights older than today.
+  Prune math: delete ~3M rows/day (yesterday's nights) → table stays ~1–2B rows flat.
+
+Reservations (kept forever, ~300 B):
+  2M/day × 365 × 300 B       ~ 220 GB/year (history + accounting — never pruned)
+```
+
+**Takeaways that drive design:** browse ≫ booking → **ES read model + cache + replicas**; the write bottleneck is **contention on hot night-rows** (a sold-out holiday weekend), not raw throughput → **atomic per-night increments**; the inventory table is only bounded because we **prune past nights daily** — the reservations ledger is not pruned.
 
 ---
 
@@ -160,9 +193,7 @@ Each box is a specialist service. A client never talks to them directly — it t
 | **Admin** | Sets room counts and nightly prices. |
 | **Kafka** | Event backbone: when something happens ("Reservation confirmed!"), it publishes an event; other services (search index, email, analytics) consume it and react. |
 
-#### Q: What is CQRS, in one plain sentence?
-
-**CQRS = use two different data stores: one tuned for *reading*, one tuned for *writing*.** Here, **reads** (search) hit Elasticsearch — fast, handles huge browse traffic, can be a few seconds behind. **Writes** (booking) hit the RDBMS — exact, transactional, never overbooks. When inventory changes in the RDBMS, that change is streamed (via **CDC** — Change Data Capture — over Kafka) into Elasticsearch to keep search fresh-ish.
+In one plain sentence: **CQRS means using two different data stores — one tuned for *reading*, one tuned for *writing*.** Here, **reads** (search) hit Elasticsearch — fast, handles huge browse traffic, can be a few seconds behind. **Writes** (booking) hit the RDBMS — exact, transactional, never overbooks. When inventory changes in the RDBMS, that change is streamed (via **CDC** — Change Data Capture — over Kafka) into Elasticsearch to keep search fresh-ish.
 
 ```
 RDBMS (write side)        = the exact, transactional source of truth (always correct)
@@ -373,9 +404,9 @@ But if Jul 12 was full:
 
 The transaction's **rollback** is what makes it truly all-or-nothing: even the nights that succeeded get reverted, so we never leave the guest half-booked.
 
-#### Q: What's a "hold" / "soft lock with TTL," and why not just book instantly?
+### The "hold" — why we don't just book instantly
 
-Between "I want this room" and "payment succeeded" there's a gap (the guest is typing card details). We don't want two people fighting over a room during that gap, so we **increment `booked_count` immediately** and mark the reservation `PENDING_PAYMENT` — the room is *held* for them. But what if they close the tab and never pay? A background **sweeper** job finds holds older than, say, 10 minutes (the **TTL** — time to live) and **decrements** the count, freeing the room again.
+Between "I want this room" and "payment succeeded" there's a gap (the guest is typing card details). We don't want two people fighting over a room during that gap, so we **increment `booked_count` immediately** and mark the reservation `PENDING_PAYMENT` — the room is *held* for them, a "soft lock with TTL." But what if they close the tab and never pay? A background **sweeper** job finds holds older than, say, 10 minutes (the **TTL** — time to live) and **decrements** the count, freeing the room again.
 
 ```
 book → booked_count++ (held) → PENDING_PAYMENT
@@ -429,9 +460,7 @@ boolean hasSpace() {
 - `overbookBuffer = 0` → the strict "never oversell" behavior.
 - `overbookBuffer = 5` on a 100-room type → the system will happily sell up to 105.
 
-#### Q: How do they pick the buffer number?
-
-From **history**. If, on average, 4% of guests cancel or no-show for this hotel on similar dates, a buffer around 4% is "safe." Fancier systems use ML on seasonality, day-of-week, event calendars, etc. Set it too low → empty rooms (lost money); too high → too many walks (angry guests, walk costs). It's a tuned business trade-off, not a technical constant.
+So how do they actually pick the buffer number? From **history**. If, on average, 4% of guests cancel or no-show for this hotel on similar dates, a buffer around 4% is "safe." Fancier systems use ML on seasonality, day-of-week, event calendars, etc. Set it too low → empty rooms (lost money); too high → too many walks (angry guests, walk costs). It's a tuned business trade-off, not a technical constant.
 
 ---
 
@@ -486,7 +515,7 @@ class Reservation {
 }
 ```
 
-**The rule that ties back to inventory:** every path that *ends* a booking early (`EXPIRED`, `CANCELLED`, no-show) must **give the rooms back** — decrement `booked_count` for each night, or those rooms are lost forever (phantom "sold out" with an empty hotel). Undoing an earlier increment like this is called **compensation** (see the Saga pattern in §15).
+**The rule that ties back to inventory:** every path that *ends* a booking early (`EXPIRED`, `CANCELLED`, no-show) must **give the rooms back** — decrement `booked_count` for each night, or those rooms are lost forever (phantom "sold out" with an empty hotel). Undoing an earlier increment like this is called **compensation** (see the Saga pattern in §22).
 
 ```java
 void cancel(Reservation r) {
@@ -582,9 +611,7 @@ List<Hotel> results = elasticsearch.search(city, checkIn, checkOut, guests, filt
 
 Keeping the index fresh: whenever `room_inventory` changes in the RDBMS, that change is streamed out via **CDC (Change Data Capture)** over **Kafka**, and the search index updates. It lags by seconds — acceptable, because booking re-checks for real.
 
-#### Q: Isn't it bad UX to show a hotel that's actually sold out?
-
-Slightly, but it's the right trade-off. The alternative — making search perfectly exact — would require hammering the booking database on every search, which browse-heavy traffic (§3) would crush. A rare "sorry, just sold out, please pick another" at booking time is far cheaper than a slow or down search for everyone. **Search optimizes for speed and availability; booking optimizes for correctness.**
+Isn't it bad UX, then, to occasionally show a hotel that's actually sold out? Slightly, but it's the right trade-off. The alternative — making search perfectly exact — would require hammering the booking database on every search, which browse-heavy traffic (§3) would crush. A rare "sorry, just sold out, please pick another" at booking time is far cheaper than a slow or down search for everyone. **Search optimizes for speed and availability; booking optimizes for correctness.**
 
 ---
 
@@ -618,9 +645,12 @@ CREATE TABLE reservations (
     check_in DATE NOT NULL, check_out DATE NOT NULL,
     guests INT, total_amount INT, status VARCHAR(30) NOT NULL,
     room_id BIGINT,                          -- assigned at check-in
+    hold_expiry TIMESTAMP,                    -- TTL for PENDING_PAYMENT holds (sweeper target)
     created_at TIMESTAMP DEFAULT now()
 );
-CREATE INDEX idx_res_guest ON reservations(guest_id, created_at DESC);
+CREATE INDEX idx_res_guest  ON reservations(guest_id, created_at DESC);
+CREATE INDEX idx_res_holds  ON reservations(status, hold_expiry);   -- hold sweeper
+CREATE INDEX idx_inv_date   ON room_inventory(date);                -- prune / availability sweep
 
 CREATE TABLE payments ( payment_id BIGINT PRIMARY KEY, reservation_id BIGINT, amount INT, status VARCHAR(20), idempotency_key VARCHAR(255) UNIQUE );
 CREATE TABLE refunds  ( refund_id BIGINT PRIMARY KEY, reservation_id BIGINT, amount INT, status VARCHAR(20) );
@@ -631,6 +661,34 @@ CREATE TABLE outbox ( id BIGINT PRIMARY KEY, event_type VARCHAR(50), payload JSO
 ```
 
 > **Tables to consider:** hotels, room_types, rooms, **room_inventory** (the key one), reservations, payments, refunds, cancellation_policies, guests, reviews, outbox, pricing_rules.
+
+### Indexes that matter
+
+Pick indexes by the **hot paths**, not by habit. Each one below exists because a specific query runs constantly:
+
+| Index | On | Serves |
+| --- | --- | --- |
+| `PRIMARY KEY (hotel_id, room_type_id, date)` | `room_inventory` | **The booking hot path** — the per-night conditional increment (§6) lands on one exact row; also the exact availability re-check (§5). |
+| `(date)` | `room_inventory` | The **prune + availability sweep** — delete past nights in bulk, range-scan a stay's nights. |
+| `(status, hold_expiry)` | `reservations` | The **hold sweeper** — cheaply find `PENDING_PAYMENT` rows past their TTL to release (§6, §8) without scanning the whole table. |
+| `(guest_id, created_at DESC)` | `reservations` | A guest's **booking history**, newest first. |
+| `UNIQUE (idempotency_key)` | `reservations`, `payments` | Dedup retried bookings/charges — the constraint *is* the safety net (§11, §12). |
+
+> 💡 **Why the PK doubles as the workhorse index:** `(hotel_id, room_type_id, date)` is both the primary key *and* the exact shape of the booking `WHERE` clause — so the single hottest write in the whole system is a primary-key point/range lookup, the cheapest thing a relational DB can do.
+
+### Database & storage choices (which DB, and why at scale)
+
+Same deciding question as Airbnb/BookMyShow: *does this number decide whether we oversell a room, or does it just help someone browse?* `room_inventory`'s counts are the former; everything search-facing is the latter.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| `room_inventory`, `reservations`, `payments`, `refunds` | **RDBMS** (PostgreSQL/MySQL) | Overbooking prevention is an **atomic conditional increment** (`WHERE booked_count < total_count`) across every night in the range, inside one transaction, with `rows_affected == nights` deciding all-or-nothing (§6). That's exactly what row-level locking + ACID transactions give you natively. | An eventually-consistent store has no cross-row transaction to make "increment N nights atomically, roll back if any is full" safe — you'd be building a lock manager by hand for a job the RDBMS already does. |
+| `hotels`, `room_types`, `rooms` (catalog) | **RDBMS** | Catalog data joins naturally with inventory/reservations and isn't write-hot — no reason to leave the relational model. | Splitting the catalog into a separate store buys nothing and adds a cross-system join for no benefit. |
+| Search & discovery (geo + facets + availability summary) | **Elasticsearch** | Multi-filter browse queries (city, price, amenities) plus a denormalized "min free rooms over next N nights" hint (§10) — a read model kept fresh via CDC. | Running exact per-night availability checks (§5) against the RDBMS for every hotel on every search would hammer the same database that must stay fast for the correctness-critical booking writes. |
+| Browse-path caching | **Redis** | Caches popular `city + date` searches and hot availability snapshots, absorbing read traffic before it reaches either ES or the RDBMS. | Skipping the cache means re-running the same popular queries against ES/RDBMS on every request — wasteful at browse-heavy scale (§3). |
+| Hotel photos | **Blob store + CDN** | Large immutable bytes, served from the edge. | Storing images in the RDBMS bloats the table that must stay lean for the booking hot path. |
+
+**Why relational wins for count-based availability:** the whole design turns "is this room type free" into a simple integer comparison per night (`booked_count < total_count`), and the *only* thing that makes that safe under concurrency is an atomic conditional `UPDATE` inside a real transaction (§6) — there's no NoSQL equivalent that gives the same all-or-nothing guarantee across multiple night-rows for free. Booking write volume is modest (§3), so a single RDBMS primary handles it easily; scale by **sharding on `hotel_id`** (§15) — since a booking only ever touches one hotel's nights, it stays a clean single-shard transaction — and scale reads with **ES + cache**. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ### What each table is *for* (and the two sneaky ones)
 
@@ -705,13 +763,11 @@ Read the endpoints top-to-bottom and they retrace a guest's trip:
 | `POST .../check-in` / `check-out` | Arrive / leave. | Assign physical room (§9) → `CHECKED_IN` → `COMPLETED`. |
 | `PUT /v1/hotels/{id}/inventory` | (Manager) set counts/prices. | Admin-only; feeds `room_inventory`. |
 
-#### Q: Why is `Idempotency-Key` a *header* on the create-reservation call?
+### Why `Idempotency-Key` is a header, and why the flow is split into so many calls
 
-Because creating a reservation is the one call that **must not happen twice** if the client retries (double charge, double room). The client generates a unique key once and sends it on every retry of that same intent; the server uses it (via the `UNIQUE` column from §11) to recognize "this is the same booking I already made" and return the original instead of making a new one. Read calls (`GET`) don't need it — repeating a search is harmless.
+`Idempotency-Key` shows up as a *header* on the create-reservation call specifically because creating a reservation is the one call that **must not happen twice** if the client retries (double charge, double room). The client generates a unique key once and sends it on every retry of that same intent; the server uses it (via the `UNIQUE` column from §11) to recognize "this is the same booking I already made" and return the original instead of making a new one. Read calls (`GET`) don't need it — repeating a search is harmless.
 
-#### Q: Why split `pay`, `check-in`, `check-out` into separate calls instead of one big "book" call?
-
-Because they happen at **different times, possibly days apart**, and each is its own state transition (§8). You pay now, check in next week, check out three days after that. Separate endpoints map cleanly to those real-world moments and let each be retried/handled independently.
+You might also wonder why `pay`, `check-in`, and `check-out` are separate calls instead of one big "book" call. It's because they happen at **different times, possibly days apart**, and each is its own state transition (§8). You pay now, check in next week, check out three days after that. Separate endpoints map cleanly to those real-world moments and let each be retried/handled independently.
 
 ---
 
@@ -786,7 +842,7 @@ These aren't abstract — each is a thing that genuinely happens at a front desk
 - **Abandoned checkout.** Someone holds a room, then closes the laptop to answer the door and never comes back. The **TTL sweeper** notices the hold is stale after ~10 min and frees the room — otherwise it'd be "sold" to nobody.
 - **Payment fails.** Card declined after we held the rooms → the saga's **compensation** decrements each night, reservation → `EXPIRED`. Rooms are free again within seconds.
 - **Duplicate booking tap.** Impatient double-tap or a network retry → same `idempotency_key` → the `UNIQUE` constraint means only one booking/charge sticks (§11).
-- **Cancellation.** Guest cancels → state → `CANCELLED`, inventory released, refund computed by the **cancellation policy** (free if early, penalty if last-minute — a swappable **Strategy**, §15).
+- **Cancellation.** Guest cancels → state → `CANCELLED`, inventory released, refund computed by the **cancellation policy** (free if early, penalty if last-minute — a swappable **Strategy**, §22).
 - **No-show.** Guest never arrives → charged per policy; the **overbook buffer** (§7) usually means the room was resold anyway.
 - **Partial availability over a range.** Want 3 nights but night 2 is full → the whole stay is rejected (all-or-nothing). We can't sell someone "2 of your 3 nights."
 
@@ -801,63 +857,11 @@ int refundFor(Reservation r, CancellationPolicy policy, Instant now) {
 }
 ```
 
-#### Q: Which of these is the "strong consistency" one everyone talks about?
-
-**"Two guests race the last room"** and **"overbooking"** — those are the writes that must be *exactly* right, so they go through the strongly-consistent RDBMS path with the atomic conditional update. Everything read-side (search showing a stale sold-out hotel) is allowed to be eventually consistent, because booking re-checks for real. That split — **strict on the money/inventory write, relaxed on browse reads** — is the whole consistency philosophy of the design.
+Of all these edge cases, which is the "strong consistency" one everyone talks about? **"Two guests race the last room"** and **"overbooking"** — those are the writes that must be *exactly* right, so they go through the strongly-consistent RDBMS path with the atomic conditional update. Everything read-side (search showing a stale sold-out hotel) is allowed to be eventually consistent, because booking re-checks for real. That split — **strict on the money/inventory write, relaxed on browse reads** — is the whole consistency philosophy of the design.
 
 ---
 
-## 15. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Saga / Orchestration** | Reserve → pay → confirm, with compensation (release inventory) | Distributed txn without 2PC |
-| **State** | Reservation lifecycle | Guard transitions |
-| **Optimistic Locking / CAS** | Inventory `booked_count < total_count` conditional update | Prevent overbooking |
-| **Strategy** | Pricing (seasonal/dynamic), cancellation policy, room assignment, overbooking | Swap rules |
-| **Outbox** | Reliable events (confirmed → notify) | No dual-write loss |
-| **CQRS (lite)** | Search (ES read model) vs booking (RDBMS write) | Optimized reads |
-| **Ports & Adapters** | Payment, search index, notifications | Swap providers |
-| **Decorator / Chain** | Price = base + season + taxes + fees − discount | Stack pricing |
-| **Repository / Factory** | Data access; notification/payment creation | Testable, extensible |
-
-### The patterns, each in one line + where it applies
-
-Patterns sound academic; here each is tied to a concrete hotel moment:
-
-| Pattern | One-line meaning | The hotel moment |
-| --- | --- | --- |
-| **Saga** | Multi-step process with undo steps. | Reserve → pay → confirm; undo (release rooms) if payment fails. |
-| **State** | Only legal status transitions allowed. | The reservation lifecycle (§8) — can't go `COMPLETED → CHECKED_IN`. |
-| **Optimistic Locking / CAS** | "Update only if the value is still what I expect." | `WHERE booked_count < total_count` — stops the double-book. |
-| **Strategy** | Swap a rule without changing the caller. | Pricing (seasonal), cancellation refund %, room-assignment logic. |
-| **Outbox** | Save the "to-send" event in the same DB transaction. | `RESERVATION_CONFIRMED` reliably reaches Kafka (§11). |
-| **CQRS** | Separate read store from write store. | Search on Elasticsearch, booking on RDBMS (§4). |
-| **Decorator / Chain** | Stack small transformations. | Final price = base + season + taxes + fees − discount. |
-| **Repository / Factory** | Hide data access / object creation behind an interface. | Swap DB or payment provider without touching business logic. |
-
-The **Decorator/Chain** for pricing, made concrete — each layer wraps the previous:
-
-```java
-interface PriceRule { int apply(int runningPrice, BookingContext ctx); }
-
-// each rule takes the price so far and returns a new one — stackable in any order
-PriceRule seasonal = (p, ctx) -> ctx.isPeakSeason() ? (int)(p * 1.5) : p;   // +50% in peak
-PriceRule taxes    = (p, ctx) -> (int)(p * 1.18);                            // +18% tax
-PriceRule discount = (p, ctx) -> ctx.hasCoupon()   ? p - ctx.couponValue() : p;
-
-int finalPrice = List.of(seasonal, taxes, discount)
-    .stream()
-    .reduce(basePrice, (price, rule) -> rule.apply(price, ctx), (a, b) -> b);
-```
-
-#### Q: Why so many patterns — isn't this over-engineering?
-
-Each pattern here earns its place by absorbing a *specific* real-world messiness: distributed steps that can fail (**Saga**), illegal status jumps (**State**), concurrent last-room fights (**CAS**), rules that change per hotel/season (**Strategy**), and unreliable cross-service messaging (**Outbox**). In an interview you don't need all of them — but naming the *right one for the problem being discussed* shows you recognize the underlying shape.
-
----
-
-## 16. Scaling & Failure
+## 15. Scaling & Failure
 
 - **Search** off Elasticsearch + cache; never scan inventory for every hotel; approximate, exact re-check at booking.
 - **Booking** on RDBMS with strong consistency; **shard by `hotel_id`**; prune past-date inventory rows.
@@ -888,7 +892,7 @@ Because the **atomic booking transaction (§6) is scoped to a single hotel**. If
 
 ---
 
-## 17. Interview Cheat Sheet
+## 16. Interview Cheat Sheet
 
 > **"How do you prevent overbooking over a date range?"**
 > "Model inventory per room type **per night** (`booked_count`/`total_count`). Book with an **atomic conditional increment** for **every** night (`WHERE booked_count < total_count`); if `rows_affected != nights`, roll back the whole booking. Wrap reserve→pay→confirm in a **saga** that decrements (releases) on failure, with a **HELD TTL** for abandoned checkouts."
@@ -902,15 +906,191 @@ Because the **atomic booking transaction (§6) is scoped to a single hotel**. If
 > **"Search at scale?"**
 > "Elasticsearch read model with a denormalized availability summary + cache; exact counts re-checked at booking. Search is approximate, booking is exact."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Two guests book the last room concurrently** | The atomic per-night increment (§6) lets exactly one `booked_count+1` through while `booked_count < total_count`; the loser changes 0 rows → `rows != nights` → "just sold out." No overbooking, no lock manager. |
+| **Hold expires mid-payment** (10-min TTL, guest pays at minute 11) | The sweeper may have already decremented and freed the room, and someone else could grab it. Guard confirm with the reservation still in `PENDING_PAYMENT`; if the room's gone, treat payment as needing **refund/compensation** — never confirm a stay you can't honor. Mitigate with a generous TTL + "your hold is expiring" nudge. |
+| **Walk policy triggered** (real overbooking — everyone showed up) | Intentional buffer (§7) oversold and no physical room is free at check-in → **walk** the guest: rebook + pay a nearby hotel + compensation. Track **walk rate** (§20); if it's high, lower `overbook_buffer`. |
+| **Channel-manager / OTA double-sell** (Booking.com and your site sell the same last room within seconds) | Both channels must decrement the **same** `room_inventory` counter through one Inventory Service — never keep separate per-channel counts. The atomic increment makes the second sell fail; the OTA gets an availability push-back (§19). |
+
 ---
 
-## 18. Final Takeaways
+## 17. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Have the split memorized.
+
+The whole design hinges on one asymmetry, already introduced in §2 and §14: **the write path guards money and inventory, so it must be exactly right; the read path just helps people browse, so it can lag.** In CAP terms, the booking core chooses **CP** (stay consistent, refuse rather than overbook) and search chooses **AP** (stay up and fast, tolerate stale answers).
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Inventory / booking / payment (writes)** | **CP** (strong consistency) | Overbooking or a double charge is unacceptable — correctness wins over availability. A partitioned inventory shard should **reject** rather than guess. |
+| **Search / browse** | **AP** (available + eventual) | A few seconds of stale "available" is harmless because booking **re-checks exact counts** (§10). Never take search down to keep it perfectly fresh. |
+| **Notifications / analytics / search index** | **Eventual** | Downstream of the outbox/CDC (§4, §11) — async and retryable. |
+
+- Booking writes hit a **single source-of-truth row** (`room_inventory`), and the atomic conditional increment (§6) gives serializable behavior **per night-row** without any global lock.
+- The system is **eventually consistent across services** (outbox/saga, CDC to ES), but **strongly consistent at the inventory row** where it counts.
+
+> One-liner for the interview: **"Strong consistency where money and inventory live; eventual consistency everywhere a stale read is cheap to correct."**
+
+---
+
+## 18. Dynamic Pricing
+
+> Hotels don't have one price — the same Deluxe room costs more on New Year's Eve than on a rainy Tuesday. Pricing is a **per-night** number that a job recomputes.
+
+Because availability is already stored **per night** (`room_inventory` has one row per night), price rides along on that same row as `room_inventory.price`. A background **pricing job** periodically recomputes each night's price from demand signals; the booking path just reads whatever price is currently on the night-row.
+
+```
+price(night) = base_price × seasonal_multiplier(date) × occupancy_multiplier(booked/total)
+```
+
+- **Seasonal multiplier** — calendar-driven (peak season, weekends, local events): e.g. ×1.5 for a festival week.
+- **Occupancy multiplier** — the fuller a night gets, the pricier the last rooms: e.g. ×1.0 under 60% full, ×1.3 above 90%.
+
+Different hotels (and different strategies) compute this differently, so pricing is a swappable **Strategy** (§22) — the caller asks for "the price for this night" and doesn't care whether it's a flat rate, a seasonal curve, or a full ML demand model:
+
+```java
+interface PricingStrategy {
+    int priceFor(RoomInventory night);   // returns the per-night price to store
+}
+
+class SeasonalOccupancyPricing implements PricingStrategy {
+    public int priceFor(RoomInventory night) {
+        double seasonal  = calendar.multiplierFor(night.date);          // e.g. 1.5 in peak
+        double occupancy = night.bookedCount >= 0.9 * night.totalCount  // nearly full?
+                         ? 1.3 : 1.0;
+        return (int) (night.basePrice() * seasonal * occupancy);
+    }
+}
+
+// the pricing job writes the result back onto the night-row the booking path reads
+void repriceNightly(RoomInventory night, PricingStrategy strategy) {
+    night.price = strategy.priceFor(night);   // UPDATE room_inventory SET price = ? WHERE (hotel,type,date)
+}
+```
+
+> ⚠️ **Price the guest saw ≠ price at charge time.** A price recompute can land between "guest sees ₹5,000" and "guest taps Pay." **Snapshot the quoted price into the reservation** (`total_amount`) at hold time and charge that — never re-read the live `room_inventory.price` at payment, or a repricing job could silently overcharge.
+
+#### Q: Why store price on `room_inventory` per night instead of one price on `room_types`?
+
+Because price genuinely varies **night by night** — a Deluxe might be ₹4,000 on a Tuesday and ₹9,000 on the Saturday of a concert, within the *same* booking. `room_types.base_price` is just the starting point; the live, sellable price lives on the per-night row right next to `booked_count`, so both "is it free?" and "what does it cost?" for a given night are answered by reading one row. A multi-night stay simply **sums the per-night prices** in the range.
+
+---
+
+## 19. Domain Topics (Channel Manager, Housekeeping, Multi-Room)
+
+> These are the "do you actually know hotels?" follow-ups. A sentence or two each is enough to stand out.
+
+### Channel manager / OTA sync
+
+Hotels don't only sell on your site — the same rooms are listed on **OTAs** (Online Travel Agencies like Booking.com, Expedia, MakeMyTrip). A **channel manager** is the component that keeps one shared inventory in sync across all of them.
+
+> 💡 **OTA / channel manager:** the OTA is a third-party storefront; the channel manager is the two-way bridge between the OTA and your **PMS** (Property Management System — the hotel's own booking-of-record).
+
+- **The danger — double-sell:** if Booking.com and your site each keep *their own* count, both can sell the last room at once. Fix: **one source-of-truth counter** (`room_inventory`) that every channel decrements through the same Inventory Service; the atomic increment (§6) makes the second sale fail.
+- **Two-way sync:** a booking on *either* side must push the new count to the other within seconds (webhook/API), so the OTA hides the room too. This rides the same Kafka/CDC stream (§4) as the search index.
+
+### Housekeeping / room status
+
+The physical `rooms` table carries a `status` (`AVAILABLE` / `OCCUPIED` / `MAINTENANCE`) that is **separate from availability counts** (§9).
+
+- A room under **`MAINTENANCE`** (broken AC, deep clean) is **excluded from check-in assignment** — `assignRoom` (§9) only picks `AVAILABLE` rooms.
+- ⚠️ Maintenance affects **assignment, not the sale**: if enough rooms are down that a night's true capacity drops, the manager lowers that night's `total_count`, which is what actually prevents selling the missing room. Keeping cleaning/maintenance churn off the booking hot path is exactly why counts and physical rooms are decoupled.
+
+### Multi-room booking
+
+A family may book **3 Deluxe rooms** for the same dates in one reservation.
+
+- The per-night increment becomes **`booked_count + N`** guarded by `booked_count + N <= total_count + overbook_buffer` (still one atomic statement per night, still all-or-nothing across the range).
+- 💡 Booking **different room types together** (2 Deluxe + 1 Suite) is modeled as **line items** under one reservation — each type/night incremented in the same transaction so the whole cart is atomic: either the family gets every room or none.
+
+---
+
+## 20. Reliability & Observability
+
+- **No single point of failure** — RDBMS primary + replicas + failover, multi-AZ for cache/search, multiple stateless service instances behind a load balancer.
+- **Idempotent retries** everywhere on the write path (booking, pay, refund) via the `idempotency_key` (§11).
+- **Dead-letter queues** for failed events / saga compensations, with alerting.
+- **Graceful degradation** — if search (ES) is down, still allow direct booking by hotel/date against the RDBMS; if the cache is down, fall back to ES/DB reads.
+
+### Metrics that actually matter here
+
+| Metric | Why it matters | Alert when |
+| --- | --- | --- |
+| **Overbooking rate** (accidental) | Should be **zero** — any nonzero value means the atomic guard is broken. | `> 0` — page immediately |
+| **Walk rate** (intentional overbook → no room) | Tunes `overbook_buffer` (§7): too high = buffer too aggressive. | above the business threshold |
+| **Hold-expiry leaks** | `PENDING_PAYMENT` rows past TTL that the sweeper never released → phantom "sold out." | backlog grows / sweeper lag |
+| **Booking success rate** | Drops signal payment, inventory, or availability problems. | sudden dip |
+| **p99 latency** (search & booking) | Search must feel instant; booking must confirm fast under holiday load. | p99 breaches SLO |
+
+> 💡 The two hotel-specific ones — **walk rate** and **hold-expiry leaks** — are what tell you whether your *business* knobs (overbook buffer, hold TTL) are set right, not just whether the servers are up.
+
+---
+
+## 21. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6.
+
+1. **Clarify requirements** (functional + NFRs, lead with "no overbooking") — §2
+2. **Estimate scale** (browse ≫ booking, inventory row growth) — §3
+3. **High-level architecture + CQRS split** — §4
+4. **Data model** (the per-night `room_inventory` is the star) — §5, §11
+5. **Deep dive: the hard part** → **availability + overbooking over a date range** — §5–§7
+6. **Deep dive: booking saga, payments, state, failures** — §8, §13, §14
+7. **Address scale + edge cases + domain** — §10, §15, §17–§20
+8. **Summarize tradeoffs** — §17, §16
+
+> 🎤 **Lead with the core challenge:** state up front that "the crux is per-night availability and never overbooking across a date range," then spend most of your time there. Mentioning **room-type counts** (not per-seat) early signals you understand the domain.
+
+---
+
+## 22. Design Patterns (that can be used)
+
+Patterns sound academic; here each is tied to a concrete hotel moment:
+
+| Pattern | Where / the hotel moment | Why / one-line meaning |
+| --- | --- | --- |
+| **Saga / Orchestration** | Reserve → pay → confirm; undo (release inventory) if payment fails | Distributed transaction without 2PC |
+| **State** | Reservation lifecycle (§8) — blocks illegal jumps like `COMPLETED → CHECKED_IN` | Guard transitions |
+| **Optimistic Locking / CAS** | Inventory `WHERE booked_count < total_count` conditional update | Prevent overbooking without heavy locks |
+| **Strategy** | Pricing (seasonal/dynamic), cancellation refund %, room assignment, overbooking buffer | Swap a rule without changing the caller |
+| **Outbox** | Save the "to-send" event in the same DB transaction (§11) | `RESERVATION_CONFIRMED` reliably reaches Kafka, no dual-write loss |
+| **CQRS (lite)** | Search (Elasticsearch read model) vs booking (RDBMS write model) (§4) | Optimized reads, exact writes |
+| **Ports & Adapters** | Payment gateway, search index, notifications | Swap providers without touching business logic |
+| **Decorator / Chain** | Final price = base + season + taxes + fees − discount | Stack small pricing transformations in order |
+| **Repository / Factory** | Data access; notification/payment creation | Testable, extensible |
+
+The **Decorator/Chain** for pricing, made concrete — each layer wraps the previous:
+
+```java
+interface PriceRule { int apply(int runningPrice, BookingContext ctx); }
+
+// each rule takes the price so far and returns a new one — stackable in any order
+PriceRule seasonal = (p, ctx) -> ctx.isPeakSeason() ? (int)(p * 1.5) : p;   // +50% in peak
+PriceRule taxes    = (p, ctx) -> (int)(p * 1.18);                            // +18% tax
+PriceRule discount = (p, ctx) -> ctx.hasCoupon()   ? p - ctx.couponValue() : p;
+
+int finalPrice = List.of(seasonal, taxes, discount)
+    .stream()
+    .reduce(basePrice, (price, rule) -> rule.apply(price, ctx), (a, b) -> b);
+```
+
+With this many named patterns, it's fair to ask whether this is over-engineering. It isn't, as long as each one earns its place by absorbing a *specific* real-world messiness: distributed steps that can fail (**Saga**), illegal status jumps (**State**), concurrent last-room fights (**CAS**), rules that change per hotel/season (**Strategy**), and unreliable cross-service messaging (**Outbox**). In an interview you don't need to name all of them — but naming the *right one for the problem being discussed* shows you recognize the underlying shape.
+
+---
+
+## 23. Final Takeaways
 
 - **Availability = count per room type per night**; a range is bookable only if **every** night has `booked_count < total_count`.
 - **Atomic conditional increment** per night prevents overbooking without heavy locks (all-or-nothing: `rows==nights`).
 - **Saga** for reserve→pay→confirm with **compensation** (decrement) + **HELD TTL** for abandoned checkouts; **idempotency** stops double booking.
 - **Overbooking buffer** is a deliberate business strategy (+ walk policy); **physical room assigned at check-in**.
 - **Search** = ES read model + cache (approximate); **booking** = RDBMS (exact, strong); shard by hotel.
+- **CP where money/inventory lives, AP for browse** — booking re-checks exact counts so stale search is harmless.
+- **Dynamic price is per-night** on `room_inventory` (seasonal × occupancy, a Strategy); **snapshot the quote** into the reservation so a repricing job never overcharges.
+- **Watch walk rate + hold-expiry leaks** — the two hotel-specific signals that your business knobs (buffer, TTL) are set right.
 - Patterns: Saga, State, Optimistic Locking, Strategy (pricing/policy), Outbox, CQRS-lite.
 
 ### Related notes

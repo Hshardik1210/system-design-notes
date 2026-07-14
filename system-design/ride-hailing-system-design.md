@@ -23,10 +23,14 @@
 - [13. Data Model (all tables)](#13-data-model-all-tables)
 - [14. Sequences](#14-sequences)
 - [15. Consistency & Correctness](#15-consistency--correctness)
-- [16. Design Patterns (that can be used)](#16-design-patterns-that-can-be-used)
-- [17. Scaling & Failure](#17-scaling--failure)
-- [18. Interview Cheat Sheet](#18-interview-cheat-sheet)
-- [19. Final Takeaways](#19-final-takeaways)
+- [16. Scaling & Failure](#16-scaling--failure)
+- [17. Interview Cheat Sheet](#17-interview-cheat-sheet)
+- [18. Consistency & CAP Tradeoffs](#18-consistency--cap-tradeoffs)
+- [19. Reliability & Observability](#19-reliability--observability)
+- [20. Safety, Trust & Driver Modes](#20-safety-trust--driver-modes)
+- [21. How to Drive the Interview (framework)](#21-how-to-drive-the-interview-framework)
+- [22. Design Patterns (that can be used)](#22-design-patterns-that-can-be-used)
+- [23. Final Takeaways](#23-final-takeaways)
 
 ---
 
@@ -95,8 +99,7 @@ Plain version: **be paranoid about money and ride ownership; be relaxed about ca
 | Driver's dot on the map | **Eventual** (a bit stale is fine) | It's just a hint | Car icon lags 2s — nobody notices |
 | "Nearby drivers" list | **Eventual** | An estimate anyway | You offer to a car that just moved — retry the next |
 
-Q: **Why not just make everything strongly consistent — isn't "always correct" better?**
-Because strong consistency is *expensive* (locks, coordination, slower). Applying it to 250,000 location updates/sec would be impossibly slow and pointless. You spend that budget only where being wrong actually hurts (money, ride ownership).
+Making everything strongly consistent isn't simply "better," because strong consistency is *expensive* (locks, coordination, slower). Applying it to 250,000 location updates/sec would be impossibly slow and pointless. You spend that budget only where being wrong actually hurts (money, ride ownership).
 
 ---
 
@@ -148,11 +151,9 @@ tiny data (trips, payments)   → SQL database   (correct, slow-ish, that's fine
 firehose (driver locations)   → Redis + Kafka  (fast, in-memory, "good enough")
 ```
 
-Q: **Why 4 seconds? Why not update location every second (smoother map)?**
-Because rate = drivers ÷ interval. Halving the interval to 2s *doubles* the firehose to 500k/sec — more servers, more cost, more heat. 4s is a battery/bandwidth/cost compromise. (Uber actually uses an **adaptive rate**: faster pings near a pickup where precision matters, slower when idle far away — see §9.)
+Why 4 seconds and not, say, every second for a smoother map? Because rate = drivers ÷ interval. Halving the interval to 2s *doubles* the firehose to 500k/sec — more servers, more cost, more heat. 4s is a battery/bandwidth/cost compromise. (Uber actually uses an **adaptive rate**: faster pings near a pickup where precision matters, slower when idle far away — see §9.)
 
-Q: **Why is a completed trip only ~2 KB but so important?**
-It carries rider, driver, route, fare, timestamps — small. But it's *money and a legal record*, so it goes to the durable SQL DB and is kept forever, while raw location history is downsampled and dumped to a cheap data lake.
+A completed trip is only ~2 KB but is still hugely important: it carries rider, driver, route, fare, timestamps — small. But it's *money and a legal record*, so it goes to the durable SQL DB and is kept forever, while raw location history is downsampled and dumped to a cheap data lake.
 
 ---
 
@@ -191,7 +192,7 @@ POST /v1/rides/{id}/rate    → the 5-star screen after the trip
 
 Two ideas in that summary trip people up. Here they are in plain terms.
 
-#### Q: What is an "Idempotency-Key" and why does `POST /rides` need one?
+### Why `POST /rides` needs an Idempotency-Key
 
 You tap "Confirm." Your phone is on flaky 4G, the response is slow, so you tap again — or the app auto-retries. Without protection that's **two ride requests = two drivers dispatched = chaos.**
 
@@ -214,7 +215,7 @@ public Ride requestRide(@RequestHeader("Idempotency-Key") String key,
 
 Repeats carrying the same key resolve to the single original ride, never a new one.
 
-#### Q: What's a `quoteId`, and why lock the price?
+### What a `quoteId` is, and why the price is locked
 
 You see "₹240" on the estimate screen. You think for 20 seconds. In those 20 seconds surge might jump. If we recomputed at "Confirm," you'd be charged ₹300 — surprise, anger. So `estimate` returns a **`quoteId`** that *freezes* that fare+surge for a short time; `POST /rides` passes the `quoteId`, and we charge the frozen number.
 
@@ -226,7 +227,7 @@ POST /rides { quoteId: "q_abc" }  → charged 240, NOT whatever surge is now
 
 The quote simply has a short expiry window; within it, the fare you saw is the fare you pay.
 
-#### Q: Why WebSocket for offers and tracking instead of normal REST?
+### Why WebSocket for offers and tracking, not normal REST
 
 Normal REST is *pull*: the client asks, server answers, done. But a driver offer and the moving-car map are *push*: the **server** needs to reach the phone the instant something happens, without the phone constantly asking "anything yet? anything yet?". A **WebSocket** is a persistent open pipe both sides can send through — perfect for "here's a ride offer, now!" and "driver moved, redraw the dot." (Same connection-registry idea as a chat system.)
 
@@ -261,7 +262,7 @@ You *could* build one giant program that does everything. But its jobs have wild
 | **Payment Service** | Charge rider, pay driver | SQL + ledger |
 | **Notification / Tracking** | Push updates to phones | WebSocket connections |
 
-#### Q: What is Kafka doing in the middle, and why?
+### What Kafka is doing in the middle, and why
 
 Kafka is a **shared event log** — an append-only list of "things that happened" (`RIDE_REQUESTED`, `TRIP_ENDED`, …). When the Trip Service finishes a trip, it doesn't call the payment, analytics, and receipt services one by one (tight coupling, brittle). It just **publishes one event** onto Kafka; whoever cares subscribes.
 
@@ -276,7 +277,7 @@ Trip Service:  "TRIP_ENDED {trip 55, fare 240}"  ──►  Kafka
 
 Benefits, in plain terms: (1) **Decoupling** — the Trip Service doesn't need to know who reacts. (2) **Resilience** — if Analytics is down, the event waits in the log; nothing is lost. (3) **Fan-out** — add a new listener (say, fraud detection) later without touching the Trip Service. This is the **Pub-Sub / Observer** pattern.
 
-#### Q: Why is Matching "the hard part" and not, say, Payments?
+### Why matching is "the hard part," not payments
 
 Payments is a well-understood, low-rate problem (a few hundred/sec) with proven tools. Matching must, *within a couple of seconds*, search a constantly-moving set of a million drivers, score them by real road-driving time, offer to the best, handle rejections, and guarantee no double-assignment — all under load. That real-time geo + optimization + concurrency mix is what makes ride-hailing distinctive (§6–§7).
 
@@ -363,9 +364,9 @@ List<DriverId> findNearby(double lat, double lng) {
 }
 ```
 
-#### Q: Why also search the 8 neighboring cells — isn't my own cell enough?
+### Why also search the 8 neighboring cells
 
-Because you might be standing at the **edge** of your box. The closest driver could be 50 m away but just over the line, in the next cell. If you only searched your own cell you'd miss them. So you always grab your cell **plus its 8 neighbors** (a 3×3 block) to cover the borders.
+You might be standing at the **edge** of your box. The closest driver could be 50 m away but just over the line, in the next cell. If you only searched your own cell you'd miss them. So you always grab your cell **plus its 8 neighbors** (a 3×3 block) to cover the borders.
 
 ```
 ┌─────┬─────┬─────┐
@@ -439,9 +440,22 @@ GEOSEARCH drivers:online FROMLONLAT 77.5900 12.9700 BYRADIUS 3 km ASC
 
 Because it lives **in memory (RAM)**, not on disk. Redis just moves a point in an in-memory structure — microseconds. This is exactly why the geo-index is Redis and **never** the SQL trip DB: a disk-based DB doing 250k location rewrites/sec would collapse. Locations are also "eventual" data (§2) — a dot being 2 seconds stale is fine — so RAM's "fast but volatile" trade-off is perfect.
 
-#### Q: Why "shard the geo-index by city/region"?
+### Why shard the geo-index by city/region
 
 A rider in Bangalore never needs a driver in Delhi. So keep a **separate index per city**. Benefits: each index is smaller (faster search), and a problem in one city's index doesn't touch another's (**isolation**). It's the same locality principle one level up: don't search the whole country, only the relevant city.
+
+#### Q: H3 vs geohash vs S2 — which do I actually pick in an interview?
+
+Don't agonize — **any of them answers "find nearby fast"; pick one and justify it in a sentence.** A safe, senior-sounding answer: *"I'd serve live matching with **Redis GEO** (geohash under the hood) because it's `GEOADD`/`GEOSEARCH` out of the box, and model surge supply/demand on **H3 hexagons** because equal-distance neighbors make per-cell demand-vs-supply clean."* The one distinction worth stating:
+
+| If they ask… | Say | Because |
+| --- | --- | --- |
+| "Simplest to reason about / ship?" | **Geohash** (or Redis GEO) | Prefix = proximity; built into Redis; no tree to rebalance. |
+| "Why does Uber use H3?" | **H3 hexagons** | All 6 neighbors are equidistant → **supply/demand per cell** for surge is fair and clean. |
+| "Globe-scale, no pole/date-line distortion?" | **S2** | Sphere + Hilbert curve → tidy range queries worldwide. |
+| "Wildly uneven density (downtown vs rural)?" | **QuadTree** | Splits only crowded cells → each cell holds ~equal drivers. |
+
+> 💡 The interviewer rarely wants a winner — they want to hear you **know the trade-off** (fixed grid vs adaptive, square vs hexagon) and can pick deliberately. "Redis GEO for serving, H3 for surge" lands it.
 
 ---
 
@@ -558,22 +572,42 @@ Rider B: SET driver:42:lock B NX  → nil false ❌ B is told "taken", offers it
 
 Redis guarantees only the first `SET NX` succeeds; the second is rejected, so exactly one rider wins the driver and the other moves on.
 
-#### Q: Greedy vs batch matching — when and why?
+### Greedy vs batch matching — when and why
 
 - **Greedy (nearest-first):** handle each request the instant it arrives, give it the best driver *available right now*. Simple, low latency. But **locally** optimal — it can make a globally worse set of assignments.
 - **Batch:** wait ~1–2 seconds, collect a *pool* of requests and drivers, and solve them **together** to minimize *total* wait across everyone (a min-cost assignment / Hungarian algorithm).
 
-Why batch can win — a classic case:
+Why batch can win — a fully worked 2×2 (min-cost bipartite matching):
+
+Two riders `R1, R2` and two drivers `D1, D2`. Build a **cost matrix** where each cell is the ETA-to-pickup (minutes) for that rider↔driver pair:
 
 ```
-Two riders, two drivers (greedy handles R1 first):
-  Greedy:  R1 grabs D1 (its nearest)  → R2 forced onto far D2  → total wait = 2 + 9 = 11 min
-  Batch:   see both at once → R1↔D2 (3), R2↔D1 (2)             → total wait = 3 + 2 = 5 min ✅
+            D1      D2
+   R1  │     2       3
+   R2  │     2       9
 ```
+
+Now compare the two ways to hand out the cars. There are only **two valid assignments** (each rider gets a different driver):
+
+```
+Greedy (serve R1 first, it grabs its own nearest):
+   R1 → D1 (its min: 2 vs 3, picks 2)
+   R2 → D2 (D1 is now taken, forced onto 9)
+   TOTAL WAIT = 2 + 9 = 11 min   ❌ locally optimal for R1, globally bad
+
+Batch (look at BOTH riders together, minimize the sum):
+   Option A: R1→D1 (2) + R2→D2 (9) = 11
+   Option B: R1→D2 (3) + R2→D1 (2) = 5   ← pick this
+   TOTAL WAIT = 5 min   ✅ R1 waits 1 min longer so R2 saves 7
+```
+
+The trick: greedy locks in D1 for R1 because it's *R1's* best — but D1 is the **only** good driver for R2 (2 vs 9), so hoarding it for R1 (who's fine either way: 2 vs 3) is globally wasteful. Batch sees the whole matrix and gives the scarce-but-critical D1 to the rider who needs it most. At real scale this is an *N×N* matrix solved with the **Hungarian / auction algorithm**; the 2×2 is just the intuition.
 
 Trade-off: batching adds a 1–2s delay and more compute, so it's used in **dense markets** where the global gain is big; sparse areas just use greedy.
 
-#### Q: What is UberPool doing differently?
+> 💡 In an interview, draw exactly this 2×2 grid. It's the fastest way to *show* (not just claim) that greedy is locally optimal but globally beatable.
+
+### What UberPool is doing differently
 
 Pooling matches **multiple riders whose routes overlap** to one car (shared fare, some detour). Now matching isn't "pick a driver" but "which riders should share, and in what pickup/dropoff order?" — a routing/optimization problem on top of matching. Riders trade a little detour time for a cheaper fare.
 
@@ -614,9 +648,9 @@ COMPLETED        → "You've arrived" → fare + rating screen
 CANCELLED / NO_DRIVERS → the ride ended early
 ```
 
-#### Q: Why bother with a formal state machine — why not just a `status` column we set freely?
+### Why a formal state machine instead of a free-form `status` column
 
-Because it **blocks illegal jumps** that would corrupt reality or money. Without guards you could get: charge a trip that never started, start a trip nobody accepted, or complete a cancelled ride. The state machine defines *which* transitions are legal and rejects the rest.
+It **blocks illegal jumps** that would corrupt reality or money. Without guards you could get: charge a trip that never started, start a trip nobody accepted, or complete a cancelled ride. The state machine defines *which* transitions are legal and rejects the rest.
 
 ```java
 // Allowed moves only. Anything not listed is rejected.
@@ -638,7 +672,7 @@ void transition(Trip trip, State next, String actor) {
 }
 ```
 
-#### Q: What stops two actors (rider taps cancel, driver taps start) racing at the same instant?
+### What stops two actors racing at the same instant
 
 A **conditional update** in the DB — only change the row *if it's still in the state you expected*:
 
@@ -650,7 +684,7 @@ WHERE trip_id = 55 AND status = 'DRIVER_ARRIVED';   -- only if still ARRIVED
 
 This is **optimistic concurrency**: don't lock up front; instead let the `WHERE status = <expected>` clause decide the winner. Exactly one of the racing updates changes a row; the other sees "0 rows" and backs off.
 
-#### Q: Why write `trip_status_history` and fire a Kafka event on *every* transition?
+### Why write `trip_status_history` and fire a Kafka event on every transition
 
 - **History** = a full timestamped record of the ride (`REQUESTED at 8:00, ASSIGNED at 8:01…`). Priceless for disputes ("driver started the meter before I got in"), support, and analytics.
 - **Kafka event** = the announcement so *other* services react without the Trip Service calling each one: `TRIP_ENDED` → Payment charges, Notification sends a receipt, Analytics updates dashboards (the Pub-Sub fan-out from §5).
@@ -690,7 +724,7 @@ Driver phone: "driver 42 is at (12.9716, 77.5946)"  ──►  Location Service
 
 Each ping just **overwrites** the driver's latest position (`GEOADD` and `SET` both replace the existing value). We don't `INSERT` a database row per ping — that would accumulate 250k throwaway rows per second for data we only need the newest value of.
 
-#### Q: Why can these 250k pings/sec NOT go into the trips database?
+### Why 250k pings/sec cannot go into the trips database
 
 We did this math in §3: a SQL DB handles a few *thousand* writes/sec; we have **250,000**. It would instantly fall over. And it'd be pointless — a location is "eventual" data (§2), disposable in seconds, so we keep only the **latest** value in fast in-memory Redis (`GEOADD` and `SET` both *overwrite*, they don't accumulate). The durable DB is saved for the trickle of trips/payments.
 
@@ -707,15 +741,15 @@ void onPing(long driverId, double lat, double lng, boolean onTrip, Long riderId)
 }
 ```
 
-#### Q: Why does only an *active trip* push GPS to a rider? What about the idle cars I see on the map?
+### Why only an active trip pushes GPS to a rider
 
-Two different jobs:
+Idle cars on the map and an active trip's driver serve two different jobs:
 - **Idle drivers** just refresh the **match index** (so they can be found). Their pings do *not* stream to anyone.
 - **A driver on your trip** additionally pushes each new position to *your* WebSocket so your live map animates.
 
 The floating cars you see before booking are usually a cheap, throttled snapshot near you — not a live per-car stream to your phone. Streaming every idle car to every nearby rider would be a needless firehose.
 
-#### Q: What is "adaptive ping rate," and why?
+### What "adaptive ping rate" is, and why
 
 Ping frequency is a battery/bandwidth vs precision trade-off. So the app **dials it up when precision matters and down when it doesn't**:
 
@@ -724,7 +758,7 @@ Driver idle, far from any pickup   → ping every ~10s   (save battery; rough po
 Driver assigned, approaching you   → ping every ~1–2s  (you're staring at the map; needs to be smooth)
 ```
 
-#### Q: What's the WebSocket "gateway" doing here?
+### What the WebSocket "gateway" is doing here
 
 Millions of phones hold an **open connection** (so the server can push instantly). A **gateway** is the fleet of servers that hold those live connections and know "rider 99's phone is on gateway box #7." When driver 42's ping arrives for rider 99's trip, the system routes the update to the right gateway, which pushes it down the open pipe. It's a stateful *connection registry* — the same idea a chat app uses to deliver messages to online users.
 
@@ -769,7 +803,7 @@ No — that would be far too slow. Real map engines **precompute shortcuts** so 
 
 The precomputed highway-like shortcuts handle the long haul ("take NH-44, ~6 hours"), so a live query only does detailed search over the local streets at each end instead of every small street along the way.
 
-#### Q: Why is ETA "ML-adjusted," and how should I talk about it in an interview?
+### Why ETA is "ML-adjusted," and how to talk about it in an interview
 
 The raw graph time is a good base, but reality has patterns a static graph misses: 6 PM Fridays are slower, rain slows everything, this particular left turn always backs up. So a **machine-learning model** nudges the estimate using history (time of day, day of week, weather, this segment's past behavior). In an interview, **don't** try to design the model — treat it as a black box and emphasize: its **inputs** (live traffic, historical trips, weather), that it **continuously refines** as the trip progresses, and that updated ETAs are **pushed** to the rider's app.
 
@@ -881,7 +915,7 @@ void completeTrip(Trip trip) {
 
 Because the trip write and the outbox write share one transaction, the event can't be lost even if the service crashes right after committing — a separate relay ships the stored outbox rows later.
 
-#### Q: Why an "idempotent charge"? And upfront vs metered?
+### Why an "idempotent charge," and upfront vs metered pricing
 
 - **Idempotent charge:** same retry-safety idea as §4 — a network retry must not charge the rider twice. The charge carries a unique key; the payment provider ignores a repeat of the same key. "Charge ₹240 for trip 55, key X" run twice = charged once.
 - **Upfront vs metered:** *Upfront* = you pay the quoted fare no matter the exact route (predictable; what Uber mostly shows now). *Metered* = the final fare is computed from the *actual* distance/time driven (the old taxi meter). Upfront needs the locked `quoteId` from §11; metered computes at trip end from real GPS distance.
@@ -922,6 +956,20 @@ CREATE TABLE outbox ( id BIGINT PRIMARY KEY, event_type VARCHAR(50), payload JSO
 
 > Live driver positions = **Redis GEO** (`drivers:online`) + `loc:driver:{id}`, **not a table**. Surge = a small hot table/cache updated by a stream job.
 
+### Database & storage choices (which DB, and why at scale)
+
+The doc already frames the central trade-off in §2: *be strict about money and ride ownership, be relaxed about car dots.* The storage picks are that rule made literal — the deciding question per data type is *"does being wrong here cause real-world chaos, or is staleness invisible?"*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Live driver locations + matching index | **Redis GEO** (in-memory geospatial) | 250k location writes/sec (§3) that are only ever needed as the *latest* value — `GEOADD`/`SET` overwrite in place, microsecond in-memory updates, and `GEOSEARCH` gives radius queries for free. | The main SQL DB tops out around a few thousand writes/sec — 250k/sec of GPS pings would collapse it in seconds, for data that's stale and worthless within seconds anyway. |
+| Trips, payments, driver earnings | **RDBMS** (with Snowflake IDs) | Trip state and money need **strong consistency**: `UPDATE ... WHERE status = <expected>` for race-free state changes (§8), `UNIQUE(idempotency_key)` to stop double-charges/double-rides, and a real transaction for the double-entry ledger (§12). | Locations can be eventually consistent, but "two riders assigned the same driver" or "charged twice" are real-world/financial disasters — this is exactly where you pay for ACID. |
+| Driver claim locks | **Redis** (`SET NX EX`) | The atomic claim that stops two rides grabbing the same driver (§7) needs a sub-millisecond compare-and-set with auto-expiry (so a crash doesn't lock a driver forever) — `SET NX` is built for precisely this. | Doing this lock via the RDBMS would add latency to the matching hot path for something that's a transient handoff, not a permanent record. |
+| Location history (analytics/ETA models, not live matching) | **Time-series / wide-column** (Cassandra) or a downsampled data lake | The firehose is sampled and streamed via Kafka, then written to a store built for high-volume time-ordered writes with range scans by driver/time — not the low-latency point lookups Redis GEO does for live matching. | Keeping full-resolution history in Redis would blow past memory budgets; keeping it in the RDBMS would repeat the same write-volume problem locations have everywhere else. |
+| Events (trip lifecycle, location stream) | **Kafka** | A durable log decouples the Trip/Location services from downstream consumers (pricing, notifications, analytics) — paired with the outbox for trip completion (§12). | Direct synchronous calls to every downstream consumer would couple services together and lose events on a crash. |
+
+**Why the main SQL DB can never see raw GPS pings:** the numbers settle it (§3) — an RDBMS handles a few thousand writes/sec, the fleet produces ~250,000/sec, and each ping is disposable the moment a newer one arrives. So locations live entirely in **Redis (latest value + geo-index) plus a Kafka stream** for anything downstream, while the RDBMS is reserved for the low-rate, must-be-exact trickle of trips and payments — geo-sharded by city/region (§16) so a request never needs to reach across regions. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
+
 ### Reading the schema
 
 Each table maps to one part of a ride. Group them by job:
@@ -937,7 +985,7 @@ Each table maps to one part of a ride. Group them by job:
 | `reviews` | Ratings both ways | After-trip feedback |
 | `outbox` | Pending events to publish | Reliable event delivery (§12) |
 
-#### Q: The `trips` table has an `idempotency_key UNIQUE` — what's that doing?
+### What `idempotency_key UNIQUE` on the `trips` table is doing
 
 It's the *database-level* safety net for the double-tap problem from §4. Even if two identical requests slip past the app check, the DB's `UNIQUE` constraint physically **refuses** to store two rows with the same key — the second insert errors out, guaranteeing one ride per tap.
 
@@ -945,15 +993,15 @@ It's the *database-level* safety net for the double-tap problem from §4. Even i
 idempotency_key VARCHAR(255) UNIQUE   -- DB rejects a duplicate → at most one trip per tap
 ```
 
-#### Q: Why is `trip_id` a "Snowflake" ID and not just `AUTO_INCREMENT 1,2,3…`?
+### Why `trip_id` is a "Snowflake" ID, not `AUTO_INCREMENT 1,2,3…`
 
 At Uber scale, trips are created on **many servers at once**, so a single auto-increment counter would be a bottleneck (everyone waits for the one counter) and a single point of failure. A **Snowflake ID** lets each server mint unique, time-sortable 64-bit IDs *independently* (built from timestamp + machine id + sequence) — no central coordination. (See the distributed-ID-generator note.)
 
-#### Q: Why is there an index `idx_trips_rider ON trips(rider_id, requested_at DESC)`?
+### Why the index `idx_trips_rider ON trips(rider_id, requested_at DESC)` exists
 
-Because the app constantly asks "show me *my* recent trips, newest first" (your ride history screen). Without an index the DB scans every trip ever; with it, the DB jumps straight to that rider's rows already in newest-first order, instead of scanning the whole table.
+The app constantly asks "show me *my* recent trips, newest first" (your ride history screen). Without an index the DB scans every trip ever; with it, the DB jumps straight to that rider's rows already in newest-first order, instead of scanning the whole table.
 
-#### Q: Why are driver locations deliberately **not** a table here?
+### Why driver locations are deliberately not a table here
 
 This is the §3/§9 lesson made concrete: 250k location writes/sec would destroy a SQL table, and locations are disposable "eventual" data. So live positions live in **Redis GEO** (`drivers:online` for the match index + `loc:driver:{id}` for the latest point), and only durable, must-be-correct facts (trips, payments) get real tables.
 
@@ -1003,9 +1051,35 @@ The sequence diagram looks busy, but it's just the earlier sections happening **
 
 Notice the two rhythms interleaving: **request/response** for the discrete steps (create trip, claim, charge) and **continuous streaming** for the live GPS. And every important step drops a **Kafka event** so pricing, notifications, and analytics react without the Trip Service phoning each one.
 
-#### Q: What happens on cancellation — why "release the driver lock"?
+### What happens on cancellation, and why "release the driver lock"
 
 If you cancel after a driver was assigned, that driver is still holding your atomic claim (§7). We must **release the lock** so he's free again and can be re-offered to other waiting riders — otherwise he'd sit "locked to a cancelled trip" and effectively vanish from the pool. Depending on *when* you cancel (after assign/arrival), a **cancellation fee** may apply, since the driver already spent time/fuel coming to you.
+
+### Cancellation & no-show policy — the deep dive
+
+"Cancel" isn't one event — it's several, and the correct handling (free the driver, re-match, who pays) depends on **who** cancelled and **at what stage**. The three jobs on every cancellation are always the same: **(1) release the driver, (2) settle money, (3) put the driver back to work.**
+
+```
+1. RELEASE   → DEL driver:{id}:lock  +  drivers.status = ONLINE   (he's claimable again)
+2. SETTLE    → maybe a cancellation / no-show fee (see table)
+3. RE-MATCH  → the driver flows back into the pool; the rider (if driver cancelled) is re-dispatched
+```
+
+> ⚠️ **Release must be idempotent and ownership-checked.** Delete the Redis lock only if it's still *this* trip's lock (compare-and-delete), and guard the DB with `WHERE status IN ('DRIVER_ASSIGNED','DRIVER_ARRIVED')`. A late cancel of an already-completed trip must change **nothing**.
+
+Who pays depends on the stage and the actor:
+
+| When / who cancels | Driver released? | Charge | Why |
+| --- | --- | --- | --- |
+| Rider cancels **< ~2 min** after assign | Yes → re-offer | **Free** | Grace window; driver barely moved. |
+| Rider cancels **after** grace / after `DRIVER_ARRIVED` | Yes → re-offer | **Cancellation fee** (partial) | Driver spent time/fuel driving to pickup. |
+| **Driver** cancels | Yes → re-offer to next candidate | Rider **not** charged; driver acceptance-rate hit | Don't punish the rider for a driver bailing. |
+| **No-show** (driver arrived, waited, rider never came) | Yes, after a **wait timer** (e.g. 5 min) | **No-show fee** | Compensates the driver for the dead wait. |
+| System cancels (no driver found, §16) | N/A / release | **Free** | Our failure, not the rider's. |
+
+#### Q: If the rider cancels mid-trip (already `IN_PROGRESS`), do they still pay?
+
+Yes — but it's not a "cancellation fee," it's a **partial fare** for the distance/time actually driven. Once the trip is `IN_PROGRESS` the meter is real: the state machine (§8) won't let it jump back to `CANCELLED` for free, so an early end computes the fare from the GPS distance covered so far (metered), charges that via the idempotent payment path (§12), and moves the trip to `COMPLETED`. The rule of thumb: **before pickup = flat cancellation/no-show fee; after start = partial metered fare.**
 
 ---
 
@@ -1043,24 +1117,7 @@ Come back to the §2 rule: **be strict about money and ride ownership, relaxed a
 
 ---
 
-## 16. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Strategy** | Matching (greedy vs batch/min-cost), pricing (normal/surge), ETA model | Swap algorithms |
-| **State** | Trip lifecycle | Guard legal transitions |
-| **Observer / Pub-Sub** | Kafka events + WebSocket tracking | Decouple; fan-out |
-| **Ports & Adapters** | Routing, payment, maps, geo-index | Swap providers |
-| **Saga / Orchestration** | Request→match→trip→payment, with compensation (cancel/refund) | Distributed txn |
-| **Outbox** | Reliable event emit (trip end → charge/payout) | No dual-write loss |
-| **Circuit Breaker** | Maps/payment calls | Fail fast on provider issues |
-| **Spatial Index** | Geohash/S2/H3/Redis GEO | Fast nearby search |
-| **Decorator / Chain** | Fare composition (base + distance + time + surge + tax) | Stack fare rules |
-| **Repository / Factory** | Data access; vehicle/notification creation | Testable, extensible |
-
----
-
-## 17. Scaling & Failure
+## 16. Scaling & Failure
 
 - **Geo-shard by city/region** — rides are local → locality + isolation; matching engine stateless + horizontally scaled per region.
 - **Location firehose** → Redis GEO + Kafka; downsample history to a lake; never the DB.
@@ -1072,7 +1129,7 @@ Come back to the §2 rule: **be strict about money and ride ownership, relaxed a
 
 ---
 
-## 18. Interview Cheat Sheet
+## 17. Interview Cheat Sheet
 
 > **"How do you find nearby drivers fast?"**
 > "A geospatial index — geohash/S2/**H3 hexagons** (Uber) or Redis GEO. Index online drivers by cell; `GEOSEARCH` a radius around pickup and rank candidates by **ETA-to-pickup via routing** (not straight-line), rating, and direction."
@@ -1089,9 +1146,126 @@ Come back to the §2 rule: **be strict about money and ride ownership, relaxed a
 > **"Consistency model?"**
 > "Strong for trips and payments (idempotency, atomic claim, outbox); eventual for driver location and nearby-driver discovery."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Driver "accepts" two rides at once** | Only the **atomic Redis claim** (`SET driver:{id}:lock NX`) can win once — the second ride gets `nil`, is told "driver taken," and offers its next candidate. DB `drivers.status=ON_TRIP` is the backstop. |
+| **Quote expires mid-request** (rider hesitates > TTL) | `POST /rides` with a stale `quoteId` is rejected → app silently re-fetches `estimate` and shows the (possibly new) price before confirming. Never charge an expired quote. |
+| **Redis claim OK but trip DB update returns 0 rows** | The trip already moved (rider cancelled / another actor won). **DB is the truth** → release the Redis lock, re-offer the driver, don't assign. Redis is a fast gate, not the record. |
+| **Surge changes between quote and trip start** | Rider pays the **locked `quoteId`** fare, not live surge — that's the whole point of freezing it (§11). Surge drift only affects *new* estimates, never an in-flight quoted ride. |
+| **Driver crashes / loses signal mid-trip** | Trip state is durable in the DB; last known GPS is in Redis. On reconnect the WebSocket re-registers and streaming resumes; the trip never leaves `IN_PROGRESS` on its own. |
+| **Two riders' best match is the same scarce driver** | Atomic claim gives exactly one winner; the loser re-dispatches. In dense markets, **batch matching** (§7) avoids the fight by assigning the pool together. |
+
+> **Ultimate layer model:** Redis GEO = fast "who's nearby" · atomic claim = one driver, one trip · state machine + conditional update = legal transitions only · idempotency key = safe retries · outbox = money/events never lost.
+
 ---
 
-## 19. Final Takeaways
+## 18. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Ride-hailing has a **crisp, memorable split** — use it.
+
+The whole system is deliberately **two systems glued together**: a small **CP** core (trips/payments) and a huge **AP** edge (locations/geo-index). CAP says under a network partition you can keep either **C**onsistency or **A**vailability, not both — so you pick *per data type* based on what being wrong costs.
+
+| Path | Choice | Under a partition… | Why |
+| --- | --- | --- | --- |
+| **Trip state / driver assignment** | **CP** | Refuse/retry rather than double-assign | Two riders sharing one car is real-world chaos; correctness > uptime here. |
+| **Payments / fare / ledger** | **CP** | Block rather than mischarge | It's money — a wrong charge means refunds and lost trust. |
+| **Driver location / "nearby" list** | **AP** (last-write-wins) | Serve slightly stale dots, keep going | A car icon 2s behind is invisible; availability of the firehose matters more. |
+| **Geo-index (Redis GEO)** | **AP** (last-write-wins) | Newest `GEOADD` wins; old pings just lost | Locations are disposable; you only ever want the latest value. |
+| **Surge zones** | **AP** (eventual) | Serve last computed multiplier | A few seconds of stale surge is fine; the quote is frozen anyway (§11). |
+
+- The CP core is tiny and low-rate (§3), so paying for strong consistency (atomic claim, `UPDATE ... WHERE status`, unique keys, outbox) is cheap and worth it.
+- The AP edge is the 250k-pings/sec monster; **last-write-wins** on an in-memory store is exactly the relaxed guarantee that makes that throughput possible.
+
+> **Interviewer one-liner:** *"Strong consistency where money and ride ownership live, eventual (last-write-wins) for driver locations and discovery — I match the strength of the guarantee to the cost of being wrong."*
+
+---
+
+## 19. Reliability & Observability
+
+> A system that matches perfectly but silently drops 5% of ride requests during a spike has failed. Show you'd **measure** and **degrade gracefully**, not just build the happy path.
+
+### Key metrics to watch
+
+| Metric | What it tells you | Alert when |
+| --- | --- | --- |
+| **Match latency** (request → `DRIVER_ASSIGNED`, p50/p99) | Is dispatch keeping up? | p99 creeps past a few seconds |
+| **Unassigned-trip age** (oldest `REQUESTED` still searching) | Riders stuck with no driver | age climbs → widen radius / raise surge |
+| **Location ping rate** (pings/sec vs expected) | Firehose health; are drivers' apps reporting? | sudden drop = gateway/ingest issue |
+| **Surge multiplier drift** (recompute lag) | Is pricing stale vs real demand? | stream job falls behind window |
+| **Offer accept rate / timeout rate** | Matching quality; are we offering to bad drivers? | acceptance drops → scoring or supply problem |
+| **Payment success / reconciliation backlog** | Money settling correctly | backlog grows |
+
+### Reliability principles
+
+- **No single point of failure** — replicate the trip DB (primary + replicas + failover), run multi-AZ Redis, and keep matching/gateway services stateless behind load balancers so any instance can die.
+- **Idempotent retries everywhere** on the write path — ride creation, claim, charge all carry keys so a retry after a timeout is a no-op, never a duplicate.
+- **Dead-letter queues (DLQs)** for events that repeatedly fail to process (e.g. a malformed `TRIP_ENDED`) so one poison message doesn't stall the whole consumer.
+- **Graceful degradation** — if the routing/ETA service is down, fall back to **straight-line distance × avg speed** for a rough ETA rather than blocking matching; if surge's stream job lags, serve the **last known multiplier** (or 1.0×) instead of failing the estimate; if a WebSocket gateway dies, clients **reconnect** and resume since trip state is durable in the DB.
+
+> ⚠️ **Degrade, don't disappear.** Under overload the goal is a *slightly worse* ride (rougher ETA, wider search, a short wait), never a blank screen. Decide up front which features are droppable and which (the trip/payment core) are not.
+
+---
+
+## 20. Safety, Trust & Driver Modes
+
+> Ride-hailing carries a **real-world trust** burden other systems don't — a stranger gets into your car. A quick mention of safety and driver-experience features signals product maturity.
+
+### Safety & trust
+
+- **SOS / emergency button** — one tap shares live location + trip details with a safety team / local emergency services; high-priority path, always available even under degradation.
+- **Trip sharing** — rider shares a live-tracking link (the same WebSocket location stream, §9) with a friend who watches the car in real time without the app.
+- **Identity & verification** — driver background checks and periodic **selfie / face match** before going online (is the person driving the registered driver?); vehicle-plate verification at pickup.
+- **Two-way ratings + anomaly detection** — ratings (§13 `reviews`) plus signals like long unexpected stops or big route deviations flag trips for review.
+
+> 💡 Safety features mostly **reuse existing rails**: SOS and trip-sharing ride on the live location stream; verification is an extra check gating the "go online" API. You rarely need new infrastructure — call that out.
+
+### Driver destination / preference mode
+
+- **Destination mode** — a driver heading home sets their destination; matching then **only offers rides roughly along that route** (a directional filter on candidate scoring, §7), so they earn on the way instead of driving empty.
+- **Preference filters** — ride types the driver will accept (e.g. pool vs solo, long trips), fed into the same scoring/eligibility step.
+
+> These are **filters layered onto the matching funnel (§7)**, not a separate engine: they shrink the candidate set *before* scoring. Framing them that way shows you understand where new business rules plug into the existing design.
+
+---
+
+## 21. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5 (the geo-matching core) — that's what they're really testing.
+
+1. **Clarify requirements** (functional + NFRs; call out the strong-vs-eventual split) — §2
+2. **Estimate scale** — surface the **location firehose** (250k pings/sec) as the monster — §3
+3. **Define APIs** (note the `quoteId` lock + idempotent `POST /rides`) — §4
+4. **High-level architecture + data model** — §5, §13
+5. **Deep dive: the hard part** → **geo-index + real-time matching/dispatch** — §6, §7
+6. **Surge / dynamic pricing** (demand ÷ supply per cell, quote lock) — §11
+7. **Trip lifecycle, location pipeline, payments** (state machine, WebSocket, outbox, ledger) — §8, §9, §12
+8. **Scale + edge cases + failure** (geo-shard, no driver, cancellations, degradation) — §16, §19
+9. **Summarize tradeoffs** — §18
+
+> 🎤 **Lead with the core challenge:** open with *"The crux is real-time geo-matching — finding and locking the best nearby driver in seconds over a firehose of location updates, while keeping trips and money strongly consistent."* Then spend most of your time on §6–§7. Everything else is supporting cast.
+
+---
+
+## 22. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Strategy** | Matching (greedy vs batch/min-cost), pricing (normal/surge), ETA model | Swap algorithms |
+| **State** | Trip lifecycle | Guard legal transitions |
+| **Observer / Pub-Sub** | Kafka events + WebSocket tracking | Decouple; fan-out |
+| **Ports & Adapters** | Routing, payment, maps, geo-index | Swap providers |
+| **Saga / Orchestration** | Request→match→trip→payment, with compensation (cancel/refund) | Distributed txn |
+| **Outbox** | Reliable event emit (trip end → charge/payout) | No dual-write loss |
+| **Circuit Breaker** | Maps/payment calls | Fail fast on provider issues |
+| **Spatial Index** | Geohash/S2/H3/Redis GEO | Fast nearby search |
+| **Decorator / Chain** | Fare composition (base + distance + time + surge + tax) | Stack fare rules |
+| **Repository / Factory** | Data access; vehicle/notification creation | Testable, extensible |
+
+---
+
+## 23. Final Takeaways
 
 - **Real-time geo-matching** over a **spatial index** (H3/S2/geohash/Redis GEO) is the core; rank by **ETA-by-road**, not straight-line.
 - **Atomic driver claim** + offer/timeout/fallback loop; **batch min-cost matching** in dense areas; pooling is a routing problem.

@@ -16,13 +16,17 @@
 - [6. Delivery Guarantees & Consumer Idempotency](#6-delivery-guarantees--consumer-idempotency)
 - [7. Event Ordering](#7-event-ordering)
 - [8. Outbox Table Cleanup](#8-outbox-table-cleanup)
+- [Transactional Inbox & CDC (Debezium)](#transactional-inbox--cdc-debezium)
+- [When to Use Outbox vs CDC vs Event Sourcing](#when-to-use-outbox-vs-cdc-vs-event-sourcing)
 - [9. Saga Pattern](#9-saga-pattern)
 - [10. Saga Walkthrough — Create Order](#10-saga-walkthrough--create-order)
 - [11. Two Ways to Implement Saga](#11-two-ways-to-implement-saga)
 - [12. Saga Isolation Gotcha](#12-saga-isolation-gotcha)
 - [13. Retriable vs Compensatable Steps (Pivot Transaction)](#13-retriable-vs-compensatable-steps-pivot-transaction)
 - [14. When a Compensation Fails](#14-when-a-compensation-fails)
+- [Saga Timeouts & Stuck Sagas](#saga-timeouts--stuck-sagas)
 - [15. How Outbox + Saga + Idempotency Fit Together](#15-how-outbox--saga--idempotency-fit-together)
+- [Common Mistakes](#common-mistakes)
 - [16. Interview Cheat Sheet](#16-interview-cheat-sheet)
 - [17. Final Takeaways](#17-final-takeaways)
 
@@ -516,6 +520,40 @@ OrderUpdated (v2) processed before OrderCreated (v1)  ❌
 
 > Global ordering is expensive and rarely needed. **Per-aggregate ordering is usually enough.**
 
+### Version / sequence numbers, in practice
+
+Partitioning keeps events *for one order* in one Kafka partition, so they usually arrive in order. But retries, rebalances, and a brief window of two workers can still reorder them. The robust fix is to **stamp each event with a monotonic `version`** (per aggregate) and let the consumer **ignore anything it has already surpassed**.
+
+Add the column to the outbox and increment it per aggregate:
+
+```sql
+ALTER TABLE outbox ADD COLUMN version BIGINT;   -- monotonic per aggregate_id (1, 2, 3, ...)
+```
+
+Then the consumer keeps the **last version it applied** for each aggregate and drops stale/duplicate events:
+
+```java
+@KafkaListener(topics = "orders")
+public void onOrderEvent(OrderEvent e) {
+    long lastApplied = versionStore.get(e.getOrderId());   // e.g. 5, default 0
+
+    if (e.getVersion() <= lastApplied) {
+        return;   // stale or duplicate — a newer state is already applied
+    }
+
+    apply(e);                                              // process this newer event
+    versionStore.put(e.getOrderId(), e.getVersion());      // advance the watermark (atomic with apply)
+}
+```
+
+> 💡 This is the **same idea as an idempotency key, but ordered**: `event_id` dedup answers "have I seen this?"; `version` answers "is this *newer* than what I have?" Versioning gives you dedup **and** stale-event protection in one field.
+
+> ⚠️ Store the applied `version` **in the same transaction** as the state change. If you apply the event and crash before saving the version, a redelivery re-applies it — you're back to needing idempotency underneath.
+
+#### Q: If I already partition by `order_id`, why bother with a version?
+
+Partitioning gives you *best-effort* order on the happy path, but it breaks exactly when things go wrong: a producer retry can re-send an older event after a newer one, and during a consumer-group rebalance a message can be re-delivered out of sequence. The `version` check is the **consumer-side safety net** that makes correctness independent of delivery order — cheap insurance for the cases partitioning alone can't cover.
+
 ---
 
 ## 8. Outbox Table Cleanup
@@ -543,7 +581,84 @@ WHERE status = 'SENT'
 
 ---
 
+## Transactional Inbox & CDC (Debezium)
+
+### Transactional Inbox — the outbox, mirrored on the consumer
+
+The outbox protects the **producer** ("my event is never lost after I commit"). The **inbox** is the mirror image on the **consumer**: "an event I received is processed **exactly once**, even if it's redelivered."
+
+The trick is symmetric. Instead of processing an event directly, the consumer first writes it to an `inbox` table **in the same transaction** as its own business change:
+
+```
+BEGIN TRANSACTION
+  1. Insert event_id into inbox   (fails if event_id already exists → duplicate)
+  2. Apply the business change    (reserve inventory, etc.)
+COMMIT
+```
+
+Because the dedup record and the effect commit together, a redelivery hits a **duplicate-key violation on the inbox row** and is safely skipped — no half-applied state.
+
+> 💡 **Outbox + Inbox = end-to-end exactly-once *effect*.** The wire is still at-least-once, but the outbox guarantees "never lost on send" and the inbox guarantees "never applied twice on receive." The `processed_events` dedup in §6 *is* a lightweight inbox.
+
+### CDC / Debezium — skip the polling entirely
+
+Instead of a relay that **polls** the outbox, **Change Data Capture** tails the database's write-ahead log (WAL/binlog) and streams committed row changes straight to Kafka. **Debezium** is the common tool.
+
+```
+orders + outbox INSERT  →  DB commit  →  WAL/binlog  →  Debezium  →  Kafka
+```
+
+You often still write to an outbox table, but nothing polls it — Debezium reads the commit log directly, so there's **no `SELECT ... PENDING` loop and no polling latency/DB load**.
+
+| | Polling relay (this doc) | CDC / Debezium |
+| --- | --- | --- |
+| How events leave the DB | app `SELECT`s the outbox | reads the commit log (WAL/binlog) |
+| Latency | tick interval (ms–s) | near-instant |
+| DB load | continuous polling queries | log reader, negligible query load |
+| Ops cost | tiny (a cron/loop) | Kafka Connect + Debezium to run/monitor |
+| Ordering | you enforce it | log order preserved per table |
+
+> 💡 **Pick CDC when** polling latency or DB load hurts (high write volume), or you already run Kafka Connect. **Stick with the polling relay when** volume is modest and you'd rather not operate Debezium — it's the pragmatic default.
+
+---
+
+## When to Use Outbox vs CDC vs Event Sourcing
+
+All three get events out of a service reliably, but they solve different pressures. Match the tool to the constraint — and know when **none** of them is worth it.
+
+| Approach | Use when | How it works | Cost / trade-off |
+| --- | --- | --- | --- |
+| **Transactional Outbox** | You need reliable publishing at modest–medium volume and want simple infra | Event row in the same txn; relay polls & publishes | Slight latency; extra worker; at-least-once |
+| **CDC (Debezium)** | You need **near-instant** publish, or polling load/latency hurts at high volume | Tail the DB commit log → Kafka, no app polling | Heavy infra (Kafka Connect + Debezium) to run/monitor |
+| **Event Sourcing** | **Greenfield** system where the event log *is* the source of truth (audit, replay, temporal queries) | State is derived by replaying an append-only event log | Big paradigm shift; rebuild state via projections |
+
+### When NOT to reach for these
+
+- **Low volume / single consumer → just publish directly + retry.** If you emit a handful of events and a simple retry-with-backoff (or a manual reconcile job) is acceptable, the outbox is over-engineering. Add it when a lost event actually causes real inconsistency.
+- **You need the event out *instantly* → CDC, not polling.** A polling relay always adds up to one tick of latency. If milliseconds matter, tail the log with CDC instead of tightening the poll loop.
+- **Greenfield with strong audit/replay needs → event sourcing.** If you're designing fresh and the history itself is valuable, make the event log the source of truth from day one — bolting an outbox onto a mutable-state model later gives you neither the audit trail nor the replay.
+
+> ⚠️ Don't cargo-cult the outbox onto every service. It exists to fix the **dual-write** problem (§1). No dual write → no outbox needed.
+
+---
+
 ## 9. Saga Pattern
+
+### First, the intuition — a saga is an "undo stack"
+
+Before any distributed-systems jargon, here's the whole idea. Imagine doing a multi-step task where **each step is already permanent the moment you finish it** (you can't hit Ctrl-Z). To stay safe, every time you complete a step you **write down how to undo it** on a stack of sticky notes:
+
+```
+Do:  create order        → note: "cancel order"
+Do:  reserve inventory    → note: "release inventory"
+Do:  charge payment       → ❌ card declined!
+```
+
+Payment failed, so you can't finish. You now **pop the notes in reverse** and run each undo: *release inventory*, then *cancel order*. You end up back at a clean state — not by rewinding time, but by **doing new "undo" actions** you planned ahead of time.
+
+That's a saga: **a sequence of steps, each paired with a compensating "undo," and a stack that remembers what to unwind if something later fails.** Everything below (distributed transactions, 2PC, orchestration) is just this idea made rigorous for real services.
+
+> 💡 A database transaction gives you the undo stack **for free** (automatic `ROLLBACK`). A saga is what you build **by hand** when the steps live in different services and no shared transaction exists.
 
 ### Problem it solves
 
@@ -700,6 +815,17 @@ public void createOrderSaga(OrderRequest req) {
 #### Q: Why reverse order — does it matter?
 
 Usually yes. Later steps often depend on earlier ones (you can't refund a payment that was never charged; releasing inventory before cancelling the order keeps the order's view sane). Undoing newest-first mirrors how you got into the state and avoids acting on things that no longer exist.
+
+#### Q: Can a compensation "erase" the charge — i.e. is it a rollback?
+
+No. A **compensation is not a rollback** — it's a *new forward transaction* that offsets the old one. When you charge a card, real money moves and the payment provider records a settled transaction; that fact is now part of history and cannot be deleted. The compensation is a **refund**: a *second* transaction that moves money back. The customer's balance ends up where it started, but the ledger shows **both** the charge and the refund — two real events, not one erased event.
+
+This matters in practice:
+
+- A refund can **take days** to settle and can itself **fail** (closed card, etc.) → compensations must be idempotent and retriable (§14).
+- Some effects are **irreversible** (a shipped package, a sent email). Their "compensation" is a *mitigation* (recall request, correction email), not an undo — another reason to order such steps **after the pivot** (§13).
+
+> 💡 Think **accounting ledger, not `Ctrl-Z`**: you never delete a line, you add a balancing line. "As if it never happened" is a *net-zero effect*, not a *deleted history*.
 
 ---
 
@@ -921,6 +1047,40 @@ Because it removes impossible situations. If a non-undoable step sat *before* th
 
 ---
 
+## Saga Timeouts & Stuck Sagas
+
+A step can **hang** — the payment service is slow, an event is lost, a downstream call never returns. Without a timeout, the saga sits in `IN_PROGRESS` forever, holding semantic locks (reserved inventory!) and blocking the order. Every long-lived saga needs a **deadline per step** and a plan for what to do when it fires.
+
+### The playbook
+
+1. **Set a timeout on each step**, not just the whole saga. Store a `deadline_at` on the saga-log row; a sweeper job scans for steps past their deadline.
+
+```
+saga_id | current_step   | status      | deadline_at
+--------|----------------|-------------|--------------------
+abc123  | CHARGE_PAYMENT | IN_PROGRESS | 2026-07-14 19:41:00   ← past due → act
+```
+
+2. **Decide: cancel vs retry — based on the pivot (§13).**
+   - **Before the pivot** (still compensatable) → **cancel**: run compensations backwards (release inventory, cancel order), free the locks.
+   - **After the pivot** (must roll forward) → **retry** with backoff: the money already moved, so you can't undo — keep retrying `confirm` / `send receipt` until it succeeds.
+
+```
+timeout fires
+   ├─ before pivot? → COMPENSATE (release inventory → cancel order)
+   └─ after pivot?  → RETRY forward (with backoff)
+```
+
+3. **Beware the double-fire.** A timeout doesn't mean the step *failed* — it may just be slow. The step might still complete after you've given up. So the timeout path must be **idempotent**: a late-arriving `PaymentSucceeded` for a saga you already cancelled must be reconciled (e.g. auto-refund), not blindly applied.
+
+4. **Bounded retries → DLQ → human.** After N retries a compensation or forward step still fails, park the saga in a **dead-letter queue** and raise an alert. An **ops dashboard** lets someone inspect and resolve it manually (e.g. a stuck refund).
+
+> ⚠️ A saga stuck mid-flight is **not harmless** — it's holding a semantic lock (§12). Reserved-but-never-released inventory silently reduces sellable stock. Timeouts exist to release those locks, not just to fail fast.
+
+> 💡 This is exactly why teams reach for **Temporal / Step Functions / Camunda**: durable timers, automatic retries, and a queryable history of stuck workflows come built in — you don't hand-roll the sweeper.
+
+---
+
 ## 15. How Outbox + Saga + Idempotency Fit Together
 
 ### Full system flow
@@ -971,6 +1131,24 @@ Placing an order:
 1. You place the order → **idempotency** ensures no duplicates
 2. System records everything → **outbox** ensures nothing is lost
 3. Multiple steps happen → **saga** ensures consistency
+
+---
+
+## Common Mistakes
+
+The patterns are simple; the bugs come from subtle violations of their core invariant. These are the ones that actually break systems in production.
+
+| Mistake | Why it breaks | Do this instead |
+| --- | --- | --- |
+| **Publishing outside the transaction** | You call `kafka.send()` in `createOrder` instead of writing an outbox row. A crash after commit but before send → event lost. It's the **dual-write problem the outbox exists to solve** (§1). | Insert the event row in the *same* transaction; let the relay publish. |
+| **Marking `SENT` before Kafka acks** | You set `status = SENT` then publish. If publish fails, the row is already `SENT` → the event is **silently lost forever**. | Publish first, mark `SENT` only after a **successful ack**. A crash in between just re-publishes (at-least-once, §6). |
+| **Saga without persisted orchestrator state** | Orchestrator holds the flow **in memory**. It crashes mid-saga → nobody knows which steps ran, locks never release, order stuck forever. | Persist a **saga log** row per step (§11); resume or compensate on restart. |
+| **Non-idempotent compensations** | `release stock` blindly does `stock += 10`. A retry runs it twice → **stock inflated**. Same for double refunds. | Make every compensation **idempotent** (check-then-act, or key on saga_id) so retries are safe (§14). |
+| **Choreography with no correlation ID** | Events fly between services with no shared id → you can't tell which `PaymentFailed` belongs to which order, and can't trace a flow. | Stamp every event with a **correlation/saga id**; log it end-to-end so a flow is reconstructable. |
+
+> ⚠️ Four of these five collapse to **one rule**: the event and the effect must share a fate. Write them in one transaction, ack before you mark done, and never trust in-memory state to survive a crash.
+
+> 💡 Interview tell: if someone says "then we publish to Kafka **and** save the order," ask *"in what order, and what happens if the second one fails?"* — that question exposes the dual-write bug every time.
 
 ---
 

@@ -19,10 +19,12 @@
 - [9. API Design](#9-api-design)
 - [10. Sequences](#10-sequences)
 - [11. Consistency & Edge Cases](#11-consistency--edge-cases)
-- [12. Design Patterns (that can be used)](#12-design-patterns-that-can-be-used)
-- [13. Scaling & Failure](#13-scaling--failure)
-- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
-- [15. Final Takeaways](#15-final-takeaways)
+- [12. Scaling & Failure](#12-scaling--failure)
+- [13. Interview Cheat Sheet](#13-interview-cheat-sheet)
+- [14. Consistency & CAP Tradeoffs](#14-consistency--cap-tradeoffs)
+- [15. How to Drive the Interview (framework)](#15-how-to-drive-the-interview-framework)
+- [16. Design Patterns (that can be used)](#16-design-patterns-that-can-be-used)
+- [17. Final Takeaways](#17-final-takeaways)
 
 ---
 
@@ -58,9 +60,7 @@ So there are really four everyday actions, and the whole system is built to make
 1. **Answer ranking by quality** — a doctor's answer about medicine should beat a random stranger's, even with similar votes. Ranking uses *author expertise*, not just vote count.
 2. **Question dedup** — "How do I learn Python?" and "Best way to get started with Python?" are the *same* question. We detect that and keep all answers together under one canonical question, instead of scattering them across 100 near-identical pages.
 
-#### Q: Why not just store questions and answers in one big table and be done?
-
-You can store them fine — the hard part is **serving reads fast at scale**. Billions of people read; only a tiny fraction write. If every page view recomputed "which answers are best?" and "what should this user's feed contain?" from scratch, the database would melt. The recurring trick in this whole design is: **do the expensive work once (rank answers, build feeds, aggregate votes) ahead of time, cache the result, and let reads just fetch it.** That's the CQRS idea you'll see repeated in every section below.
+You could store questions and answers in one big table and call it done — storage isn't the hard part. The hard part is **serving reads fast at scale**. Billions of people read; only a tiny fraction write. If every page view recomputed "which answers are best?" and "what should this user's feed contain?" from scratch, the database would melt. The recurring trick in this whole design is: **do the expensive work once (rank answers, build feeds, aggregate votes) ahead of time, cache the result, and let reads just fetch it.** That's the CQRS idea you'll see repeated in every section below.
 
 ---
 
@@ -82,9 +82,7 @@ You can store them fine — the hard part is **serving reads fast at scale**. Bi
 
 **Read-heavy** is the single most important constraint. On a Q&A site, one person writes an answer and then *millions* read it over months. Reads outnumber writes by a huge factor, so we optimize hard for reads (caching, precomputed lists) and can afford to be a bit slower/cleverer on writes.
 
-#### Q: "Eventual consistency ok" — doesn't that mean the site shows wrong data?
-
-It means *slightly stale is fine here because nobody's money or safety is on the line.* If you upvote an answer and its count shows **1,240** for a few seconds before ticking to **1,241**, no harm done. Compare that to a bank balance, which must be exact instantly (**strong** consistency). Quora deliberately trades a few seconds of staleness (in vote counts, rankings, feeds) for massive speed and scale. For example, a "most popular answers" list can refresh every few minutes rather than the instant each reader clicks.
+"Eventual consistency ok" doesn't mean the site shows wrong data — it means *slightly stale is fine here because nobody's money or safety is on the line.* If you upvote an answer and its count shows **1,240** for a few seconds before ticking to **1,241**, no harm done. Compare that to a bank balance, which must be exact instantly (**strong** consistency). Quora deliberately trades a few seconds of staleness (in vote counts, rankings, feeds) for massive speed and scale. For example, a "most popular answers" list can refresh every few minutes rather than the instant each reader clicks.
 
 ---
 
@@ -106,9 +104,7 @@ These numbers exist to justify design choices, not to be exact. The story they t
 - **Search/dedup runs on every ask and every search** → the search stack (Elasticsearch + vector DB) is hit constantly and must scale independently of the main database.
 - **Data grows forever** → questions and answers never really get deleted, so we partition (split across many machines) and archive cold, rarely-read content to cheaper storage.
 
-#### Q: How do I turn a vague "billions of views" into a number I can reason about?
-
-Pick a round number and divide by seconds in a day (~86,400, call it ~100k). Example:
+How do you turn a vague "billions of views" into a number you can reason about? Pick a round number and divide by seconds in a day (~86,400, call it ~100k). Example:
 
 ```
 2B views/day ÷ ~100,000 sec/day ≈ 20,000 reads/sec average
@@ -116,6 +112,27 @@ peak traffic is spikier → multiply by 3–5× → ~60k–100k reads/sec at pea
 ```
 
 The exact figure barely matters — what matters is the *conclusion*: "tens of thousands of reads per second, so a single database can't serve reads directly; we need caches and read replicas." Estimation in interviews is about reaching that conclusion, not the arithmetic.
+
+### The other QPS number people forget: dedup + search
+
+Reads-per-second gets all the attention, but the *expensive* per-request work on Quora is the **dedup/search path**, because it doesn't just hit a cache — it runs an ML embedding **and** a nearest-neighbor lookup. Size it separately:
+
+```
+Every ask AND every search bar query → 1 embedding + 1 ANN lookup
+  asks              ~ small (writes are rare)
+  searches          ~ much larger (people search constantly before/instead of asking)
+Assume ~5,000 search/dedup QPS at peak (a fraction of the read firehose)
+
+Per query cost:
+  embedding(text)   ~ 5–15 ms on a GPU/embedding service  (the ML forward pass)
+  ANN lookup        ~ 1–5 ms  in the vector DB (HNSW is sub-linear, not a full scan)
+  lexical (ES)      ~ few ms   in parallel
+→ 5k QPS × one embedding each → the embedding service, not the DB, is the bottleneck
+```
+
+> 💡 **tip:** The takeaway isn't the numbers — it's that **embedding + ANN is a separate, GPU-bound cost center** you must scale independently (batch embeddings, cache embeddings for repeated queries, autoscale the embedding service). Say this out loud; most candidates only size the read path and miss that dedup has its own capacity story.
+
+> ⚠️ **pitfall:** Don't claim you "search all 100M question vectors per query." **ANN** (Approximate Nearest Neighbor) over an **HNSW** index is *sub-linear* — it walks a small graph, touching thousands of vectors, not all of them. Saying you brute-force-compare against every vector signals you don't understand why a vector DB exists.
 
 ---
 
@@ -148,9 +165,7 @@ Each service is a **microservice** — it owns one job and one slice of the data
 | **Search Service** | Lexical + semantic search over questions |
 | **Graph Service** | Who follows which topics/users |
 
-#### Q: What is Kafka doing in the middle of this diagram?
-
-When you post an answer, several things must happen: update rankings, refresh feeds, add it to the search index, notify followers. If the Answer Service did all of that *before* replying to you, posting would feel slow and one failing step (say, notifications) could break the whole action.
+So what is Kafka doing in the middle of this diagram? When you post an answer, several things must happen: update rankings, refresh feeds, add it to the search index, notify followers. If the Answer Service did all of that *before* replying to you, posting would feel slow and one failing step (say, notifications) could break the whole action.
 
 Instead, the Answer Service just saves the answer and **publishes an event** — `ANSWER_CREATED` — onto Kafka, then returns immediately. Kafka is a shared **event log**; other services *subscribe* and react on their own time: the ranking job re-ranks, the feed service fans it out, the indexer indexes it, notifications fire. This is the **Pub/Sub (Observer)** pattern: the writer doesn't know or wait for the reactors.
 
@@ -164,9 +179,7 @@ POST answer ─► Answer Service ─► save to DB ─► publish ANSWER_CREATE
                                                       └─► Notifications (tell followers)
 ```
 
-#### Q: What does "CQRS" mean in one sentence?
-
-**Command Query Responsibility Segregation** = *separate the write path from the read path.* Writes (post an answer, cast a vote) go into normal databases. But reads don't run live queries against those — instead a background job precomputes the answers ("ranked answer list for question 42", "home feed for user 7") into a fast cache, and reads just fetch the finished result. Write side and read side have different shapes, optimized separately — the read path serves precomputed results so requests return instantly.
+What does "CQRS" mean in one sentence? **Command Query Responsibility Segregation** = *separate the write path from the read path.* Writes (post an answer, cast a vote) go into normal databases. But reads don't run live queries against those — instead a background job precomputes the answers ("ranked answer list for question 42", "home feed for user 7") into a fast cache, and reads just fetch the finished result. Write side and read side have different shapes, optimized separately — the read path serves precomputed results so requests return instantly.
 
 ---
 
@@ -227,9 +240,7 @@ class QuestionService {
 }
 ```
 
-#### Q: What actually happens when two questions ARE duplicates?
-
-We don't delete either one. We pick one to be the **canonical** (the "real" one everyone lands on) and point the other at it with a `canonical_id`. From then on, visiting the duplicate **redirects** to the canonical, and all answers show up in one place instead of being split across two pages.
+What actually happens when two questions ARE duplicates? We don't delete either one. We pick one to be the **canonical** (the "real" one everyone lands on) and point the other at it with a `canonical_id`. From then on, visiting the duplicate **redirects** to the canonical, and all answers show up in one place instead of being split across two pages.
 
 ```java
 // A moderator or an automated job merges a duplicate into the canonical question
@@ -244,9 +255,7 @@ void mergeDuplicate(long dupId, long canonicalId) {
 }
 ```
 
-#### Q: Why not block the user from posting the moment we find a match?
-
-Because our matcher is a *guess*, not a fact. If we hard-blocked, a genuinely new question that merely *looks* similar would be impossible to ask, which infuriates users. So the friendly flow is **suggest, don't forbid**: "These existing questions look similar — want to read them instead?" The user decides. Merging duplicates that slip through is handled later by moderators/automation, where a human can confirm.
+Why not block the user from posting the moment we find a match? Because our matcher is a *guess*, not a fact. If we hard-blocked, a genuinely new question that merely *looks* similar would be impossible to ask, which infuriates users. So the friendly flow is **suggest, don't forbid**: "These existing questions look similar — want to read them instead?" The user decides. Merging duplicates that slip through is handled later by moderators/automation, where a human can confirm.
 
 ---
 
@@ -276,9 +285,20 @@ We compute a `rank_score` per answer from several **signals**:
 | --- | --- | --- |
 | **Votes (Wilson score)** | Up/down votes, but *fair* when there are few votes | 10/10 upvotes shouldn't instantly beat 900/1000 |
 | **Author credibility/expertise** | Is the author knowledgeable *in this topic*? | An expert's answer is probably more trustworthy |
-| **Quality signals** | Length, formatting, sources/links | A thorough, cited answer beats one line |
+| **Quality signals** | Length, formatting, sources/links, images | A thorough, cited answer beats one line |
 | **Freshness** | How recent | Break ties, surface up-to-date info |
-| **Engagement** | Views, shares | People found it useful |
+| **Engagement** | Views, shares, upvote-rate | People found it useful |
+| **Dwell time** | Do readers actually *stay and read* it, or bounce? | The strongest "was this genuinely helpful?" signal — hard to fake with vote brigading |
+
+> 💡 **tip:** If you name only "upvotes" you sound like Reddit. The interview-winning move is to lead with **author credibility** and **dwell time** — the two signals that make Quora's ranking *quality*-driven rather than *popularity*-driven, and the two hardest to game.
+
+#### Q: What *is* "author credibility" / how is topic expertise actually computed?
+
+"Credibility" isn't one number — it's a **per-topic** reputation. The same person can be an expert in `Cardiology` and a novice in `Python`, so we never store a single global score; we store expertise *scoped to a topic*. Concretely, a background job derives, for each (author, topic) pair, signals like: how often their answers **in that topic** get upvoted, how much **dwell time** those answers earn, whether they hold stated **credentials** (a verified doctor, a Google engineer), how many **topic followers** they have, and whether other credible authors upvote them. Those roll up into a `topicExpertise(topic) → 0..1` value that the ranker weights heavily. It's stored denormalized on the user as a `credibility` **JSONB** blob (`{"Cardiology": 0.94, "Python": 0.2, ...}`) so the ranker can read it without a join.
+
+> 💡 **tip:** A **JSONB** column is a JSON document stored *inside* a relational row that the DB can index and query into. It's perfect here because expertise is a sparse, per-topic map that changes shape per user — modeling it as one row-per-(user,topic) is also valid, but JSONB keeps the hot read (ranker fetching a user's whole expertise map) to a single lookup.
+
+> ⚠️ **pitfall:** Don't say "we compute credibility live when ranking." Expertise is derived by a **periodic batch job** from historical engagement, then cached on the user row — recomputing a person's topic reputation on every answer render would be absurd. Same precompute-and-cache theme as everything else in this doc.
 
 #### Q: What's a "Wilson score" and why not just `upvotes − downvotes`?
 
@@ -319,9 +339,7 @@ double answerRankScore(Answer a, Author author, String topic) {
 }
 ```
 
-#### Q: Do we recompute this ranking every time someone opens the question?
-
-**No — that's the key scaling move.** A popular question is read millions of times but its votes change slowly. Recomputing the ranking on every read would be enormous wasted work. Instead a **background job recomputes the ranked list periodically** (or when enough votes/edits accumulate) and stores the finished, ordered list in a cache. Reads just fetch the cached order.
+Do we recompute this ranking every time someone opens the question? **No — that's the key scaling move.** A popular question is read millions of times but its votes change slowly. Recomputing the ranking on every read would be enormous wasted work. Instead a **background job recomputes the ranked list periodically** (or when enough votes/edits accumulate) and stores the finished, ordered list in a cache. Reads just fetch the cached order.
 
 ```java
 // Runs periodically (or triggered after N new votes) — NOT on every page view
@@ -401,13 +419,62 @@ class FeedService {
 }
 ```
 
-#### Q: What does "hydrate the id list" mean?
+What does "hydrate the id list" mean? The cached feed is just a list of **IDs** — `[q_42, a_17, q_88, ...]` — tiny and cheap to store. When you actually open the app, we **hydrate**: look up each ID's full content (title, body, author, current vote count) to render the page. Storing IDs (not full posts) keeps caches small and means the *content* stays fresh even if the *ordering* was computed a while ago.
 
-The cached feed is just a list of **IDs** — `[q_42, a_17, q_88, ...]` — tiny and cheap to store. When you actually open the app, we **hydrate**: look up each ID's full content (title, body, author, current vote count) to render the page. Storing IDs (not full posts) keeps caches small and means the *content* stays fresh even if the *ordering* was computed a while ago.
+### The end-to-end fan-out sequence
+
+Put the pieces in order so you can narrate it in one breath:
+
+```
+WRITE PATH (someone posts an answer):
+  AnswerSvc saves answer → emits ANSWER_CREATED (Kafka)
+     └─► Feed fan-out worker:
+           - author is a NORMAL user  → push answer_id into each active follower's feed:home:{id}
+           - author is a CELEBRITY    → do NOTHING (their content is pulled at read time)
+           - skip followers who are INACTIVE (haven't opened the app in N days)
+
+READ PATH (user opens home):
+  1. read cached id list  feed:home:{userId}      (pushed items already here)
+  2. PULL fresh items:    top-ranked Q&A from followed topics + celebrities' recent answers
+  3. MERGE push + pull candidates → ML rank for THIS user → cache → hydrate ids → render
+```
+
+#### Q: I just followed a new topic — why is my feed still empty of it?
+
+Because your prebuilt feed was computed *before* you followed it. Two ways to fix the gap, and real systems use both: (1) a **backfill on new follow** — the moment you follow `Python`, a job pulls that topic's recent top-ranked questions and splices them into your `feed:home` so the feed isn't empty; and (2) the **pull half of the hybrid** — followed *topics* are pulled at read time anyway (only followed *users'* answers are pushed), so the next feed refresh naturally includes the new topic. Backfill just makes it feel instant instead of waiting for the next refresh.
+
+> 💡 **tip:** **Skip inactive users on fan-out.** If someone hasn't opened Quora in months, pushing every new answer into their feed is wasted writes and wasted cache. Push only to *active* followers; when a dormant user returns, rebuild their feed on-demand (pull). This one line dramatically shrinks fan-out cost and is a classic senior-signal detail.
+
+### What the ML ranker actually scores on
+
+"ML rank the candidates" is hand-wavy unless you can name the features. The ranker predicts *"how likely is THIS user to engage with THIS item?"* from signals like:
+
+| Feature group | Examples |
+| --- | --- |
+| **Content quality** | answer `rank_score` (§6), author topic-expertise, has sources/images |
+| **User affinity** | overlap between the item's topics and topics/people you follow; your past engagement with this author |
+| **Freshness** | how new the question/answer is (decays over time) |
+| **Engagement priors** | global CTR / dwell time the item is already earning from similar users |
+| **Diversity / dedup** | penalize near-duplicate topics so the feed isn't 10 Python posts in a row |
+
+> ⚠️ **pitfall:** Don't rank the feed purely by each answer's `rank_score`. Answer `rank_score` measures "best answer *within a question*"; the feed ranker measures "best item *for this user right now*" — a globally great answer on a topic you don't care about should still rank low **for you**. Two different rankers, two different jobs.
 
 ---
 
 ## 8. Data Model (all tables)
+
+### Database & storage choices (which DB, and why at scale)
+
+No single database is best for every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question for the content is *"strong consistency and transactions?"* — yes, for questions/answers/votes, which rules out an eventually-consistent NoSQL store as the source of truth. But search itself splits into **two different problems**, which is the interesting twist here.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Questions, answers, votes, topics (**source of truth**) | **RDBMS**, sharded by `question_id` | The composite PK on `votes (user_id, answer_id)` gives "one vote per user per answer" atomically, and `rank_score`-ordered reads (`idx_answers_q_rank`) need a real index, not eventual consistency. Sharding by `question_id` keeps a question and all its answers/comments on one shard. | A NoSQL store would need hand-rolled uniqueness for votes and can't cheaply guarantee the dedup check (§5) that runs inside the same transaction as question creation. |
+| Lexical search (keyword match on title/body) | **Elasticsearch** | Full-text + tag facets need an inverted index and BM25-style relevance ranking — the RDBMS has neither. | Vector search alone can't do exact keyword/phrase matching well (e.g. searching for an exact error message) — you still need lexical for that half of dedup/search. |
+| Semantic dedup & similarity ("did you mean this question?") | **Vector DB** (embeddings + ANN search) | Duplicate questions are rarely worded identically ("How to lose weight fast?" vs "Best way to shed pounds quickly?") — only a **vector embedding + nearest-neighbor search** catches paraphrases that share no keywords. This is Quora's core problem (§5) and lexical search structurally cannot solve it. | Elasticsearch's inverted index matches tokens, not meaning — it would miss the exact paraphrase cases dedup exists to catch. Running vector search alone would miss precise keyword/quote matches. Quora needs **both**, run together at ask-time. |
+| Precomputed feed/ranked answers | **Redis** | `feed:home:{userId}` and `answers:q:{id}:ranked` are read on every page view and are derived from the RDBMS — a sorted set gives instant top-N without recomputing `rank_score` per request. | Recomputing rank across votes+expertise+signals (§6) on every read doesn't scale; this is a CQRS read model, safe to keep in a fast, rebuildable cache. |
+
+**Why RDBMS wins for the Q&A core, and why vector + lexical must both exist for search:** votes/answers are moderate-write, high-read, and need the "one vote per user" guarantee a relational PK gives for free — sharding by `question_id` keeps a question's answers/votes/comments together so answering or voting touches one shard. Search is the unusual part of this system: **lexical (ES)** and **semantic (vector DB)** aren't redundant, they answer different questions — "does this text contain these words" vs "does this text *mean* the same thing" — and Quora's dedup flow (§10) runs both in parallel before deciding whether a new question is really new. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 CREATE TABLE users ( user_id BIGINT PRIMARY KEY, name TEXT, credibility JSONB, created_at TIMESTAMP );
@@ -445,6 +512,18 @@ CREATE TABLE ask_to_answer ( question_id BIGINT, asked_user_id BIGINT, at TIMEST
 
 > **Tables to consider:** users, topics, questions, question_topics, answers, comments, votes, follows_topic, follows_user, question_follows, ask_to_answer, precomputed feeds/rankings, moderation, search index (ES) + vector store.
 
+### Indexes that matter
+
+The schema is only fast if the hot reads hit an index. The ones worth naming out loud:
+
+- `answers (question_id, rank_score DESC)` — **the** index of this system. "Give me this question's answers, best-first" is the most common read; this composite index makes it a single ordered range scan instead of sorting every time.
+- `question_topics (topic_id, question_id)` — powers "recent/top questions in a topic" for feeds and topic pages. Indexing on `topic_id` first lets you jump straight to a topic's questions (the reverse of the PK's `(question_id, topic_id)`).
+- `votes (user_id, answer_id)` — this *is* the composite PK, so it doubles as the uniqueness guard ("one vote per user per answer") **and** the lookup index for the UPSERT.
+- `questions (canonical_id)` — find all duplicates folded into a canonical question (and follow the redirect pointer from §5) without scanning.
+- `comments (answer_id, created_at)` — load an answer's comment thread in order.
+
+> 💡 **tip:** A **composite index's column order is not cosmetic** — `(question_id, rank_score DESC)` serves "answers of a question, ranked" but *not* "globally highest-ranked answers." Match the index's leading column to your query's filter. Naming the exact index behind your hottest query is a strong seniority signal.
+
 ### Reading the schema
 
 Every table maps to a real thing you can point at in the UI. Grouping them:
@@ -456,9 +535,7 @@ Every table maps to a real thing you can point at in the UI. Grouping them:
 | **The people & interest graph** | `users`, `follows_topic`, `follows_user`, `question_follows` | Who exists and what they follow |
 | **The interactions** | `votes`, `ask_to_answer` | Upvotes, and "please answer this" invites |
 
-#### Q: Why the weird two-column primary keys like `PRIMARY KEY (user_id, answer_id)` on votes?
-
-That's a **composite key**, and here it enforces a business rule: **one vote per user per answer.** The pair `(user, answer)` must be unique, so the same user physically *cannot* have two rows for the same answer. If they change their mind, we update the existing row's `value` instead of inserting a new one (an **UPSERT**). Same idea on `question_topics` — one row per (question, topic) pair, no accidental duplicate tags.
+Why the weird two-column primary keys like `PRIMARY KEY (user_id, answer_id)` on votes? That's a **composite key**, and here it enforces a business rule: **one vote per user per answer.** The pair `(user, answer)` must be unique, so the same user physically *cannot* have two rows for the same answer. If they change their mind, we update the existing row's `value` instead of inserting a new one (an **UPSERT**). Same idea on `question_topics` — one row per (question, topic) pair, no accidental duplicate tags.
 
 ```sql
 -- vote or change a vote: insert if new, otherwise overwrite the value.
@@ -469,9 +546,7 @@ ON CONFLICT (user_id, answer_id)          -- the row already exists
 DO UPDATE SET value = EXCLUDED.value;      -- just change up→down or down→up
 ```
 
-#### Q: Why does `answers` store `score`, `up_count`, `down_count` AND `rank_score` — isn't that redundant?
-
-They serve different purposes, and storing them (denormalizing) is deliberate so reads don't recompute:
+Why does `answers` store `score`, `up_count`, `down_count` AND `rank_score` — isn't that redundant? They serve different purposes, and storing them (denormalizing) is deliberate so reads don't recompute:
 
 - `up_count` / `down_count` — the raw tallies, updated by the async vote aggregation.
 - `score` — a simple derived number (e.g. `up − down`) for quick display.
@@ -485,9 +560,7 @@ ORDER  BY rank_score DESC          -- uses idx_answers_q_rank
 LIMIT  20;
 ```
 
-#### Q: What's the `canonical_id` column doing on `questions` again?
-
-It's the dedup pointer from §5. Normally it's null (the question stands alone). When a question is discovered to be a duplicate, `canonical_id` is set to the "real" question's id, and the app follows that pointer so all answers show up under one canonical question. A self-reference within the same table.
+What's the `canonical_id` column doing on `questions` again? It's the dedup pointer from §5. Normally it's null (the question stands alone). When a question is discovered to be a duplicate, `canonical_id` is set to the "real" question's id, and the app follows that pointer so all answers show up under one canonical question. A self-reference within the same table.
 
 ---
 
@@ -527,9 +600,7 @@ GET /v1/home                       → first 20 items + nextCursor="eyJvZmZzZXQi
 GET /v1/home?cursor=eyJ...jJ9      → the NEXT 20, continuing exactly where you stopped
 ```
 
-#### Q: Why does `POST /v1/questions` say "dedup-check first"?
-
-Because the create endpoint doesn't blindly insert. It first runs the lexical+semantic check from §5. If it finds a strong match, it can return suggestions ("these look similar") so the user can reuse an existing question instead of creating a near-duplicate. Only if the user proceeds (or nothing similar exists) does it actually create the row and emit `QUESTION_CREATED`.
+Why does `POST /v1/questions` say "dedup-check first"? Because the create endpoint doesn't blindly insert. It first runs the lexical+semantic check from §5. If it finds a strong match, it can return suggestions ("these look similar") so the user can reuse an existing question instead of creating a near-duplicate. Only if the user proceeds (or nothing similar exists) does it actually create the row and emit `QUESTION_CREATED`.
 
 ---
 
@@ -583,9 +654,26 @@ Ranking job (runs periodically, NOT per read):  recompute rank_score for the que
 Someone reads the question ──► serve the CACHED ranked list ──► hydrate ids into full answers
 ```
 
-#### Q: Why is there a gap between voting and the ranking updating?
+Why is there a gap between voting and the ranking updating? Because ranking is done by a **periodic background job**, not synchronously when you vote. Your vote is saved instantly (so *your* view updates), but the *reordering* of everyone's answers waits for the next ranking pass. This is intentional: re-ranking on every single vote across billions of votes would be impossibly expensive, and a Q&A order that's a minute stale bothers nobody. Write fast, rank eventually.
 
-Because ranking is done by a **periodic background job**, not synchronously when you vote. Your vote is saved instantly (so *your* view updates), but the *reordering* of everyone's answers waits for the next ranking pass. This is intentional: re-ranking on every single vote across billions of votes would be impossibly expensive, and a Q&A order that's a minute stale bothers nobody. Write fast, rank eventually.
+### Ask-to-Answer
+
+A question with zero good answers is a dead end. **Ask-to-Answer** lets the asker (or the system) *invite* specific people who are likely to write a great answer — the mechanism that seeds quality answers on new questions. It's backed by the `ask_to_answer (question_id, asked_user_id, at)` table from §8.
+
+```
+User (or system) invites experts to answer Q:
+  1. pick candidates: users with high topicExpertise for Q's topics (+ followers of the topic)
+  2. INSERT into ask_to_answer (question_id, asked_user_id, at)   -- PK dedupes repeat invites
+  3. emit ASK_TO_ANSWER → Notification service pings each invitee ("You're asked to answer")
+  4. invitee's home feed / "Answer requests" tab surfaces the question
+(when they answer) → normal ANSWER_CREATED path (rank + fan-out); clear the pending request
+```
+
+Who gets invited? The natural candidate pool is exactly the **per-topic expertise** score from §6 — rank potential answerers by `topicExpertise(topic)` and invite the top ones, optionally biased toward people who *follow* the topic (more likely to respond).
+
+> 💡 **tip:** The composite `PRIMARY KEY (question_id, asked_user_id)` on `ask_to_answer` quietly enforces "you can't invite the same person to the same question twice" — the same one-row-per-pair trick used by `votes` and `question_topics`. Point this out; reusing a known pattern is a good signal.
+
+> ⚠️ **pitfall:** Don't fan out invites to *everyone* with topic expertise on a hot topic — that's a notification-spam storm and it trains experts to ignore requests. Cap invites per question, and prefer people with both high expertise **and** recent activity so the ping actually converts into an answer.
 
 ---
 
@@ -635,21 +723,116 @@ void aggregate(List<VoteEvent> batch) {
 
 The displayed count is therefore **approximate/eventually-consistent** — it might show 49,998 for a moment before settling on 50,000. Nobody cares on a Q&A site, and it lets votes scale enormously. (This is the same "aggregate a firehose of events in batches" idea as the ad-click counter, just smaller stakes.)
 
-#### Q: Read-heavy caching — what if the cache is stale or a question gets a sudden traffic spike?
-
-Reads are served from caches (ranked answer lists, feeds) so the database is barely touched. Two beginner worries:
+What if the read-heavy cache is stale, or a question gets a sudden traffic spike? Reads are served from caches (ranked answer lists, feeds) so the database is barely touched. Two beginner worries:
 
 - **Stale cache:** acceptable here. The ranking/feed job refreshes caches periodically; a slightly old order is fine (eventual consistency again). Content itself is hydrated fresh from IDs, so vote counts and text stay current even when *ordering* is a bit old.
 - **Sudden hot question (goes viral):** a single popular question can get a spike of reads. Because its ranked answer list is a single cached entry, one cache lookup serves everyone — the DB isn't hit per reader. If even the cache node gets hot, you replicate that entry across cache nodes. The precompute-and-cache design turns a viral question from a database problem into a cheap cache read.
 
-#### Q: How do deletes and edits stay consistent across search, ranking, and cache?
+Deletes and edits stay consistent across search, ranking, and cache the same lazy way:
 
 - **Deleted answer:** we don't rip it out everywhere instantly; we mark a **tombstone** (a "this is gone" flag). Readers skip tombstoned answers when hydrating, and the next ranking pass drops it and recomputes the question's order. Cleaner than trying to synchronously purge it from every cache and index.
 - **Edited question/answer:** the text changed, so its meaning may have too — we **re-index** it (Elasticsearch + a fresh embedding in the vector DB, often via CDC) and **re-rank**. This keeps search results and dedup accurate after edits.
 
 ---
 
-## 12. Design Patterns (that can be used)
+## 12. Scaling & Failure
+
+- Read-heavy → **cache precomputed feeds + ranked answer lists**; DB rarely hit on reads.
+- **Votes** async-aggregated (Kafka); approximate cached counts.
+- **Search/dedup** on **Elasticsearch (lexical) + vector DB (semantic)**, rebuilt via CDC.
+- **Ranking jobs** recompute per question/feed periodically.
+- Partition questions/answers; archive cold content; eventual consistency acceptable.
+
+### How this survives scale and things breaking
+
+Every bullet above is one of two moves: **serve reads from cheap copies**, and **do heavy work in the background**.
+
+- **Read-heavy → cache everything readers touch.** Feeds and ranked answers live in Redis, so the vast majority of requests never reach the main database. The DB mostly handles the rare writes.
+- **Votes async.** Recording a vote is a tiny write; turning votes into counts happens in batches (§11), so a viral answer can't melt the database with a counter war.
+- **Search on its own stack.** Elasticsearch (words) + vector DB (meaning) run separately from the main DB and are rebuilt from the source of truth via **CDC** (Change Data Capture — the DB streams out its changes so the search indexes stay in sync automatically).
+- **Partition + archive.** Content grows forever, so we split it across many machines (partition) and move old, rarely-read Q&A to cheaper storage (archive).
+
+What actually happens when a piece breaks? Because the system is **eventually consistent** and event-driven, most failures degrade gracefully rather than taking the site down:
+
+| If this breaks... | What users see | Why it's survivable |
+| --- | --- | --- |
+| Ranking job is down | Answer order is a bit stale | Cached list still serves; catches up when the job restarts |
+| Vote aggregator lags | Counts update slowly | Individual votes are still saved; totals reconcile later |
+| Search cluster is down | Search/dedup degraded | Core read/write of Q&A still works; index rebuilds from CDC |
+| A cache node dies | Brief slowdown for those keys | Rebuild the cache entry from the DB; other nodes unaffected |
+
+The theme: nothing here needs bank-grade instant correctness, so we lean on caches, queues, and background recomputation, and let the rare failure heal itself.
+
+---
+
+## 13. Interview Cheat Sheet
+
+> **"How is Quora different from Reddit?"**
+> "Organized around a **question with many answers** ranked by **quality** (author expertise is a key signal, unlike Reddit's pure vote-based hot), plus **topic/people follows** and **question dedup/merge**. The feed/voting/read-heavy machinery is similar."
+
+> **"How do you rank answers?"**
+> "A quality score from votes (Wilson lower bound) + **author credibility/topic expertise** + quality signals + freshness, precomputed per question and cached; recomputed as votes/edits arrive."
+
+> **"How do you avoid duplicate questions?"**
+> "On ask, run **lexical search (Elasticsearch)** + **semantic search (embed → vector DB ANN)** over existing questions; above a similarity threshold, suggest the existing one so the user reuses it; duplicates get merged into a **canonical question** (via `canonical_id` + redirect) so answers stay together."
+
+> **"Feed generation?"**
+> "Candidate generation from followed topics/users (+ recs) → ML ranking → cache (hybrid fan-out): push for followed users, pull for topics."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Two paraphrased questions asked seconds apart** | Both may pass dedup if neither is indexed yet. Fine — a later merge job sets `canonical_id` and folds answers under one canonical question (§5). |
+| **Answer gets 50k upvotes in a minute** | Never `UPDATE ... count+1` per vote (hot row). UPSERT the individual vote, aggregate counts async in batches; displayed count is approximate (§11). |
+| **Viral question — millions of readers at once** | Its ranked answer list is one cached entry → one lookup serves everyone; replicate the hot key across cache nodes. DB barely touched. |
+| **Expert answers a low-vote question late** | Author topic-expertise weight can float it above older high-vote answers on the next ranking pass — quality over recency (§6). |
+| **User edits an answer's text** | Re-index in ES + recompute its embedding in the vector DB (via CDC) and re-rank, so search/dedup stay accurate (§11). |
+| **New follow → empty-looking feed** | Backfill the topic's top questions on follow; the pull half of the hybrid includes it on the next refresh (§7). |
+| **Ask-to-Answer invite spam** | Cap invites per question; target high-expertise **and** recently-active users so pings convert (§10). |
+| **Vote brigading / vote manipulation** | Wilson lower bound resists small-sample gaming; dwell time and per-topic credibility are far harder to fake than raw votes (§6). |
+
+---
+
+## 14. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" On Quora the answer is narrow — **only the vote write needs strong consistency; almost everything else is deliberately eventual.**
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Vote UPSERT (write)** | **CP** (strong consistency) | The composite-PK UPSERT must be atomic so "one vote per user per answer" always holds — you can't double-count or lose a user's vote toggle. |
+| **Question create + dedup** | **CP** (within the shard) | The dedup check and the insert should agree on one source of truth so two identical questions don't both slip through in the same instant. |
+| **`rank_score` / ranked answer lists** | **Eventual** | Recomputed by a periodic job; a minute-stale answer order harms nobody. |
+| **Home feeds** | **Eventual** | Precomputed + cached; a slightly old ordering is fine, content is hydrated fresh. |
+| **Vote *counts* (display)** | **Eventual** | Aggregated async in batches; 49,998 → 50,000 lag is invisible to users. |
+| **Search / dedup index** | **Eventual** | ES + vector DB rebuilt from the DB via CDC; a few seconds behind is acceptable. |
+| **Notifications / analytics** | **Eventual** | Downstream, async, retryable. |
+
+- The **individual vote row** is strongly consistent (atomic UPSERT on `(user_id, answer_id)`); the **derived numbers** built from it — counts, `rank_score`, feeds — are all eventual, recomputed in the background.
+- This is the CQRS split made physical: **strong on the write of record, eventual on every read model derived from it.**
+
+> One-liner: **"Strong consistency on the vote write; eventual consistency on everything derived from it — counts, rankings, and feeds."**
+
+---
+
+## 15. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6 (the parts that make Quora *Quora*).
+
+1. **Clarify requirements** (functional + NFRs; read-heavy, eventual-OK) — §2
+2. **Estimate scale** (read firehose **and** the separate dedup/search + embedding cost) — §3
+3. **Define APIs** — §9
+4. **High-level architecture + data model** — §4, §8
+5. **Deep dive: the distinctive parts** → **question dedup (lexical + semantic/ANN)** and **answer ranking (expertise + Wilson + dwell time)** — §5, §6
+6. **Deep dive: feed generation** (hybrid fan-out + ML ranker) — §7
+7. **Address scale, consistency + edge cases** (async votes, caching, CAP) — §11, §12, §14
+8. **Summarize tradeoffs** — §14, §13
+
+> 🎤 **Lead with what makes it different:** state up front that "the read/vote/feed machinery is Reddit-like; the two crux problems are **semantic question dedup** and **quality-based answer ranking with author expertise**," then spend most of your time there. That framing signals you know *why* this problem was chosen.
+
+---
+
+## 16. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -674,61 +857,11 @@ Patterns are just named solutions to recurring problems. The ones that matter mo
 - **Composite** — "treat a tree uniformly." Comment threads are trees (replies to replies); the Composite pattern lets code walk them the same way at any depth.
 - **Chain of Responsibility** — "a pipeline of steps." Asking a question flows through dedup → validate → topic-tag → publish; each step is a link you can add/remove.
 
-#### Q: Do I need to memorize all nine for an interview?
-
-No. Interviewers care that you can *justify structure*, not recite a catalog. Lead with the three that shape this design — **CQRS/Materialized View** (fast reads), **Observer/Pub-Sub** (decoupled event processing), and **Strategy** (swappable ranking/dedup models) — and mention the rest only if they come up naturally.
+Do you need to memorize all nine for an interview? No. Interviewers care that you can *justify structure*, not recite a catalog. Lead with the three that shape this design — **CQRS/Materialized View** (fast reads), **Observer/Pub-Sub** (decoupled event processing), and **Strategy** (swappable ranking/dedup models) — and mention the rest only if they come up naturally.
 
 ---
 
-## 13. Scaling & Failure
-
-- Read-heavy → **cache precomputed feeds + ranked answer lists**; DB rarely hit on reads.
-- **Votes** async-aggregated (Kafka); approximate cached counts.
-- **Search/dedup** on **Elasticsearch (lexical) + vector DB (semantic)**, rebuilt via CDC.
-- **Ranking jobs** recompute per question/feed periodically.
-- Partition questions/answers; archive cold content; eventual consistency acceptable.
-
-### How this survives scale and things breaking
-
-Every bullet above is one of two moves: **serve reads from cheap copies**, and **do heavy work in the background**.
-
-- **Read-heavy → cache everything readers touch.** Feeds and ranked answers live in Redis, so the vast majority of requests never reach the main database. The DB mostly handles the rare writes.
-- **Votes async.** Recording a vote is a tiny write; turning votes into counts happens in batches (§11), so a viral answer can't melt the database with a counter war.
-- **Search on its own stack.** Elasticsearch (words) + vector DB (meaning) run separately from the main DB and are rebuilt from the source of truth via **CDC** (Change Data Capture — the DB streams out its changes so the search indexes stay in sync automatically).
-- **Partition + archive.** Content grows forever, so we split it across many machines (partition) and move old, rarely-read Q&A to cheaper storage (archive).
-
-#### Q: What actually happens when a piece breaks?
-
-Because the system is **eventually consistent** and event-driven, most failures degrade gracefully rather than taking the site down:
-
-| If this breaks... | What users see | Why it's survivable |
-| --- | --- | --- |
-| Ranking job is down | Answer order is a bit stale | Cached list still serves; catches up when the job restarts |
-| Vote aggregator lags | Counts update slowly | Individual votes are still saved; totals reconcile later |
-| Search cluster is down | Search/dedup degraded | Core read/write of Q&A still works; index rebuilds from CDC |
-| A cache node dies | Brief slowdown for those keys | Rebuild the cache entry from the DB; other nodes unaffected |
-
-The theme: nothing here needs bank-grade instant correctness, so we lean on caches, queues, and background recomputation, and let the rare failure heal itself.
-
----
-
-## 14. Interview Cheat Sheet
-
-> **"How is Quora different from Reddit?"**
-> "Organized around a **question with many answers** ranked by **quality** (author expertise is a key signal, unlike Reddit's pure vote-based hot), plus **topic/people follows** and **question dedup/merge**. The feed/voting/read-heavy machinery is similar."
-
-> **"How do you rank answers?"**
-> "A quality score from votes (Wilson lower bound) + **author credibility/topic expertise** + quality signals + freshness, precomputed per question and cached; recomputed as votes/edits arrive."
-
-> **"How do you avoid duplicate questions?"**
-> "On ask, run **lexical search (Elasticsearch)** + **semantic search (embed → vector DB ANN)** over existing questions; above a similarity threshold, suggest the existing one so the user reuses it; duplicates get merged into a **canonical question** (via `canonical_id` + redirect) so answers stay together."
-
-> **"Feed generation?"**
-> "Candidate generation from followed topics/users (+ recs) → ML ranking → cache (hybrid fan-out): push for followed users, pull for topics."
-
----
-
-## 15. Final Takeaways
+## 17. Final Takeaways
 
 - **Question → many answers**, ranked by **quality** with **author expertise** as a key signal — precomputed + cached.
 - **Question dedup** = lexical (ES) + **semantic (embeddings + vector DB)**; merge into a **canonical** question.

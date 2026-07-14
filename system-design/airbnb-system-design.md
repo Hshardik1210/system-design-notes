@@ -21,11 +21,15 @@
 - [9. Data Model (all tables)](#9-data-model-all-tables)
 - [10. API Design](#10-api-design)
 - [11. Sequences](#11-sequences)
-- [12. Consistency & Edge Cases](#12-consistency--edge-cases)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Scaling & Failure](#14-scaling--failure)
-- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
-- [16. Final Takeaways](#16-final-takeaways)
+- [12. Consistency & CAP Tradeoffs](#12-consistency--cap-tradeoffs)
+- [13. Scaling & Failure](#13-scaling--failure)
+- [14. Reviews & Trust](#14-reviews--trust)
+- [15. Messaging](#15-messaging)
+- [16. Reliability & Observability](#16-reliability--observability)
+- [17. How to Drive the Interview (framework)](#17-how-to-drive-the-interview-framework)
+- [18. Interview Cheat Sheet](#18-interview-cheat-sheet)
+- [19. Design Patterns (that can be used)](#19-design-patterns-that-can-be-used)
+- [20. Final Takeaways](#20-final-takeaways)
 
 ---
 
@@ -68,17 +72,29 @@ On Amazon, if 5 people buy "the same t-shirt," that's fine — there are thousan
 
 ## 2. Requirements
 
+> 💡 **Always start the interview here.** Clarify scope out loud before designing — it frames every later decision and signals seniority. Say the core out loud: *"a two-sided marketplace where the sacred invariant is **no double-booking**."*
+
 **Functional**
 
 - Host: create/manage listings, set calendar availability + pricing, accept/decline requests.
 - Guest: search (location, dates, guests, filters), view listing, book (instant/request), pay, review.
 - Messaging host↔guest; cancellations/refunds per policy; wishlists.
 
-**Non-functional**
+### Non-functional (NFRs)
 
-- **No double-booking** (strong consistency on the booking write).
-- Fast **geo + faceted search** (read-heavy).
-- Trust & safety (reviews, verification); global (multi-currency, i18n).
+| NFR | Target / Note |
+| --- | --- |
+| **Consistency** | **Strong** on the booking/calendar write (no double-booking) and on money (ledger). **Eventual** is fine for search, availability bitset, review counts. |
+| **Availability** | High for search/browse; the booking write may favor **consistency over availability** (CP for the calendar claim). |
+| **Latency** | Search < 200ms (map viewport + facets); booking claim should feel instant. |
+| **Scale** | Read-heavy: search ≫ bookings (**~1000:1**). Spiky traffic on popular destinations/dates. |
+| **Durability** | A confirmed booking and every ledger entry must never be lost. |
+| **Global** | Multi-currency + FX, i18n, regional data locality. |
+| **Trust & safety** | Verified stays, two-way reviews, blocking/reporting, anti-fraud on payments. |
+
+### Out of scope (state assumptions)
+
+- Recommendations/personalized ranking internals (ML black box), pricing optimization, tax/regulatory compliance engines, dispute-resolution UI, Experiences/co-hosting. Mention, then defer.
 
 ---
 
@@ -94,7 +110,20 @@ Calendar rows: 7M listings × 365 days ≈ 2.5B rows/year → partition/prune pa
 Storage: listings + calendar + bookings; photos → blob/CDN (the bulk of bytes)
 ```
 
-> Browse/search dominates → an ES read model + cache. Bookings are low-volume but **strongly consistent** (correctness over throughput).
+> Numbers are illustrative — the point is to **show the method**, not be exact.
+
+### Reading the math (what each number drives)
+
+| Quantity | Rough estimate | How you get there | What it drives in the design |
+| --- | --- | --- | --- |
+| **Search QPS (peak)** | ~tens of thousands/sec | ~1000 searches per booking, spiky on popular dates | ES read model + Redis cache + CDN; **never** hit the write DB on search |
+| **Booking write rate** | modest (~hundreds/sec peak) | 1000:1 search:booking ratio | one RDBMS primary suffices; hard part is **correctness on hot dates**, not throughput |
+| **Calendar write rate** | ~nights-per-booking × bookings | avg ~4 nights/booking flipped `AVAILABLE→BOOKED` | per-night rows + atomic claim; shard by `listing_id` so a claim stays on one shard |
+| **Calendar rows** | ~2.5B/year | 7M listings × 365 nights | **partition by month + drop old partitions** (don't `DELETE` billions of rows) |
+| **Availability bitset** | ~320 MB total | 365 bits (~46 B) × 7M listings | fits in the ES index/memory → cheap in-index date filter (§5) |
+| **Photo storage** | the bulk of bytes | ~20–30 images/listing × millions | **blob + CDN**, never the DB |
+
+> Browse/search dominates → an ES read model + cache. Bookings are low-volume but **strongly consistent** (correctness over throughput). The takeaway that drives everything: **scale reads with replicas/ES/cache; protect one strongly-consistent write path for money + calendar.**
 
 ---
 
@@ -140,7 +169,7 @@ Host edits price / a night gets booked
 
 #### Q: If search can be stale, won't a guest sometimes book a place that's actually taken?
 
-Yes — and that's *allowed*. Search is **best-effort**: it might show a listing that got booked 2 seconds ago. The safety net is that the **booking step re-checks the real calendar in the RDBMS** and rejects the stale one (see §6). Search gets you *candidates*; booking is the *authority*. Trying to make search perfectly live would make it slow and fragile for no real benefit.
+Yes — and that's *allowed*. Search is **best-effort**: it might show a listing that got booked 2 seconds ago (the same applies to the availability bitset in §5 — it's precomputed from the last CDC update, so it can say "free" for a night that just got claimed). The safety net is that the **booking step re-checks the real calendar in the RDBMS** and rejects the stale one (see §6). Search gets you *candidates*; booking is the *authority* — it only needs to be *mostly* fresh, which CDC provides. Trying to make search perfectly live would make it slow and fragile for no real benefit.
 
 ---
 
@@ -232,6 +261,25 @@ You'd think "only show places free July 10–14" is easy. It's the **hardest** p
 
 **The trick: bake availability into the search index as a bitset.** For each listing, store a row of 0/1 bits, one per upcoming day: `1` = free, `0` = taken. A date-range search just checks "are all the bits for July 10–14 set to 1?" — a fixed-width bitwise check instead of scanning a calendar table.
 
+**Concrete 7-day example.** Say today is **Jul 8** and listing 42's next 7 nights look like this (bit index = day offset from today):
+
+```
+day offset:   0     1     2     3     4     5     6
+date:        Jul8  Jul9  Jul10 Jul11 Jul12 Jul13 Jul14
+bit:          1     1     0     0     1     1     1
+                          └──taken──┘
+
+Guest wants Jul 10 → Jul 12  (nights 10 & 11 → bits 2,3)
+  wanted bits = positions {2,3} = 1 1
+  actual bits at {2,3}          = 0 0   → NOT all free → REJECT ✗
+
+Guest wants Jul 12 → Jul 15  (nights 12,13,14 → bits 4,5,6)
+  wanted bits = positions {4,5,6} = 1 1 1
+  actual bits at {4,5,6}          = 1 1 1 → all free → CANDIDATE ✓ (re-check at booking)
+```
+
+So a date-range availability filter is just "**do the requested bit positions all equal 1?**" — one bitwise AND, no calendar scan.
+
 ```
 Listing 42, next 10 days:   [1 1 0 0 1 1 1 1 1 0]
                              ^Jul8            ^Jul17
@@ -255,21 +303,13 @@ boolean isFreeForRange(long mask, int checkInOffset, int checkOutOffset) {
 
 This is **approximate** on purpose (the index lags reality by a few seconds via CDC), so the real calendar is re-checked at booking time (§6).
 
-#### Q: How big is this bitset — can we really keep a year of it for 7M listings?
+**How big is this bitset — can we really keep a year of it for 7M listings?** Yes, and it's tiny: **1 night = 1 bit**, so a full year is `365 bits ≈ 46 bytes` per listing → `7M × 46 bytes ≈ ~320 MB` total. That's the compressed shadow of the 2.5B-row calendar (§3) — a few hundred MB that fits in memory/index. In practice you often keep a smaller **rolling window** (next ~64/90/180 nights, since most bookings are near-term); the code above uses a single 64-bit `long` precisely so 64 nights fit in one CPU word for a one-instruction check. The window **slides forward daily** (day 0 = today; past dates drop off) as CDC updates it.
 
-Yes, and it's tiny: **1 night = 1 bit**, so a full year is `365 bits ≈ 46 bytes` per listing → `7M × 46 bytes ≈ ~320 MB` total. That's the compressed shadow of the 2.5B-row calendar (§3) — a few hundred MB that fits in memory/index. In practice you often keep a smaller **rolling window** (next ~64/90/180 nights, since most bookings are near-term); the code above uses a single 64-bit `long` precisely so 64 nights fit in one CPU word for a one-instruction check. The window **slides forward daily** (day 0 = today; past dates drop off) as CDC updates it.
-
-#### Q: Why not just query the calendar table with `WHERE date BETWEEN … AND status='AVAILABLE'`?
+#### Q: Why not just query the calendar table with `WHERE date BETWEEN … AND status='AVAILABLE'` for every search, instead of building a bitset?
 
 For **one** listing's detail page, you absolutely do (that read is small and exact). The problem is doing it for **every search over millions of listings at once** — that's the 2.5B-row join that melts. The bitset moves a compact, pre-computed answer *into* the search index so the filter is a cheap bitwise AND, not a giant join.
 
-#### Q: What if the bitset says "free" but it just got booked?
-
-Then the booking step rejects it (§6). Search is a fast **shortlist**; being occasionally wrong is acceptable because booking is the authority. The bitset just needs to be *mostly* fresh (short staleness), which CDC provides.
-
-#### Q: How do filters like "wifi, pool, under ₹5000, superhost" work?
-
-Those are **facets** — Elasticsearch indexes them as fields, so `amenities: ["wifi","pool"]`, `price <= 5000`, `is_superhost: true` all become filters combined with the geo + availability filters in one query. Facets are cheap because ES is built for exactly this kind of multi-field filtering.
+**Filters beyond geo and dates** — "wifi, pool, under ₹5000, superhost" — are **facets**. Elasticsearch indexes them as fields, so `amenities: ["wifi","pool"]`, `price <= 5000`, `is_superhost: true` all become filters combined with the geo + availability filters in one query. Facets are cheap because ES is built for exactly this kind of multi-field filtering.
 
 ---
 
@@ -372,10 +412,7 @@ Because the guest **leaves** on the checkout morning, so that night is free for 
 
 This is closest to **optimistic / compare-and-set (CAS)**: we don't lock upfront and make others wait; we just *attempt* the conditional update and detect failure via `rows_affected != nights`. The loser isn't blocked — it's immediately told "no," and can retry with different dates. (A pessimistic alternative would `SELECT … FOR UPDATE` the rows first; the conditional-update style is the cleaner interview answer.)
 
-#### Q: Per-night rows vs storing date *ranges* — which is better?
-
-- **Per-night rows** (one row per listing per date): dead simple, the `WHERE status='AVAILABLE'` trick just works, easy to reason about. Downside: lots of rows (2.5B/year) — prune past dates.
-- **Interval model** (store booked ranges + a DB "exclusion constraint" that forbids overlaps): far more compact, but the overlap logic is trickier and DB-specific. **Use per-night for interviews**; mention intervals as the compact optimization.
+That covers per-night rows, but a natural follow-up is: why not just store date *ranges* instead of one row per night? There are actually three viable storage layouts, each with a different trade-off — worth laying out explicitly.
 
 ### Three ways to store the calendar (and which to use when)
 
@@ -508,13 +545,7 @@ void transition(Booking b, BookingStatus next) {
 
 
 
-#### Q: What happens to the calendar nights when a booking dies?
-
-Every failure exit runs the **same cleanup**: flip those nights from `HELD`/`BOOKED` back to `AVAILABLE` so other guests can book them. This "undo the earlier step" is called **compensation** (it's the heart of the saga in §8). Forgetting it = nights stuck locked forever = lost revenue and angry hosts.
-
-#### Q: How is instant-book different in this picture?
-
-Instant-book simply **skips the REQUESTED state** — there's no host to wait for. It jumps straight to PENDING_PAYMENT → CONFIRMED. Same machine, one fewer stop.
+Every failure exit runs the **same cleanup**: flip those nights from `HELD`/`BOOKED` back to `AVAILABLE` so other guests can book them. This "undo the earlier step" is called **compensation** (it's the heart of the saga in §8). Forgetting it = nights stuck locked forever = lost revenue and angry hosts. Instant-book is the same machine with one fewer stop — it just skips `REQUESTED` (no host to wait for) and jumps straight to `PENDING_PAYMENT → CONFIRMED`.
 
 ---
 
@@ -589,9 +620,7 @@ int quote(BookingCtx ctx) {
 
 Storing these as swappable **pricing_rules** (or seasonal/weekend surge rules) lets pricing change without redeploys — the same "config-driven, no deploy" idea used for hot ads elsewhere.
 
-#### Q: Where does the price live — listing or calendar?
-
-Both. The listing has a `base_price`, but `listing_calendar` also has a per-night `price`, so a host can charge more on weekends/holidays or a specific date. The quote sums the *per-night* calendar prices when they differ from the base.
+The price itself lives in two places, on purpose: the listing has a `base_price`, but `listing_calendar` also has a per-night `price`, so a host can charge more on weekends/holidays or a specific date. The quote above sums the *per-night* calendar prices when they differ from the base.
 
 ### Idempotency — why the same tap doesn't charge twice
 
@@ -622,11 +651,9 @@ void confirmBooking(Booking b) {
 }   // commit → both saved atomically; a poller later ships (2) to Kafka
 ```
 
+### Cancellations and refunds
 
-
-#### Q: What happens on a cancellation/refund?
-
-The **cancellation policy** (FLEXIBLE / MODERATE / STRICT) decides how much is refunded — this is a swappable **Strategy**. The booking moves to `CANCELLED`, nights are released, and the ledger records the refund entries. Flexible = full refund near the date; strict = little/none.
+On a cancellation, the **cancellation policy** (FLEXIBLE / MODERATE / STRICT) decides how much is refunded — this is a swappable **Strategy**: flexible pays back close to full near the date, strict pays back little or none. The booking moves to `CANCELLED`, the held/booked nights are released back to `AVAILABLE`, and the ledger records the refund entries (mirroring the escrow entries above, just reversed).
 
 ---
 
@@ -683,7 +710,18 @@ CREATE TABLE outbox ( id BIGINT PRIMARY KEY, event_type VARCHAR(50), payload JSO
 
 > **Tables to consider:** users, listings, listing_photos, **listing_calendar** (the key one), bookings, payments, payouts, cancellation_policies, reviews, conversations, messages, wishlists, outbox, pricing_rules. Photos → blob/CDN; search → ES.
 
+### Database & storage choices (which DB, and why at scale)
 
+Airbnb already draws this line explicitly in §4/§12 ("strong where it matters, relaxed where it doesn't") — the storage picks just make that concrete. The deciding question: *does this data decide who gets to book a specific night, or does it just help someone find a place?*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| `listing_calendar`, `bookings`, `payments`, `payouts` (ledger) | **RDBMS** (PostgreSQL/MySQL) | The no-double-booking guarantee rests on an **atomic conditional `UPDATE ... WHERE status='AVAILABLE'`** across every night in a range, inside one transaction (§6). Only an ACID engine with row-level locking gives you that "all nights or none" guarantee for free. The double-entry ledger (§8) also needs real transactions — money can't be "eventually" correct. | An eventually-consistent NoSQL store has no cross-row transaction to make "claim 4 nights atomically, roll back if any fails" safe — you'd have to hand-roll distributed locking for a problem the RDBMS solves natively. |
+| Search & discovery (geo + facets + availability bitset) | **Elasticsearch** | Multi-filter queries (location, price, amenities, instant-book) plus a denormalized availability bitset (§5) for a cheap in-index date-range check — a read model rebuilt from the RDBMS via CDC, exactly what ES is built for. | Running `lat BETWEEN...`/facet filters plus a 2.5B-row calendar join (§3) directly against the RDBMS on every search would melt the same database that must stay fast for booking writes. |
+| Listing/availability caching, checkout holds | **Redis** | Sub-ms reads for hot listing/availability lookups, and short-lived holds absorb read/contention load before it reaches the RDBMS. | Hitting the RDBMS for every browse-page render competes with the booking writes that need that same database to stay fast and uncontended. |
+| Photos | **Blob store + CDN** (S3/CloudFront) | Large immutable bytes, served from the edge. | Storing images in the RDBMS bloats it and kills cache locality for the data that actually needs transactions. |
+
+**Why calendar/bookings must be relational:** a booking is "this exact listing, these exact nights" (§1) — the same correctness family as BookMyShow's seat lock, just per night instead of per seat. Losing the atomic conditional update means losing the only thing that stops two guests both winning July 10–14. At Airbnb's actual write volume (bookings are a low, modest rate against the ~1000:1 search:booking ratio, §3), an RDBMS primary handles this comfortably — scale reads with **replicas + the ES CQRS read side**, and scale writes by **sharding on `listing_id`** (§13) so a booking never crosses shards. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ### How the tables fit together
 
@@ -716,9 +754,7 @@ A common beginner mix-up is thinking `listing_calendar` *is* the bookings table.
 
 **Why split it into two tables instead of one?** A booking is naturally a *range* (`check_in` / `check_out`), but to stop double-booking you have to lock and check availability **one night at a time**. Storing one row per night is what makes the atomic `WHERE status='AVAILABLE'` claim work: you flip exactly the contested nights, so two guests booking *non-overlapping* dates on the same listing never block each other. Cramming both jobs into a single "range" table would make that per-night locking clumsy.
 
-#### Q: Why is `listing_calendar` keyed by `(listing_id, date)` instead of having a booking store its own range?
-
-Because the calendar is what we **lock against** to prevent double-booking. Having a concrete row per night lets the atomic `WHERE status='AVAILABLE'` claim (§6) work night-by-night. The `bookings` table stores the *range* (`check_in`, `check_out`) for display/history; the *truth about which nights are free* lives in `listing_calendar`.
+Putting real numbers on the same example makes it concrete — here's exactly what lands in each table for that Jul 10–14 booking:
 
 ```sql
 -- The booking row: the guest-facing summary (range, price, status)
@@ -741,9 +777,7 @@ SELECT date, status FROM listing_calendar
 
 The RDBMS `geohash` (with `idx_listing_geohash`) supports simple/exact lookups and is the source of truth; **Elasticsearch** is the *rebuilt copy* tuned for fast multi-filter search (geo + facets + availability bitset). Same data, two shapes, per CQRS (§4).
 
-#### Q: How do reviews stay honest (two-way)?
-
-The `reviews` table has a `role` (`GUEST_REVIEWS_HOST` / `HOST_REVIEWS_GUEST`) tied to a real `booking_id`. Because a review requires a completed booking, you can't review a place you never stayed at. Airbnb also famously **hides both reviews until both are submitted** (or a window passes) so neither side retaliates — a nice detail to mention.
+Two-way trust is enforced through the schema, not just policy: the `reviews` table has a `role` (`GUEST_REVIEWS_HOST` / `HOST_REVIEWS_GUEST`) tied to a real `booking_id`, so you can't review a place you never actually stayed at. Airbnb also famously **hides both reviews until both are submitted** (or a window passes) so neither side retaliates — a nice detail to mention.
 
 ---
 
@@ -751,16 +785,55 @@ The `reviews` table has a `role` (`GUEST_REVIEWS_HOST` / `HOST_REVIEWS_GUEST`) t
 
 ## 10. API Design
 
+> Keep it RESTful; highlight the **`Idempotency-Key`** header on every money/booking write so retries never double-book or double-charge.
+
 ```
+# ---- Search & listing (read, eventual is fine) ----
 GET  /v1/listings?lat=&lng=&checkIn=&checkOut=&guests=&filters=   # search (map/faceted + availability)
-GET  /v1/listings/{id}     GET /v1/listings/{id}/availability?from=&to=
-POST /v1/bookings          (Idempotency-Key) { listingId, checkIn, checkOut, guests }
-POST /v1/bookings/{id}/accept | /decline     # host (request-to-book)
-POST /v1/bookings/{id}/pay | /cancel
-POST /v1/listings          # host create      PUT /v1/listings/{id}/calendar
+GET  /v1/listings/{id}
+GET  /v1/listings/{id}/availability?from=&to=                    # exact per-listing calendar
+
+# ---- Booking (write, strong consistency) ----
+POST /v1/bookings                                                # create booking / claim nights
+     body:   { listingId, checkIn, checkOut, guests }
+     header: Idempotency-Key: <uuid>
+     → 201 { bookingId, status: REQUESTED | PENDING_PAYMENT }    # instant-book vs request
+     → 409 { error: "DATES_UNAVAILABLE" }                        # lost the race / stale search
+
+POST /v1/bookings/{id}/accept | /decline                        # host (request-to-book)
+POST /v1/bookings/{id}/pay                                       # header: Idempotency-Key
+     → 200 { status: CONFIRMED }
+POST /v1/bookings/{id}/cancel                                   # refund per policy
+GET  /v1/bookings/{id}                                           # poll status
+GET  /v1/users/{id}/bookings                                     # history (cursor paginated)
+
+# ---- Host, reviews, messaging ----
+POST /v1/listings          # host create        PUT /v1/listings/{id}/calendar
 POST /v1/bookings/{id}/review
 POST /v1/conversations/{id}/messages
+
+# ---- Webhooks (inbound, at-least-once → must be idempotent) ----
+POST /v1/webhooks/payments   # gateway callback: charge succeeded/failed/refunded
+POST /v1/webhooks/payouts    # payout settled / failed (host bank)
 ```
+
+### The booking journey (which endpoint, which state)
+
+| Step | Endpoint | Booking state after | Idempotent? |
+| --- | --- | --- | --- |
+| Guest searches | `GET /v1/listings?...` | — (read) | n/a |
+| Guest opens a listing | `GET /v1/listings/{id}/availability` | — (exact calendar read) | n/a |
+| Guest books | `POST /v1/bookings` + `Idempotency-Key` | `REQUESTED` (request) or `PENDING_PAYMENT` (instant) | ✅ key |
+| Host accepts (request only) | `POST /v1/bookings/{id}/accept` | `PENDING_PAYMENT` | ✅ (state-guarded) |
+| Guest pays | `POST /v1/bookings/{id}/pay` + `Idempotency-Key` | `CONFIRMED` | ✅ key |
+| Gateway confirms | `POST /v1/webhooks/payments` | `CONFIRMED` (settle truth) | ✅ dedup event id |
+| Guest cancels | `POST /v1/bookings/{id}/cancel` | `CANCELLED` (refund per policy) | ✅ (state-guarded) |
+
+> The **create-booking** and **pay** endpoints are the ones that MUST be idempotent — a retried tap must return the *first* result, never a second hold or a second charge. Webhooks are **at-least-once**, so dedup them on the gateway event id.
+
+#### Q: At the API level, how does instant-book differ from request-to-book?
+
+It's the **same `POST /v1/bookings` endpoint** — the difference is the *state it returns* and whether a host step exists. For an **instant-book** listing the server claims the nights and immediately returns `PENDING_PAYMENT` (the guest can pay right away, no human in the loop). For a **request-to-book** listing the same call claims the nights as `HELD` and returns `REQUESTED`; the guest can't pay until the host calls `POST /v1/bookings/{id}/accept` (which flips it to `PENDING_PAYMENT`), and a `/decline` or a timeout releases the hold. So the client doesn't choose a different API — it reacts to the returned status, and the `instant_book` flag on the listing decides which path the server takes.
 
 ---
 
@@ -792,11 +865,29 @@ Host accepts within 24h → charge → CONFIRMED (nights → BOOKED)
 Host declines / timeout → booking=DECLINED/EXPIRED → RELEASE held nights (compensation)
 ```
 
+### Instant-book vs request-to-book (side by side)
+
+> Same state machine, same atomic calendar claim — the only real difference is **whether a human approval step sits in the middle** (and therefore how long the hold lasts).
+
+| Dimension | **Instant-book** | **Request-to-book** |
+| --- | --- | --- |
+| Host approval | none | host must accept |
+| First state | `PENDING_PAYMENT` | `REQUESTED` |
+| Calendar on click | claim nights (short hold, ~15 min) | claim nights `HELD` (long hold, ~24h) |
+| When guest is charged | right after claim | only after host accepts |
+| Hold expiry driver | payment timeout (minutes) | host-response timeout (~24h) |
+| Failure → compensation | payment fails → release nights | decline **or** timeout → release nights |
+| Saga shape | machine-only steps | machine **+ human-in-the-loop** step |
+| Guest experience | instant confirmation | wait for host, may be declined |
+| Best for | high-trust/high-volume hosts | hosts who screen guests |
+
+> Interviewer one-liner: *"Instant-book is request-to-book with the host-approval state removed — so I reuse one state machine and one atomic claim, just with a shorter hold and no `REQUESTED` stop."*
+
 ---
 
 
 
-## 12. Consistency & Edge Cases
+## 12. Consistency & CAP Tradeoffs
 
 
 | Case                              | Handling                                                                                |
@@ -816,44 +907,27 @@ Host declines / timeout → booking=DECLINED/EXPIRED → RELEASE held nights (co
 
 ### Strong where it matters, relaxed where it doesn't
 
-The single biggest idea tying this doc together: **not everything needs to be perfectly consistent.** Airbnb deliberately picks per feature:
+The single biggest idea tying this doc together: **not everything needs to be perfectly consistent.** Airbnb deliberately picks per feature. Interviewers phrase this as **CAP** — under a network partition, do you sacrifice **C**onsistency (**AP**) or **A**vailability (**CP**)?
 
+> 💡 **CP vs AP in one breath:** **CP** = refuse to answer rather than give a wrong one (booking write). **AP** = always answer, even if slightly stale (search). You pick per path, not once for the whole system.
 
-| Part                                     | Consistency                  | Why it's OK                                                 |
-| ---------------------------------------- | ---------------------------- | ----------------------------------------------------------- |
-| **Booking / calendar**                   | **Strong** (must be exact)   | Money + no double-booking; a wrong answer is a disaster     |
-| **Search results / availability bitset** | **Eventual** (seconds stale) | A stale card is harmless — booking re-checks and rejects it |
-| **Review counts, ratings on cards**      | **Eventual**                 | Nobody's harmed if a rating updates a few seconds late      |
+| Path | CAP choice | Consistency | Why |
+| --- | --- | --- | --- |
+| **Booking / calendar write** | **CP** | **Strong** (must be exact) | Money + no double-booking; a wrong answer is a disaster, so we'd rather fail the write than double-book |
+| **Money / ledger, payouts** | **CP** | **Strong** | Funds can't be "eventually" correct; double-entry must balance |
+| **Search results / availability bitset** | **AP** | **Eventual** (seconds stale) | A stale card is harmless — booking re-checks and rejects it |
+| **Review counts, ratings on cards** | **AP** | **Eventual** | Nobody's harmed if a rating updates a few seconds late |
+| **Notifications / analytics / index** | **AP** | **Eventual** | Downstream, async, retryable (outbox → Kafka) |
 
+The pattern: an account balance must be exact to the paisa (strong/CP), while a "customers also viewed" widget can lag (eventual/AP). Same app, different guarantees on purpose — you pay for strong consistency with speed/complexity, so you only buy it where it matters.
 
-The pattern: an account balance must be exact to the paisa (strong), while a "customers also viewed" widget can lag (eventual). Same app, different guarantees on purpose — you pay for strong consistency with speed/complexity, so you only buy it where it matters.
-
----
-
-
-
-## 13. Design Patterns (that can be used)
-
-
-| Pattern                      | Where                                                                 | Why                                           |
-| ---------------------------- | --------------------------------------------------------------------- | --------------------------------------------- |
-| **Saga / Orchestration**     | Request→accept→pay→confirm→payout, with compensation (release/refund) | Multi-step distributed txn (incl. human step) |
-| **State**                    | Booking lifecycle                                                     | Guard transitions                             |
-| **Optimistic Locking / CAS** | Calendar conditional update                                           | No double-booking                             |
-| **Strategy**                 | Search ranking, pricing, cancellation policy                          | Swap rules/algorithms                         |
-| **CQRS**                     | ES search read model vs RDBMS write model                             | Optimized reads                               |
-| **Outbox**                   | Reliable events (confirmed → notify, index, payout)                   | No dual-write loss                            |
-| **Ports & Adapters**         | Payment, search index, maps, notifications                            | Swap providers                                |
-| **Decorator / Chain**        | Price = base + cleaning + service fee + taxes − discount              | Stack pricing                                 |
-| **Observer / Pub-Sub**       | Booking events → notifications, indexing, payouts                     | Decouple                                      |
-| **Repository**               | Data access                                                           | Testable                                      |
-
+> 🎤 **Interviewer one-liner:** *"Strong consistency (CP) where money or inventory is involved — the calendar claim and the ledger — and eventual consistency (AP) everywhere else: search, the availability bitset, review counts, and downstream events."*
 
 ---
 
 
 
-## 14. Scaling & Failure
+## 13. Scaling & Failure
 
 - **Search** on Elasticsearch (geo bounding-box + facets + **availability bitset**) + cache; rebuild via CDC; approximate, re-checked at booking.
 - **Booking** on RDBMS, strong consistency, shard by `listing_id` (or region); calendar past-date pruning.
@@ -866,7 +940,101 @@ The pattern: an account balance must be exact to the paisa (strong), while a "cu
 
 
 
-## 15. Interview Cheat Sheet
+## 14. Reviews & Trust
+
+> Two strangers transact money over the internet — reviews are the **trust engine** that makes that safe. The mechanics matter because naive reviews get gamed (retaliation, fake stays).
+
+- **Verified-stay requirement:** a review can only be written against a **real `booking_id`** that reached `COMPLETED`. No stay → no review. Enforced in the schema (`reviews.booking_id` + `role`), not just policy, so you can't review a place you never booked.
+- **Blind double-review window:** both sides can review, but **neither review is published until both are submitted or a fixed window (e.g. 14 days) passes.** Neither party sees the other's review before writing their own → kills **retaliation** ("you gave me 3 stars, I'll give you 1 back").
+- **Two-way roles:** `GUEST_REVIEWS_HOST` and `HOST_REVIEWS_GUEST` — a host's rating of guests feeds instant-book eligibility and screening.
+- **Rating aggregation is eventual:** the listing's `rating` / `rating_count` on the card are **denormalized aggregates** updated asynchronously (on `REVIEW_PUBLISHED` via Kafka). A card showing a rating a few seconds stale harms no one (**AP**, §12) — we don't recompute the average on the booking write path.
+- **Blocking / reporting:** either side can **block** the other (no future messaging or booking between them) and **report** abuse; blocks are checked at booking + messaging time.
+
+```
+Guest submits review ──┐
+                       ├─► both in? → publish BOTH atomically ─► REVIEW_PUBLISHED (Kafka)
+Host submits review  ──┘                                              │
+   (or 14-day window elapses → publish whatever exists)               ▼
+                                                     async: recompute listing rating/count
+```
+
+#### Q: Why hide reviews until both are in — why not publish each immediately?
+
+Because **immediate publish invites retaliation and bias.** If the host sees a guest's harsh-but-fair review first, the host can "punish back" with an unfair guest review; guests then self-censor to avoid revenge. Hiding both until each is committed (or the window closes) means each side reviews **honestly and independently** — they're writing blind. It's a small consistency delay (the review is written but not visible) bought deliberately for **trust**, which is the whole product.
+
+---
+
+
+
+## 15. Messaging
+
+> Guests and hosts need to talk — before booking ("is parking included?") and after ("what's the door code?"). It's a scoped chat, not a general social inbox.
+
+- **A conversation is scoped to a (listing, guest, host) — and, once a booking exists, to a `booking_id`.** This keeps context tight: a thread maps to a specific potential or actual stay, so support/disputes can pull the exact conversation.
+- **Pre-book inquiries vs post-book support:**
+  - **Pre-book inquiry** — guest messages a host about a listing *before* booking. No `booking_id` yet (conversation keyed by listing+guest+host). Often rate-limited / spam-filtered since there's no committed stay.
+  - **Post-book support** — once a booking exists, the thread is tied to that `booking_id`; higher trust, richer actions (share address, modify dates, escalate to support).
+- **Delivery:** messages persist in `messages` (source of truth) and fan out via push/websocket for real-time; **eventual consistency** is fine (a message arriving a second late is harmless — this is **not** the booking write path).
+- **Safety hooks:** blocked users can't message; phone-number/PII masking pre-booking (keep payments on-platform); attachments → blob + CDN.
+
+```
+Pre-book:   conversation(listing_id, guest_id, host_id)          booking_id = NULL
+              └─ inquiry → host replies → guest decides to book
+Post-book:  same conversation now carries booking_id = 9001
+              └─ scoped to the stay; support can attach it to disputes/refunds
+```
+
+> 💡 **Why scope to `booking_id`?** It makes every downstream job — disputes, refunds, "resend the door code", trust & safety review — a **single keyed lookup** instead of trawling a global chat log.
+
+---
+
+
+
+## 16. Reliability & Observability
+
+- **No single point of failure** — RDBMS primary + replicas + failover, multi-AZ Redis/Kafka/ES, stateless services behind a load balancer across zones.
+- **Idempotent retries** everywhere on the write path (booking create, pay); **webhooks deduped** on gateway event id.
+- **Dead-letter queues** for failed events / saga compensations (release-nights, payout).
+- **Graceful degradation** — if search (ES) is down, still serve direct listing pages + booking; if Redis is down, fall back to DB reads; if the payout job is behind, bookings still confirm (payout catches up).
+- **Reconciliation** — a job compares `PENDING` payments/payouts against the gateway and settles stragglers; the double-entry ledger is the audit backstop.
+
+### Signals worth alerting on
+
+| Metric | Why it matters | Alert when |
+| --- | --- | --- |
+| **Search QPS + p99 latency** | the read firehose; ES/cache health | p99 > 200ms or QPS spikes beyond capacity |
+| **Booking success / conflict rate** | a spike in `DATES_UNAVAILABLE` = hot dates or a bug | conflict rate jumps abnormally |
+| **Calendar write rate / lock contention** | hot listing/date contention | contention or claim latency climbs |
+| **CDC / search index lag** | stale search → guests book taken listings | lag > a few seconds/minutes |
+| **Payout reconciliation backlog** | held/undelivered host money | backlog grows or ages past SLA |
+| **Payment failure / webhook processing lag** | money stuck in ambiguity | failure rate up, webhook queue backs up |
+
+> 💡 **The two lags to watch specifically for Airbnb:** **CDC/index lag** (search staleness → more booking-time rejections) and **payout reconciliation backlog** (host money held too long). Both are silent — nothing errors — so you only catch them with metrics.
+
+---
+
+
+
+## 17. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6.
+
+1. **Clarify requirements** (functional + NFRs, out of scope) — §2
+2. **Estimate scale** (search ≫ bookings, calendar rows) — §3
+3. **Define APIs** (idempotent booking write, webhooks) — §10
+4. **High-level architecture + CQRS split + data model** — §4, §9
+5. **Deep dive: the hard part** → **no double-booking** (atomic per-night claim, hold+TTL) and **availability search at scale** (bitset) — §5, §6
+6. **Deep dive: payments, escrow, saga, state machine** — §7, §8
+7. **Address trust, scale, edge cases** — §12–§16
+8. **Summarize tradeoffs** — §12, §18
+
+> 🎤 **Lead with the core challenge:** state up front that "this is a two-sided marketplace whose crux is **no double-booking on a per-listing calendar**, split into a fast approximate **search** side and a bulletproof **booking** side (CQRS)." Then spend most of your time on the calendar claim + availability search.
+
+---
+
+
+
+## 18. Interview Cheat Sheet
 
 > **"How is Airbnb different from a hotel booking system?"**
 > "Many independent hosts; each listing is usually unique (count 1) with its own **calendar**; plus **request-to-book** (host approval), **host payouts** (escrow), and two-way reviews. The no-double-book correctness is the same per-night idea."
@@ -883,11 +1051,47 @@ The pattern: an account balance must be exact to the paisa (strong), while a "cu
 > **"Payments/payouts?"**
 > "Charge guest into **escrow**, pay out the host minus fee ~24h after check-in; refunds per cancellation policy; idempotent + outbox + double-entry ledger."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Two guests book the same dates** | Atomic per-night claim: one flips all nights `AVAILABLE→BOOKED`, the other gets `rows_affected < nights` → roll back → `DATES_UNAVAILABLE`. No overlap possible. |
+| **Instant-book race on the last free night** | Same atomic claim — the DB serializes the row writes; exactly one wins, the rest fail fast (no lock-and-wait). |
+| **Review posted before checkout** | Blocked by design: a review needs a `booking_id` in `COMPLETED`, and both reviews stay **hidden until both submit or the window closes** (§14). |
+| **Payout held for a dispute** | Escrow stays put — payout job **skips bookings with an open dispute** and only releases ~24h post-check-in when clear; ledger tracks the held funds. |
+| **Calendar/search index stale** | Search is **approximate** (CDC lag); the bitset may show a taken night as free → **exact re-check at booking** rejects it (§4/§5). |
+| **Abandoned checkout / host never responds** | `HELD` + `hold_expiry`; a sweeper releases expired holds; request-to-book auto-declines on timeout (compensation). |
+| **Duplicate "Pay" tap** | `UNIQUE(idempotency_key)` → return the first booking/charge, never a second. |
+| **Payment succeeds but response lost** | Idempotency + webhook + reconciliation → settle to `CONFIRMED`, don't re-charge. |
+
+> **Ultimate layer model:** atomic per-night claim = correctness · HELD+TTL = don't leak nights · idempotency = safe retries · saga compensation = clean failure · outbox = reliable events · escrow+ledger = safe money.
+
 ---
 
 
 
-## 16. Final Takeaways
+## 19. Design Patterns (that can be used)
+
+
+| Pattern                      | Where                                                                 | Why                                           |
+| ----------------------------- | --------------------------------------------------------------------- | --------------------------------------------- |
+| **Saga / Orchestration**     | Request→accept→pay→confirm→payout, with compensation (release/refund) | Multi-step distributed txn (incl. human step) |
+| **State**                    | Booking lifecycle                                                     | Guard transitions                             |
+| **Optimistic Locking / CAS** | Calendar conditional update                                           | No double-booking                             |
+| **Strategy**                 | Search ranking, pricing, cancellation policy                          | Swap rules/algorithms                         |
+| **CQRS**                     | ES search read model vs RDBMS write model                             | Optimized reads                               |
+| **Outbox**                   | Reliable events (confirmed → notify, index, payout)                   | No dual-write loss                            |
+| **Ports & Adapters**         | Payment, search index, maps, notifications                            | Swap providers                                |
+| **Decorator / Chain**        | Price = base + cleaning + service fee + taxes − discount              | Stack pricing                                 |
+| **Observer / Pub-Sub**       | Booking events → notifications, indexing, payouts                     | Decouple                                      |
+| **Repository**               | Data access                                                           | Testable                                      |
+
+
+---
+
+
+
+## 20. Final Takeaways
 
 - **Two-sided marketplace**: hosts + guests, unique listings with per-listing **calendars**.
 - **No double-booking** via per-night **atomic conditional update** (all-or-nothing) + **HELD TTL** + saga compensation.

@@ -15,6 +15,7 @@
 - [5. Fan-In (Scatter-Gather / Aggregation)](#5-fan-in-scatter-gather--aggregation)
 - [6. Where These Appear](#6-where-these-appear)
 - [7. Trade-offs & Numbers](#7-trade-offs--numbers)
+- [Common Mistakes](#common-mistakes)
 - [8. Interview Cheat Sheet](#8-interview-cheat-sheet)
 - [9. Final Takeaways](#9-final-takeaways)
 
@@ -163,6 +164,44 @@ List<Post> readFeed(long userId) {
 
 Notice the cost just **moves**: push pays per-follower **at write time**; pull pays per-followee **at read time**.
 
+### Making fan-out-on-write async (and resumable)
+
+The `onPost` push loop above is **synchronous** — the author's request thread writes to N feeds before returning. That's fine for 200 followers, but you never want a post request to block on tens of thousands of writes. In practice the loop is **offloaded to a background pipeline**: `onPost` publishes a single "new post" event, and a pool of workers does the actual per-follower writes.
+
+```java
+// PRODUCER: onPost returns immediately after publishing ONE event.
+void onPost(Post post) {
+    postStore.save(post);
+    queue.publish(new FanOutJob(post.id, post.authorId));   // 1 event → workers do the N writes
+}
+
+// CONSUMER: a worker pool drains the queue and fans out in bounded chunks.
+void handle(FanOutJob job) {
+    List<Long> followers = graph.followersOf(job.authorId);
+    for (List<Long> chunk : partition(followers, 500)) {     // ~100–1,000 followers per batch
+        feedStore.pushBatch(chunk, job.postId);              // pipelined multi-write, not N round-trips
+        rateLimiter.acquire();                               // throttle so we don't hot-spot the feed store
+        checkpoint(job.id, chunk.lastOffset());              // remember progress (see resumability below)
+    }
+}
+```
+
+- **Chunk size (~100–1,000):** big enough to amortize per-batch overhead (one pipelined `MSET`/`LPUSH` beats one round-trip per follower), small enough to checkpoint progress and stay inside a worker's timeout.
+- **Rate limit:** cap writes/sec so a viral post degrades *gracefully* (slower delivery) instead of melting the feed store — the same throttling idea as the notification batch pipeline (§4).
+
+> 💡 **Async ≠ instant.** Offloading makes posting *feel* instant, but followers now see the post *eventually* (seconds later, as workers churn). That delivery lag is the price of keeping the write path off the request thread — "fan-out complete" is a background milestone, not part of the post response.
+
+> 💡 **Two ways a queue "fans out."** A *worker pool on one consumer group* splits the N follower-writes across workers (**load sharing** — what the code above does). A *topic with N consumer groups* delivers the **same** event to N independent subscribers — e.g. one order event consumed separately by the email, SMS, and push services. Kafka does both; don't confuse "spread the work" with "copy to every subscriber."
+
+#### Q: What if the push dies halfway through the follower list?
+
+A worker can crash after writing feed #12,000 of 50,000. Two properties save you:
+
+- **Idempotent writes** — pushing the same `post.id` into a feed twice must be a no-op (store the feed as a set, or dedupe on `post.id`). Then re-running a job is safe.
+- **Resumable / checkpointed** — track a cursor (last follower offset or last chunk id) so a retried job **resumes** from where it died instead of restarting from follower #0. Combined with idempotency, at-least-once delivery from the queue becomes **effectively-once** feed state.
+
+> ⚠️ Without idempotency **or** a checkpoint, a crash mid-fan-out forces you to choose between missing followers (if you skip retrying) or duplicated posts (if you restart from scratch). Design both in from the start.
+
 #### Q: Which is "better"?
 
 Neither — it depends on the **read/write ratio**:
@@ -246,6 +285,8 @@ On read (build home feed):
 Hybrid = cheap reads for the 99% (push) + cheap writes for the 1% celebrities (pull) + merge at read
 ```
 
+> 💡 **How to pick the celebrity threshold (100k vs 1M?).** It's a dial set by your **write SLA**, not a magic constant. Estimate how many feed writes your fan-out pipeline sustains and how long you're willing to let delivery take: `threshold ≈ (writes/sec the pipeline handles) × (seconds of fan-out latency you allow)`. If workers push ~200k writes/sec and you allow ~5s, ~1M followers is the ceiling → set the cutoff there. **Lower** it (toward 100k) if many big accounts post at once (finales, breaking news) or you want headroom; **raise** it if read-time pulls are getting expensive. Fewer accounts above the line = fewer read-time pulls, so the threshold is really a **write-cost ↔ read-cost tradeoff dial**.
+
 ### Use push for most accounts, pull for celebrities
 
 The trick is realizing the two approaches fail in **opposite** situations, so you use each where it's strong:
@@ -295,9 +336,19 @@ List<Post> readFeed(long userId) {
 }
 ```
 
+#### Q: How are the pushed and pulled posts actually merged and ordered?
+
+The `rank(feed)` step is doing real work — it's a **fan-in merge**, not a plain concatenation:
+
+1. **Dedup** on a stable key (`post.id`) so a post that arrived via *both* paths (an account near the threshold, or a retry/threshold-change race) appears once. A set or map keyed by `post.id` collapses duplicates.
+2. **Sort / rank** the combined list into one order — by timestamp for a chronological feed, or by a score (recency + affinity + engagement) for a "top posts" feed. Because pushed posts and freshly-pulled celebrity posts come from different sources, they get **interleaved by the sort**, not appended in blocks.
+3. **Trim** to the page size (top N) and return.
+
+> ⚠️ **Dedup before you rank.** Merging two sources without a dedup key is the classic hybrid bug — the same celebrity post shows up twice. Key on `post.id` (a stable identity), never on list position.
+
 #### Q: Isn't there duplicate risk (a post both pushed and pulled)?
 
-Only if an account crosses the threshold mid-stream; systems handle this by clearly marking who is a "celebrity" and pulling *only* those, so a given post takes exactly one path. The threshold (e.g. 100k followers) is the switch.
+Only if an account crosses the threshold mid-stream; systems handle this by clearly marking who is a "celebrity" and pulling *only* those, so a given post takes exactly one path. The threshold (e.g. 100k followers) is the switch — and the `post.id` dedup above is the safety net for the edge cases.
 
 #### Q: Does the same idea apply to notifications and group chat?
 
@@ -366,6 +417,8 @@ List<Result> search(String query) {
 
 Because you can't build the final answer until **every** shard replies. If 9 shards answer in 10ms but 1 straggler takes 500ms, **you wait 500ms**. This is **tail latency**, and it gets *worse* with more shards (more shards = higher chance at least one is slow). Mitigations: set a **timeout** and return **partial results** (as `f.get(200, MILLISECONDS)` above does), or add shard-level retries/hedging.
 
+> 💡 **Hedged requests** attack the tail directly: if a shard hasn't replied by around the p95 (say 50ms), fire a **second** request to a replica and take whichever returns first. It costs a few % extra traffic but collapses the long tail, since you're no longer hostage to one slow replica. Pair it with a per-shard **timeout + partial results** so a fully dead shard can never hang the whole gather.
+
 #### Q: How is this different from the aggregation fan-in (counters, analytics)?
 
 Both are "N → 1", but the *shape* differs:
@@ -433,6 +486,15 @@ The whole table is just "**where does the cost land, and is any single action ca
 #### Q: If hybrid is best, why even learn push and pull?
 
 Because hybrid is literally **"push here, pull there."** You can't choose the right side per case without understanding each pure approach's failure mode. Also, at small scale, plain push (or plain pull) is simpler and totally fine — you only reach for hybrid once celebrities/scale force your hand.
+
+---
+
+## Common Mistakes
+
+- **Pure push at scale (celebrity write amplification).** Fanning out *every* post on write is fine until one account has millions of followers — then a single post becomes tens of millions of writes, spiking latency and hot-spotting the feed store (§3). Fix: go **hybrid** — stop pushing above a follower threshold and pull those accounts at read time.
+- **Hybrid without a dedup key.** Merging pushed + pulled posts by plain concatenation lets the same post appear twice (accounts near the threshold, retries, threshold changes). Always dedup on a stable `post.id` **before** ranking.
+- **Scatter-gather without a per-shard timeout.** If the coordinator waits for *all* shards with no deadline, one slow or dead shard hangs the entire query (you're only as fast as the slowest shard). Set a per-shard timeout, return **partial results**, and consider **hedged requests** to a replica for the tail.
+- **Synchronous fan-out on the request thread.** Doing the per-follower writes inline blocks posting and gives you no retry story. Offload to a queue + worker pool, and make the writes **idempotent + resumable** so a crash mid-fan-out doesn't drop or duplicate followers.
 
 ---
 

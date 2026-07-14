@@ -15,6 +15,7 @@
 - [5. Distributed Tracing](#5-distributed-tracing)
 - [6. SLI / SLO / SLA & Error Budgets](#6-sli--slo--sla--error-budgets)
 - [7. Alerting](#7-alerting)
+- [Common Mistakes](#common-mistakes)
 - [8. Interview Cheat Sheet](#8-interview-cheat-sheet)
 - [9. Final Takeaways](#9-final-takeaways)
 
@@ -56,6 +57,16 @@ Yes. Monitoring tells you when a **known** failure mode occurs. Observability is
 | **Traces** | "Where did the time/failure go across services?" | request path A→B→C with per-hop latency |
 
 Together: metrics **detect**, traces **localize**, logs **explain**.
+
+**Cost & capability at a glance** — the three pillars trade detail against cost very differently, which is *why* you keep all three rather than one:
+
+| Pillar | Cost profile | Detail level | Aggregation | Sampling |
+| --- | --- | --- | --- | --- |
+| **Logs** | cheap-ish per line, but **expensive at volume** (storage + indexing) | **highest** — full per-event context | slow/costly (must scan many entries) | high-volume/INFO often sampled |
+| **Metrics** | **cheapest** — compact pre-aggregated numbers | **lowest** — just numbers, no context | **instant & cheap** (already aggregated) | not sampled (aggregated, not per-event) |
+| **Traces** | moderate, **controlled by the sample rate** | per-request path + per-hop timing | per-request, **not** aggregate | **usually sampled** (e.g. 1%) |
+
+> 💡 **tip** Reach for the **cheapest pillar that can answer your question**: metrics for "how much / how often", traces for "where in the path", logs for "what exactly for this one event". Answering an aggregate question from logs (scanning millions of lines) is the classic way to overspend.
 
 ### The three pillars
 
@@ -135,6 +146,39 @@ Don't track random numbers — track these two well-known checklists:
 - **USE** — for **resources** (CPU, disk, memory, a queue): **U**tilization (how busy, e.g. 80% CPU), **S**aturation (how much work is *waiting* — queue length), **E**rrors. "Is this resource the bottleneck?"
 
 RED describes the service from the caller's perspective (throughput, failures, latency); USE describes a resource's internal health (how busy, how backed up, failing).
+
+#### The four Golden Signals (and how they map to RED/USE)
+
+Google's SRE book boils "what to watch on a user-facing service" down to **four Golden Signals**:
+
+- **Latency** — how long requests take (track it split by success vs error, as percentiles).
+- **Traffic** — how much demand there is (requests/sec, sessions).
+- **Errors** — rate of failed requests.
+- **Saturation** — how "full" the service/resource is (the constrained resource nearing its limit — queue depth, CPU run-queue, connection-pool usage).
+
+They line up cleanly with the two checklists:
+
+| Golden Signal | RED (service) | USE (resource) |
+| --- | --- | --- |
+| Latency | **D**uration | — |
+| Traffic | **R**ate | — |
+| Errors | **E**rrors | **E**rrors |
+| Saturation | — | **U**tilization + **S**aturation |
+
+So **RED ≈ the first three Golden Signals** (the caller's view), and **saturation** is the extra one you get from **USE** (the resource's view). Track RED on every service; add USE/saturation for the resources that can become bottlenecks.
+
+#### Worked example: utilization vs saturation (why they're different)
+
+The USE trap: people watch **utilization** and forget **saturation**. Utilization can look fine while the resource is actually drowning.
+
+```text
+CPU utilization       = 80%    ← "only 80% busy, looks healthy"
+CPU run-queue length  = 50     ← 50 threads WAITING for a core → saturated!
+```
+
+Utilization tells you the resource is 80% busy *right now*; **saturation** tells you how much work is **queued up waiting** for it. A run-queue of 50 means requests are piling up behind the CPU — latency is already climbing even though utilization "only" reads 80%. **Saturation is the leading indicator**; utilization alone will lull you into thinking you have headroom you don't.
+
+> ⚠️ **pitfall** Utilization is bounded (0–100%) and hides pain past the point of contention; saturation (queue length, wait time) has no ceiling and keeps rising as things get worse. Alert on **saturation and its symptom (latency)**, not on utilization.
 
 #### Q: What is "high cardinality" and why does everyone warn about it?
 
@@ -286,7 +330,24 @@ A **log** is a single point-in-time entry ("payment declined at 11:20"). A **tra
 
 #### Q: Why is tracing "sampled" (only ~1%)? Won't I miss things?
 
-At millions of requests, storing a full trace for **every** request is hugely expensive and mostly redundant (the 999,999 healthy requests look identical). So you keep a **sample** — e.g. 1% random, often with "always keep traces that errored or were slow" (**tail-based sampling**). You still get a statistically representative view of latency, plus all the interesting (slow/failed) ones, while dropping most of the identical healthy ones.
+At millions of requests, storing a full trace for **every** request is hugely expensive and mostly redundant (the 999,999 healthy requests look identical). So you keep a **sample**. You still get a statistically representative view of latency, plus (ideally) all the interesting ones, while dropping most of the identical healthy ones.
+
+#### Q: Head-based vs tail-based sampling — what's the difference?
+
+The question is **when** you decide to keep a trace:
+
+- **Head-based sampling** — decide at the **start** of the request (e.g. "keep 1% at random"). Cheap and simple, and the decision propagates in the trace context so every service agrees. **Downside:** it's a coin flip *before* you know the outcome — you'll drop plenty of errors and slow requests, and keep boring fast ones.
+- **Tail-based sampling** — decide at the **end**, after the whole trace is assembled, so you can keep on *outcome*: "keep everything that errored or exceeded 1s, plus a small % of the rest." Captures the interesting traces reliably. **Downside:** the collector must **buffer all spans** until the request finishes to decide — more memory, more infra.
+
+> 💡 **tip** Common setup: modest head-based rate to bound cost, plus tail-based rules to guarantee you keep the errors and slow outliers you actually debug with.
+
+> ⚠️ **pitfall** With **head-based** sampling, "increase the sample rate during an incident" doesn't recover the traces you already dropped — the decision was made at request start. If keeping every error matters, you need tail-based.
+
+#### Exemplars: jump from a metric spike straight to a trace
+
+A histogram tells you p99 latency jumped, but not *which* request was slow. **Exemplars** fix that: each metric bucket carries a few example `trace_id`s of requests that landed in it. So on the dashboard you see the p99 spike, click the exemplar dot, and land on an **actual slow trace** — metrics (detect) → trace (localize) in one click, no manual correlation. OpenTelemetry + Prometheus support exemplars natively.
+
+> 💡 **tip** Beyond the three pillars, two more signals round out observability: **continuous profiling** (always-on CPU/memory flame graphs — answers "which *function* burned the CPU", one level deeper than traces), and **synthetic vs real-user monitoring** — **synthetic** = scripted probes hitting your endpoints on a schedule (catches outages even at 3am with zero traffic), **RUM (real-user monitoring)** = telemetry from actual user sessions (reflects the real, messy experience). Use both: synthetics for a constant baseline, RUM for ground truth.
 
 ---
 
@@ -308,6 +369,14 @@ These three look alike but sit at very different levels. Read them as a chain, *
 - **SLI = the measurement.** A number you actually collect. "99.95% of requests succeeded this week." (It comes straight from your metrics — see §3.) SLI = **I**ndicator = the *measured signal*.
 - **SLO = your internal goal for that number.** "We want success ≥ 99.9% over 30 days." SLO = **O**bjective = the *target you set yourself*. No lawyers involved; it's your team's bar.
 - **SLA = the promise to the customer, with penalties.** "If uptime drops below 99.9%, you get a refund." SLA = **A**greement = a *contract* with money/legal consequences attached.
+
+> 💡 **tip** **Picking good SLIs (checkout service).** A good SLI measures **what the user experiences**, as a ratio of good events ÷ valid events.
+> - ✅ **Good:** % of checkout requests that return non-5xx (success rate).
+> - ✅ **Good:** % of checkout requests served in < 500ms (latency).
+> - ❌ **Bad:** **CPU utilization** of the checkout host — a raw resource number the user never feels; a box can be at 90% CPU and perfectly fast, or at 30% and timing out.
+> - ❌ **Bad:** total request count — that's *traffic*, not *health*; a busy service isn't a failing one.
+>
+> If an SLI can move without any user noticing, it's the wrong SLI. SLIs live at the **edge users touch**, not inside the machine.
 
 > **Why SLO stricter than SLA?** If your public promise (SLA) is 99.9% and you *aim* internally at exactly 99.9%, any bad week breaks the contract. So you aim higher internally (e.g. SLO 99.95%) to keep a buffer before the SLA (and its penalties) is ever at risk. SLA ⊇ SLO — the SLA is the looser, legally-binding outer line.
 
@@ -380,6 +449,19 @@ Instead of alerting on a raw threshold, alert on **how fast you're eating the er
 #### Q: Why not just alert on everything to be safe?
 
 Because alerts that don't matter **train people to ignore alerts**. A pager that cries wolf 50 times a day gets muted — and then the one real outage is missed. Fewer, meaningful, actionable alerts (each with a runbook) is far safer than a firehose of noise.
+
+---
+
+## Common Mistakes
+
+The handful of observability mistakes that bite almost everyone:
+
+- **High-cardinality metric labels.** Putting `user_id`, `request_id`, `email`, or a full URL-with-ids in a metric label. Each distinct value spawns a new time-series, so millions of users → millions of series → blown-up cost and a crawling metrics backend. **Fix:** keep only low-cardinality dimensions (method, region, status, service) in labels; put the high-cardinality ids in **logs** (§3).
+- **Alerting on causes (CPU) instead of symptoms.** Paging on "CPU > 70%" or "memory > 80%" — internal numbers the user never feels. High CPU may be perfectly healthy; the real outage may happen at low CPU. **Fix:** page on **user-facing symptoms** (error rate, latency, error-budget burn); send resource metrics to dashboards (§7).
+- **Logging PII / secrets.** Passwords, tokens, card numbers, or whole request bodies in logs. Logs get shipped to a central store many people can search — a leaked token *is* a breach. **Fix:** log an **id**, never the sensitive value (§4).
+- **Averaging latency instead of tracking p99.** A mean hides the tail — 99 fast requests + 1 five-second request still "averages" fine while a real user waited 5s. **Fix:** track **percentiles (p95/p99)** from a histogram; the tail is where the pain (and the churn) lives (§3).
+
+> ⚠️ **pitfall** These four rarely fail loudly — they fail *quietly*: the metrics bill creeps up, the pager cries wolf until it's muted, a token sits in a log for months, and a "healthy" average masks angry users. Audit for them proactively.
 
 ---
 

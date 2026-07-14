@@ -20,9 +20,12 @@
 - [10. Client & Topology (routing)](#10-client--topology-routing)
 - [11. Sequences](#11-sequences)
 - [12. Failure Scenarios](#12-failure-scenarios)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
-- [15. Final Takeaways](#15-final-takeaways)
+- [13. Consistency & CAP Tradeoffs](#13-consistency--cap-tradeoffs)
+- [14. API Design](#14-api-design)
+- [15. How to Drive the Interview (framework)](#15-how-to-drive-the-interview-framework)
+- [16. Interview Cheat Sheet](#16-interview-cheat-sheet)
+- [17. Design Patterns (that can be used)](#17-design-patterns-that-can-be-used)
+- [18. Final Takeaways](#18-final-takeaways)
 
 ---
 
@@ -108,9 +111,7 @@ Hot working set:   ~1 TB actually being read a lot  → THIS is what we cache
 Cache nodes:       ~16 nodes × 64 GB RAM ≈ 1 TB      → holds the hot set
 ```
 
-#### Q: What's a good hit rate, and why does it matter so much?
-
-**Hit rate** = fraction of reads served by the cache (hits ÷ total). A cache earning its keep usually runs **90%+**. The leverage is huge:
+**Hit rate** = fraction of reads served by the cache (hits ÷ total), and it matters far more than it sounds. A cache earning its keep usually runs **90%+**. The leverage is huge:
 
 - At 95% hit rate, the DB sees only **5%** of read traffic — a 20× reduction.
 - Drop to 90% and the DB load *doubles* (10% vs 5%). So a few percentage points of hit rate is the difference between a calm DB and a melting one. That's why eviction policy (§7) and avoiding mass expiry (§12) matter.
@@ -147,9 +148,7 @@ The three moving parts of the architecture, in plain terms:
 | **Cache node** | Hold a slice of keys in RAM; answer GET/SET in O(1) |
 | **Source DB** | Truth; consulted only on a miss |
 
-#### Q: What is "cache-aside" that the diagram mentions?
-
-It's the most common way the app and cache cooperate: the **app** manages the cache, and the cache sits *aside* the main path (it doesn't talk to the DB itself). On a miss, the app fetches from the DB and back-fills the cache. Full walkthrough with code is in §9 — for now just know "miss → app loads DB → app puts it in cache."
+The diagram's "cache-aside" label names the most common way the app and cache cooperate: the **app** manages the cache, and the cache sits *aside* the main path (it doesn't talk to the DB itself). On a miss, the app fetches from the DB and back-fills the cache. Full walkthrough with code is in §9 — for now just know "miss → app loads DB → app puts it in cache."
 
 ---
 
@@ -161,6 +160,19 @@ It's the most common way the app and cache cooperate: the **app** manages the ca
 - **Memory management**: slab allocation (Memcached) to reduce fragmentation; Redis uses jemalloc + efficient encodings for small values.
 - **Persistence (Redis, optional)**: **RDB** snapshots + **AOF** append-only log → survive restarts (but a cache is usually rebuildable from the DB).
 - **Threading**: Redis = single-threaded command execution (no locks → atomic ops); Memcached = multi-threaded.
+
+### Database & storage choices (which store, and why at scale)
+
+This design *is* the datastore, so "which DB" really means "what physically backs each moving part." Unlike a normal app, there's no single deciding question of "does this need transactions?" — the cache's whole job is to trade durability/transactions **away** for raw speed, while the *real* source of truth lives one layer behind it in the app's own DB.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| The cached entries themselves | **In-memory hash table** (Redis/Memcached process RAM) | O(1) lookup, no disk seek, no query planner — the entire point of a cache is "faster than the DB," and RAM is the only medium that delivers sub-ms reliably. | A disk-backed KV store (RocksDB/LevelDB) still pays a disk I/O per miss-free read — that's the DB's job, not the cache's. Putting disk under the cache defeats the reason it exists. |
+| Crash recovery (optional) | **Redis RDB snapshot + AOF log** | Lets a restarted node reload its own state in seconds instead of re-warming from the DB (or from scratch, for Memcached). | Memcached has neither — a restart is a **cold cache**, which is fine for small datasets but re-triggers a full stampede of misses on a large working set. |
+| The source of truth behind the cache | **Whatever DB the app already uses** (RDBMS/NoSQL — out of scope here) | The cache is disposable and rebuildable; the DB is not. Every design decision in this doc (async replication, sampled eviction, TTL) is safe *because* a lost cache entry just becomes a miss, not lost data. | Treating the cache itself as the system of record (e.g. relying on write-back persistence as "durable enough") reintroduces exactly the durability risk a real DB is built to avoid (§9). |
+| Cluster topology (who owns which key) | **Consistent-hash ring / Redis's 16384 hash slots**, gossiped between nodes (or held by a proxy/client) | Needs to be agreed cluster-wide and updated cheaply as nodes join/leave — a ring or fixed slot map does this with ~1/N key movement (§6). | Plain `hash(key) % N` remaps almost every key on every topology change → mass miss → stampede on the DB behind it. Not a viable topology map at any real scale. |
+
+**Redis vs Memcached, concretely — why RAM + consistent hashing wins here:** both are in-memory hash tables, so the real fork is *richness and durability* vs *raw simplicity*. Redis adds data structures (sorted sets, lists), single-threaded atomicity, and optional AOF/RDB persistence, at the cost of being (mostly) single-core per instance. Memcached is purely multi-threaded key→bytes with no persistence — simpler, and it parallelizes across cores on one box more easily, but a restart always means a cold cache and there's no way to express "increment this counter atomically" as a single op. For **this** design, the throughput vs correctness trade-off resolves in RAM's favor either way: cache correctness only ever needs to be "eventually right within a TTL," never transactional, so we spend our design budget on **consistent hashing + vnodes** (minimal reshuffling as nodes scale) and **leader-follower replication per shard** (§8) rather than on stronger consistency the workload doesn't need. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md) for the full Redis internals + cluster-routing comparison.)
 
 ### What's inside one cache node?
 
@@ -176,9 +188,7 @@ void   set(String key, byte[] value) { store.put(key, value); }   // O(1)
 
 Everything else on the node is bookkeeping around that map: expiry, eviction, and memory management.
 
-#### Q: What's the difference between TTL expiry and eviction? They sound the same.
-
-They're different reasons a key leaves the cache, and it's a very common mix-up:
+TTL expiry and eviction sound the same but are different reasons a key leaves the cache — a very common mix-up:
 
 | | **Expiry (TTL)** | **Eviction** |
 | --- | --- | --- |
@@ -223,6 +233,10 @@ Counterintuitively it's a feature. One thread executing commands one at a time m
 ---
 
 ## 6. Sharding with Consistent Hashing
+
+> 💡 **Consistent hashing, in one line:** a scheme for mapping keys to nodes so that adding or removing a node moves only a **small slice** of keys (~1/N), instead of shuffling almost everything. It's the single most important idea in this doc.
+
+> ⚠️ **The classic mistake: `hash(key) % N`.** It looks fine in a demo but the moment `N` changes (a node joins/leaves) the modulo result changes for **almost every key** → every lookup misses → the whole cache stampedes the DB at once. Never propose `% N` for a scalable cache.
 
 `hash(key) % N` **breaks** when N changes (almost all keys remap → mass miss → DB stampede). Use **consistent hashing**.
 
@@ -307,6 +321,8 @@ class HashRing {
 
 ### Virtual nodes (vnodes) — why one point per node isn't enough
 
+> 💡 **Virtual nodes (vnodes):** instead of putting each physical node at **one** spot on the ring, put it at **many** (e.g. 150). More points → smaller, evenly-mixed arcs → balanced load and, when a node dies, its share spreads across *many* neighbors instead of dumping on one.
+
 Problem with placing each node at a *single* clock position: the gaps between nodes are random, so some nodes end up owning a huge arc (lots of keys) and others a tiny arc. Load is lopsided. And when a node dies, its **entire** arc dumps onto one neighbor.
 
 Fix: give each physical node **many** positions on the clock (e.g. 150 "virtual" points each). Now the keyspace is chopped into many small arcs sprinkled evenly, so:
@@ -323,9 +339,7 @@ void addNode(String node, int vnodes) {
 }
 ```
 
-#### Q: How does Redis Cluster's "16384 hash slots" relate to a ring?
-
-Same idea, discretized for simplicity. Instead of a continuous clock, Redis pre-defines **16384 fixed slots**. A key maps to a slot via `CRC16(key) % 16384`, and each node owns a **range of slots**. Rebalancing = **moving slot ranges** between nodes (and only those keys move). It's consistent hashing with fixed buckets — easier to reason about and administer than a free-form ring.
+Redis Cluster's "16384 hash slots" is the same idea, discretized for simplicity. Instead of a continuous clock, Redis pre-defines **16384 fixed slots**. A key maps to a slot via `CRC16(key) % 16384`, and each node owns a **range of slots**. Rebalancing = **moving slot ranges** between nodes (and only those keys move). It's consistent hashing with fixed buckets — easier to reason about and administer than a free-form ring.
 
 ```
 key → CRC16(key) % 16384 = slot 8213
@@ -333,13 +347,15 @@ slot 8213 currently owned by node C → key lives on C
 add a node → hand it, say, slots 0–4095 from others → only those keys move
 ```
 
-#### Q: So does this run once at startup, or continuously?
+This isn't something computed once at startup — the ring/slot map is **live topology**. Nodes join and leave over time; the mapping is updated and gossiped so everyone agrees on the current owner of each key. Clients cache a copy of the map and refresh it when membership changes (see §10). The point of consistent hashing is that these membership changes are *cheap* — a small slice of keys moves, not the whole cache.
 
-The ring/slot map is **live topology**. Nodes join and leave over time; the mapping is updated and gossiped so everyone agrees on the current owner of each key. Clients cache a copy of the map and refresh it when membership changes (see §10). The point of consistent hashing is that these membership changes are *cheap* — a small slice of keys moves, not the whole cache.
+> 💡 **Gossip:** a decentralized way for nodes to sync state — each node periodically tells a few random peers what it knows (who's alive, who owns which slots), and the news spreads epidemic-style until the whole cluster agrees. No central coordinator to become a bottleneck or single point of failure. Redis Cluster uses gossip to propagate topology.
 
 ---
 
 ## 7. Eviction Policies
+
+> 💡 **LRU vs LFU in one line:** **LRU** = "least *recently* used" → evict whatever hasn't been touched for the longest (bets on recency). **LFU** = "least *frequently* used" → evict whatever has been read the fewest times overall (bets on lasting popularity).
 
 When memory is full, evict something:
 
@@ -430,7 +446,7 @@ reads can be served by ───┴───────────────
 - **Read scaling**: replicas can serve reads too, so a hot shard's reads spread across primary + replicas.
 - **High availability**: if the primary dies, a controller (Redis **Sentinel** / Cluster) notices and **promotes a replica** to primary, then points clients at it. This is **failover**.
 
-#### Q: What is "async" replication, and why is a little data loss OK here?
+"Async" replication is worth spelling out, along with why a little data loss is tolerated here:
 
 - **Sync**: the primary waits for the replica to confirm every write before telling the client "done." Safe, but slower — you pay the network round-trip on every write.
 - **Async** (what caches use): the primary replies "done" immediately and copies to the replica **a moment later**. Faster, but if the primary crashes in that tiny gap, the last few writes weren't copied yet — they're lost.
@@ -445,6 +461,10 @@ void set(String key, byte[] value) {
     replicationQueue.offer(new Op(key, value));  // 3. copy to replica shortly after
 }
 ```
+
+#### Q: Can I read my own write back from a replica?
+
+Not reliably — not right away. Because replication is **async**, a write lands on the primary and is acked *before* it reaches the replicas. If you `SET key=v` on the primary and then immediately `GET key` from a replica, you can get the **old** value (or a miss) during that replication lag window — the replica just hasn't received the update yet. This is **replica staleness**, and it's the price of fast async replication. Three ways to deal with it, depending on how much you care: **(1)** route reads that must see the latest write to the **primary** (read-your-writes = read from the leader); **(2)** use **quorum** reads/writes (`W + R > N`) so at least one node in your read set has the newest value — stronger, but slower, and uncommon for a plain cache; **(3)** just accept it — for most caches, a few milliseconds of staleness is fine because the **DB is the source of truth** and a stale/missing cache entry self-heals on the next load. Interview one-liner: *"Async replicas are eventually consistent; if I need read-my-own-write I read from the primary or use a quorum, otherwise I tolerate the lag because the cache isn't the source of truth."*
 
 #### Q: What's "split-brain" on failover?
 
@@ -488,6 +508,8 @@ void write(String key, Object v) {
 ```
 
 Why **delete** rather than update the cache on write? Deleting is simpler and dodges a nasty race: if two writers each *set* the cache, they can interleave and leave a stale value. Deleting just says "this is now unknown — reload it," which is always safe.
+
+> ⚠️ **Don't *update* the cache on a write — *delete* it.** Writing the new value into the cache after the DB write feels natural but invites a stale-write race: two concurrent writers can apply their DB updates in one order but their cache `SET`s in the *opposite* order, leaving the cache pinned to the older value indefinitely. `DELETE` sidesteps this entirely — the next read simply re-loads fresh truth from the DB.
 
 **Write-through** — the cache sits *in front* of the DB; every write goes **through** the cache, which writes to the DB synchronously.
 
@@ -611,21 +633,13 @@ Object v = cache.get("celebrity:42#" + r);               // different node per r
 
 ### Who holds the "which node has what" map?
 
-Someone has to answer "which node owns this key?" (the ring/slot lookup from §6). There are three places that logic can live:
-
-| Topology | Who does the routing |
-| --- | --- |
-| **Client-side sharding** | The app's client library hashes the key and connects straight to the right node |
-| **Proxy** | A middleman (Twemproxy/Envoy) takes the request and forwards it; clients stay dumb |
-| **Cluster mode** | The nodes themselves know the map; if you ask the wrong node it **redirects** you (Redis `MOVED`/`ASK`) |
+Someone has to answer "which node owns this key?" (the ring/slot lookup from §6), and the three rows of the table above are really three places that logic can live: the app's client library hashing straight to the right node (client-side), a middleman proxy (Twemproxy/Envoy) forwarding requests while clients stay dumb, or the nodes themselves knowing the map and **redirecting** you if you ask the wrong one (Redis `MOVED`/`ASK`).
 
 - **Client-side** = one fewer hop (fastest) but every client must know and refresh the ring.
 - **Proxy** = simplest clients, but the proxy is an extra hop and a thing to scale/operate.
 - **Cluster mode** = smart nodes, thin clients; the redirect costs an occasional extra round-trip when topology just changed.
 
-#### Q: How do clients avoid getting redirected on every request?
-
-They **cache the topology** (a local copy of the ring/slot map). They route directly using that cached map, so redirects are rare. When membership changes (a node joins/leaves), the map is updated and propagated (via **gossip** between nodes or a control plane); the client refreshes and gets back to direct routing. A `MOVED` redirect is essentially the cluster telling a client "your map is stale — here's the correct node, and please refresh."
+Clients avoid getting redirected on every single request because they **cache the topology** (a local copy of the ring/slot map). They route directly using that cached map, so redirects are rare. When membership changes (a node joins/leaves), the map is updated and propagated (via **gossip** between nodes or a control plane); the client refreshes and gets back to direct routing. A `MOVED` redirect is essentially the cluster telling a client "your map is stale — here's the correct node, and please refresh."
 
 ---
 
@@ -646,6 +660,43 @@ App → route key to node → GET
 New node joins the ring (vnodes) → owns ~1/N of the keyspace
 → ~1/N of keys migrate from neighbors (Redis: move slots) → clients refresh topology
 → only a fraction of keys move (no mass remap)
+```
+
+### Client routing with a stale map (MOVED / ASK)
+
+> The end-to-end flow when a client's cached topology is out of date — e.g. right after a rebalance. This is exactly what Redis Cluster's `MOVED`/`ASK` redirects are for.
+
+```
+1. Client computes: slot = CRC16("user:123") % 16384 = 8213
+2. Client's CACHED map says slot 8213 → node C  → sends GET user:123 to C
+3. But slot 8213 was just migrated to node E, so C rejects with a redirect:
+
+     -MOVED 8213 10.0.0.5:6379        ← concrete error response
+
+4. Client reads the redirect: "slot 8213 now lives at node E (10.0.0.5)"
+5. Client retries GET user:123 against node E → HIT
+6. Client REFRESHES its slot map (so future requests go straight to E — no repeat redirect)
+```
+
+> **MOVED vs ASK:** `MOVED` = "this slot has *permanently* moved, update your map." `ASK` = "this slot is *mid-migration*; for THIS one request, ask the new node (with `ASKING`), but don't update your map yet." `MOVED` is the steady-state redirect; `ASK` is the transient one during an in-flight slot move.
+
+### Failover drill (primary dies)
+
+> Numbered walk-through of a primary failing, a replica taking over, and the small write-loss window that async replication leaves behind.
+
+```
+1. Primary P (shard 3) is serving reads+writes; replica R follows it asynchronously.
+2. Client SET k=v2 → P applies it, acks the client, queues it for R
+   → but P CRASHES before that op reaches R  (R still has k=v1)
+3. Controller (Sentinel/Cluster) misses heartbeats from P → declares it down.
+4. Quorum of nodes agrees, then PROMOTES R to primary (with fencing so a
+   revived P can't keep acting as primary → no split-brain).
+5. Topology updates + gossips; clients refresh. A client still talking to old P
+   gets redirected to the new primary R (MOVED-style), then routes to R.
+6. PARTIAL-WRITE-LOSS WINDOW: the un-replicated SET k=v2 is gone — R serves the
+   older k=v1. This is acceptable for a cache: next read misses/stale → reload
+   from the DB (source of truth) → cache self-heals. (For a database you'd use
+   sync/quorum writes to avoid this; a cache trades that safety for speed.)
 ```
 
 ---
@@ -673,9 +724,7 @@ These three sound alike and get mixed up constantly. They differ by *what's bein
 | **Avalanche** | A **big batch** of keys expire at the same moment → broad miss surge that all hits the DB at once | **Jittered TTLs** + staggered warmup |
 | **Stampede** (thundering herd) | **One hot key** expires and a crowd all miss it at once, all hitting the DB with the same query | **Single-flight** (one loader; the real fix). Jitter only helps once the key is fanned out into copies |
 
-#### Q: What's a Bloom filter doing here?
-
-A **Bloom filter** is a tiny, fast, probabilistic "have we *ever* seen this key?" gate. Before hitting the DB for a possibly-nonexistent key, ask the filter: if it says "definitely no," skip the DB entirely (that's how you kill **penetration**). It can have false positives ("maybe yes" when actually no) but **never** false negatives, so it's safe as a pre-filter — a "no" is always trustworthy.
+A **Bloom filter** is doing quiet but crucial work here: it's a tiny, fast, probabilistic "have we *ever* seen this key?" gate. Before hitting the DB for a possibly-nonexistent key, ask the filter: if it says "definitely no," skip the DB entirely (that's how you kill **penetration**). It can have false positives ("maybe yes" when actually no) but **never** false negatives, so it's safe as a pre-filter — a "no" is always trustworthy.
 
 ```java
 // Guard against penetration: reject keys the Bloom filter has never seen.
@@ -689,13 +738,128 @@ Object read(String key) {
 }
 ```
 
-#### Q: What is the "circuit breaker" for a whole-cache outage?
-
-If the **entire** cache cluster is down, every read becomes a miss and the full firehose hits the DB — which may not survive it. A **circuit breaker** detects the cache is failing and **stops trying it** for a while, routing reads straight to the DB (which you've provisioned to survive this) and periodically probing whether the cache is back. The point is to fail fast so one dependency's outage doesn't cascade into a total meltdown.
+The "circuit breaker" for a whole-cache outage earns its own callout: if the **entire** cache cluster is down, every read becomes a miss and the full firehose hits the DB — which may not survive it. A **circuit breaker** detects the cache is failing and **stops trying it** for a while, routing reads straight to the DB (which you've provisioned to survive this) and periodically probing whether the cache is back. The point is to fail fast so one dependency's outage doesn't cascade into a total meltdown.
 
 ---
 
-## 13. Design Patterns (that can be used)
+## 13. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Under a network partition, is your cache CP or AP?" The honest answer for a cache is **AP by default** — and that's the *right* choice, because the real source of truth (the DB) is the one that stays CP.
+
+The key realization: a cache almost always sits **in front of** a strongly-consistent database. So you get to be relaxed at the cache layer precisely *because* the DB is strict behind it. A lost or stale cache entry is never lost data — it's just a **miss** that self-heals on the next read.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Cache reads** | **AP** (availability + eventual) | Serve possibly-stale data fast; a stale/missing entry just re-loads from the DB. TTL bounds the staleness. |
+| **Cache writes (default async replication)** | **AP** | Primary acks immediately, replicates a moment later → tiny loss window on failover, but writes stay fast and available. |
+| **Cache writes (if you demand CP)** | **CP — at a cost** | Only achievable with **synchronous / quorum replication**: the primary waits for replicas to confirm before acking. No lost writes on failover, but every write pays the round-trip and a partition can block writes entirely. Rarely worth it for a cache. |
+| **Source DB (behind the cache)** | **CP** | This is where correctness lives — transactions, durability, no lost writes. The cache leans on it. |
+
+- **Cache is AP for reads**, always — that's the whole point of a fast, available read layer.
+- **Cache is CP only if you accept slower writes** (sync/quorum replication) — most designs don't, because the DB already guarantees durability.
+- **The source DB stays CP** — the cache being loose is safe precisely because the truth behind it is strict.
+
+> One-liner: **"The cache is AP — I trade a little staleness and a tiny failover write-loss window for speed and availability, because the DB behind it is the CP source of truth that makes those losses self-healing."**
+
+---
+
+## 14. API Design
+
+> A distributed cache exposes three surfaces: the **client data API** (what apps call), the **cluster/topology API** (how routing is discovered), and the **admin API** (how operators rebalance/scale). Keep the data path dead simple — that simplicity is what buys sub-ms latency.
+
+### Client data API (what the app calls)
+
+```
+GET    key                      → value | (nil)           # O(1) lookup on the owning node
+SET    key value [EX seconds]   → OK                       # optional TTL; EX = expire in N sec
+DELETE key                      → 1 (deleted) | 0 (absent) # used by cache-aside on write
+EXPIRE key seconds              → 1 | 0                     # set/refresh a TTL
+TTL    key                      → seconds | -1 (no ttl) | -2 (absent)
+INCR   key                      → new integer              # atomic counter (single-threaded → safe)
+```
+
+### Cluster / topology API (how clients route)
+
+```
+CLUSTER SLOTS      → slot ranges → node (ip:port) + replicas   # clients cache this map
+CLUSTER NODES      → full membership + who owns which slots
+CLUSTER KEYSLOT k  → which slot a key hashes to (CRC16(k) % 16384)
+
+# Redirects returned inline when a client's map is stale (see §11):
+-MOVED <slot> <ip:port>    # slot moved permanently → update your map
+-ASK   <slot> <ip:port>    # slot mid-migration → ask new node for THIS request only
+```
+
+### Admin API (operators scale/rebalance)
+
+```
+CLUSTER ADDNODE <ip:port>              → grow the cluster
+CLUSTER SETSLOT <slot> MIGRATING/IMPORTING/NODE   → move slot ranges between nodes
+CLUSTER REBALANCE                      → redistribute slots evenly (moves ~1/N keys)
+CLUSTER FORGET <node-id>               → remove a dead/decommissioned node
+CLUSTER FAILOVER                       → manually promote a replica (planned maintenance)
+```
+
+> The data API is tiny on purpose. All the *system-design* interest lives in the topology + admin surfaces — that's where consistent hashing, slot migration, and failover (§6, §8, §11) actually show up.
+
+---
+
+## 15. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6 (sharding + failure modes are what they're really testing).
+
+1. **Clarify requirements** — data API (GET/SET/DELETE/TTL), scale, latency target, HA needs — §2
+2. **Estimate scale** — working-set size, QPS, memory (RAM is the constraint) — §3
+3. **Sketch the API + architecture** — client → router → node → DB-on-miss — §14, §4
+4. **Single-node internals** — hash map, TTL (lazy+active), eviction — §5, §7
+5. **Deep dive: the hard part → sharding** — **draw the hash ring**, add/remove a node moves only ~1/N keys, vnodes for balance, Redis 16384 slots — §6
+6. **Deep dive: failure modes** — replication + failover, stampede/avalanche/penetration/hot key — §8, §9, §12
+7. **Address consistency** — AP cache in front of a CP DB; staleness bounded by TTL + delete-on-write — §13
+8. **Summarize tradeoffs** — §13, §16
+
+> 🎤 **Lead with the headline:** say up front that "the crux is **sharding with minimal reshuffling** — consistent hashing so scaling doesn't stampede the DB," then spend most of your time on the ring, eviction, and failure modes. That's the signal they're grading.
+
+---
+
+## 16. Interview Cheat Sheet
+
+> **"How do you shard keys across nodes?"**
+> "**Consistent hashing with virtual nodes** (or Redis's 16384 hash slots) — adding/removing a node moves only ~1/N of keys, avoiding the mass remap of `hash % N`. Clients (or a proxy/cluster) route a key to its node; cluster mode uses `MOVED`/`ASK` redirects."
+
+> **"How does eviction work?"**
+> "Bounded memory → evict via LRU/LFU. Perfect LRU is costly, so caches **sample K keys** and evict the best candidate (approximate LRU). TTLs expire lazily + via a background sampling sweep."
+
+> **"How do you make it highly available?"**
+> "Leader–follower replication per shard; replicas serve reads and are promoted on primary failure by a controller/sentinel. Async replication trades a tiny loss window for speed — fine for a cache backed by a DB."
+
+> **"Thundering herd / penetration / avalanche / hot key?"**
+> "Stampede (one hot key) → request coalescing / single-flight. Avalanche (mass expiry of many keys) → jittered TTLs. Penetration (missing keys) → negative caching + Bloom filter. Hot key → replicate it (jitter each copy's TTL) or add a client-local cache."
+
+> **"Draw the hash ring for me."**
+> "Draw a circle (0 → 2³²-1). Hash each **node** to a point on it, and each **key** to a point too. To find a key's owner, **start at the key and walk clockwise to the first node**. Adding a node only steals the arc between it and its clockwise neighbor → ~1/N keys move. Then add **vnodes**: each physical node sits at ~150 points so arcs are small and even, and a death spreads across many neighbors. Mention Redis discretizes this into **16384 fixed slots**."
+
+> **"A node dies mid-write — what happens to that write?"**
+> "With async replication the primary may have acked a write it hadn't yet copied. If it dies before replicating, that write is **lost** on failover (the promoted replica never saw it). That's the accepted **write-loss window** — safe for a cache because the DB is the source of truth, so the value just re-loads on the next miss. If you truly can't lose it, you'd need **sync/quorum writes** (slower). And it's never *corrupt* — you get old-or-missing, never garbage, so a re-read fixes it."
+
+> **"Cache is empty after a deploy / rebalance — cold-start problem?"**
+> "A cold or freshly-rebalanced cache = every read misses = the DB eats the full firehose (a self-inflicted stampede). **Warm it**: pre-load the known-hot keys before taking traffic, migrate slots gradually so only ~1/N keys are cold at once, ramp traffic behind single-flight + a circuit breaker so the DB isn't hit by 10k identical misses, and jitter warm-up TTLs so the warmed keys don't all expire together (avalanche). Memcached restarts always cold; Redis can reload from RDB/AOF to skip re-warming."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **You added a node with `hash % N`** | Almost every key remaps → mass miss → DB stampede. Use **consistent hashing + vnodes** so only ~1/N keys move. |
+| **Client sends a request to the wrong node after a rebalance** | Node replies `-MOVED <slot> <ip:port>`; client retries the correct node and **refreshes its cached slot map**. `ASK` for a slot mid-migration. |
+| **Primary dies with un-replicated writes** | Controller promotes a replica (quorum + fencing → no split-brain); the un-replicated writes are lost → re-load from DB on next miss. |
+| **One hot key melts a single node** | Sharding can't split one key. **Replicate it** to salted copies (`k#0..#3`, jitter each TTL) or add a **client-local cache**. |
+| **Many keys expire at the same second** | Avalanche → **jittered TTLs** + staggered warm-up. |
+| **Requests for keys that don't exist anywhere** | Penetration → **negative caching** + **Bloom filter** to reject absent keys before the DB. |
+| **You `SET` the cache on write and it goes stale** | Two writers' `SET`s interleave → stale value pinned. **Delete-on-write** instead, so the next read reloads truth. |
+| **Whole cache cluster is down** | **Circuit breaker** → bypass to DB (provisioned to survive it), probe for recovery, then re-warm. |
+
+---
+
+## 17. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -712,23 +876,7 @@ If the **entire** cache cluster is down, every read becomes a miss and the full 
 
 ---
 
-## 14. Interview Cheat Sheet
-
-> **"How do you shard keys across nodes?"**
-> "**Consistent hashing with virtual nodes** (or Redis's 16384 hash slots) — adding/removing a node moves only ~1/N of keys, avoiding the mass remap of `hash % N`. Clients (or a proxy/cluster) route a key to its node; cluster mode uses `MOVED`/`ASK` redirects."
-
-> **"How does eviction work?"**
-> "Bounded memory → evict via LRU/LFU. Perfect LRU is costly, so caches **sample K keys** and evict the best candidate (approximate LRU). TTLs expire lazily + via a background sampling sweep."
-
-> **"How do you make it highly available?"**
-> "Leader–follower replication per shard; replicas serve reads and are promoted on primary failure by a controller/sentinel. Async replication trades a tiny loss window for speed — fine for a cache backed by a DB."
-
-> **"Thundering herd / penetration / avalanche / hot key?"**
-> "Stampede (one hot key) → request coalescing / single-flight. Avalanche (mass expiry of many keys) → jittered TTLs. Penetration (missing keys) → negative caching + Bloom filter. Hot key → replicate it (jitter each copy's TTL) or add a client-local cache."
-
----
-
-## 15. Final Takeaways
+## 18. Final Takeaways
 
 - It's a **distributed in-memory hash map**: O(1) get/set, sharded across nodes, sub-ms.
 - **Consistent hashing + vnodes** (or Redis 16384 slots) = minimal key movement on scaling (the headline).

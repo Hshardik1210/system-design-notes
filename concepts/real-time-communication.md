@@ -15,6 +15,7 @@
 - [5. WebSocket](#5-websocket)
 - [6. Comparison & When to Use](#6-comparison--when-to-use)
 - [7. Scaling Persistent Connections](#7-scaling-persistent-connections)
+- [Common Mistakes](#common-mistakes)
 - [8. Interview Cheat Sheet](#8-interview-cheat-sheet)
 - [9. Final Takeaways](#9-final-takeaways)
 
@@ -310,6 +311,17 @@ server → ping → (30s, no pong) → assume dead → close it, free the resour
 
 Heartbeats (a) **detect dead connections** so you're not holding thousands of zombie sockets, and (b) **keep the connection active** so proxies don't kill an idle-looking connection. When a client notices the heartbeat stopped, it **reconnects and resyncs** from a cursor (the last message id it saw) — the same idea SSE gives you automatically.
 
+#### Q: How do you authenticate the WebSocket handshake?
+
+Auth happens **once, at the `Upgrade` request** — there's no per-message header like in HTTP, so you validate before accepting the connection. Two common approaches, each with a trap:
+
+- **Cookie (session or JWT):** sent automatically on the handshake, but you **must** enforce a server-side **`Origin` check** — WebSocket is *not* protected by CORS the way `fetch` is, so without it any other site can open a cross-origin socket as your logged-in user.
+- **Token in the query string** (`wss://…/chat?token=…`): works everywhere, but full URLs leak into **access logs, proxies, and browser history** — keep such tokens short-lived and treat them as secrets.
+
+> ⚠️ **A socket outlives its token.** A connection authorized at 9:00 can stay open for hours; if the token expires at 9:15, nothing kicks the user off unless you **re-validate periodically** (or close on expiry). Don't assume "authenticated on connect" means "still authorized now."
+
+> ⚠️ **Backpressure: the server can outrun a slow client.** If you push faster than a client (bad network, busy tab) can read, messages pile up in the server's send buffer and memory grows unbounded. On WebSocket, check `ws.bufferedAmount` (bytes still queued) before sending and **skip, coalesce, or drop** the client if it keeps climbing; on SSE, a slow consumer stalls `res.write()`, so disconnect streams that fall too far behind. For data where only the *latest* value matters (prices, positions), **drop stale updates** rather than queueing a backlog.
+
 ---
 
 ## 6. Comparison & When to Use
@@ -362,6 +374,12 @@ If the client only needs to listen, use **SSE**. If the client also needs to sen
 
 All four techniques above need your **app to be open and connected**. When the app is backgrounded or the phone is asleep, that connection is gone. To wake a closed app ("you have a new message"), you hand the payload to the OS-level push services — **FCM** (Android) / **APNS** (iOS) — which maintain their own single always-on connection to the device. Those are a **different layer** for a different job (reaching a *closed* app), which is why they sit outside this comparison.
 
+#### Q: Why not just multiplex WebSocket over HTTP/2?
+
+There *is* a spec for it — **RFC 8441** ("Bootstrapping WebSockets with HTTP/2"), which tunnels a WebSocket inside a single HTTP/2 connection so many sockets share one TCP+TLS pipe instead of one connection each. In practice it's **unevenly supported** (plenty of proxies and servers don't implement it), so most deployments still run WebSocket as its own HTTP/1.1 `Upgrade`. Worth name-dropping in an interview; don't assume it works end-to-end.
+
+> 💡 **A fifth option: GraphQL subscriptions.** If you're already on GraphQL, a `subscription` gives you server→client push with a typed schema — but it's a *higher-level abstraction* riding on the same transports here (usually WebSocket, sometimes SSE), not a new one. See [API Paradigms](api-paradigms.md).
+
 ---
 
 ## 7. Scaling Persistent Connections
@@ -372,6 +390,8 @@ All four techniques above need your **app to be open and connected**. When the a
 - **Heartbeats/ping-pong** detect dead connections; clients **reconnect + resync** from a cursor.
 - **Sticky routing / load balancer** must support WebSocket upgrade + affinity.
 
+> 💡 **New to pub-sub?** It's a message bus where a sender **publishes** to a named channel and any interested server **subscribes** to receive — the sender never needs to know who's listening. That's exactly what decouples "the gateway that *received* a message" from "the gateway that must *deliver* it." (Deep dive: [Kafka](kafka.md).)
+
 ### Why open connections are hard to scale
 
 A normal HTTP request is quick: a request comes in, gets answered, and the connection closes — any server can handle the next one. A persistent connection (WebSocket/SSE) **stays open for a long time**, tying up resources on one server the whole time. With millions of connections held open at once, the bottleneck isn't request speed — it's *holding all those connections*, plus a way to **find which server holds which client's connection** when a message needs to reach them.
@@ -379,6 +399,8 @@ A normal HTTP request is quick: a request comes in, gets answered, and the conne
 That reframes scaling into three concrete problems:
 
 **Problem 1 — Holding millions of open connections.** Each connection eats memory and a slot on a server ("gateway"). One box can't hold them all, so you run a **fleet of stateful gateway nodes** and add more as connections grow (horizontal scaling). These gateways do little logic; their job is just to *hold connections*.
+
+> 💡 **Rough memory math.** Budget on the order of **tens of KB per idle connection** (socket buffers + a little app state) — call it ~50KB. So **1M connections ≈ tens of GB of RAM** *just to hold them idle*, before a single message flows. That's why gateways are memory-bound and you scale **out** (more nodes), not up.
 
 **Problem 2 — Finding the right connection.** Say Alice (connected to gateway 7) messages Bob. Which gateway is holding Bob's connection? You keep a **connection registry** — usually Redis — mapping user → node:
 
@@ -401,9 +423,21 @@ Two more essentials that keep the fleet healthy:
 - **Heartbeats + reconnect/resync (§5):** ping/pong culls dead sockets so gateways aren't clogged with zombies; when a client reconnects (maybe to a *different* gateway), it **resyncs from a cursor** — "last message I saw was id 415, catch me up" — so nothing is missed or duplicated.
 - **Sticky routing at the load balancer:** the LB must (a) understand the WebSocket `Upgrade` handshake, and (b) keep each client pinned to its gateway (**affinity**) — an established connection can't be moved to a different gateway mid-stream.
 
+> 💡 **Delivery semantics matter for chat.** A raw push to a socket is **at-most-once**: if the socket died mid-send, the message is simply gone. Chat needs **at-least-once** — the client **acks** each message by id, the server retries un-acked ones, and on reconnect the client replays from its last acked cursor. The cost of at-least-once is possible **duplicates** (delivered once, then re-sent because the ack was lost), so make messages **idempotent** — dedupe by message id on the client. (See [Idempotency](idempotency.md).)
+
 #### Q: Why not keep the registry in each server's memory instead of Redis?
 
 Because gateway-7 needs to find a user connected to gateway-3 — a fact that lives on a *different* box. In-memory maps are per-server islands; the registry must be **shared** so *any* node can locate *any* user. Redis is the shared, fast lookup all gateways read from. (This exact machinery powers chat systems — see the WhatsApp note below.)
+
+---
+
+## Common Mistakes
+
+- **Reaching for WebSocket when SSE (or long polling) would do.** If the client only *listens* — notifications, feeds, live scores — a full-duplex stateful socket buys you nothing but scaling pain and hand-rolled reconnect. Direction first: only-listening → **SSE**.
+- **No heartbeat / keepalive.** Without ping/pong you accumulate **zombie half-open sockets** (dead clients that still look alive), and idle connections get silently culled by proxies and load balancers. Always ping periodically and reconnect on missed pongs.
+- **Sticky LB *or* connection registry — but not both.** They solve *different* halves and you need **both**: sticky affinity keeps an established socket pinned to its gateway (it can't be moved mid-stream), while the registry (user→node) lets *other* gateways find where a recipient lives. One without the other means messages that can't be routed, or connections that break on every LB reshuffle.
+- **Assuming `send()` means "delivered."** A successful `send()` only means "queued locally," not "the other side got it." For anything that matters, use **acks + resync** (see delivery semantics above).
+- **Ignoring backpressure.** Blindly writing to a slow client grows the send buffer until the server OOMs — watch `bufferedAmount` and shed load.
 
 ---
 

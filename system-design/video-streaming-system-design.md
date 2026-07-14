@@ -22,11 +22,14 @@
 - [12. Metadata, Search & Recommendations](#12-metadata-search--recommendations)
 - [13. View Counting at Scale](#13-view-counting-at-scale)
 - [14. Data Model (all tables)](#14-data-model-all-tables)
-- [15. Design Patterns (that can be used)](#15-design-patterns-that-can-be-used)
-- [16. Scaling & Failure](#16-scaling--failure)
-- [17. YouTube vs Netflix — Deeper](#17-youtube-vs-netflix--deeper)
-- [18. Interview Cheat Sheet](#18-interview-cheat-sheet)
-- [19. Final Takeaways](#19-final-takeaways)
+- [15. Scaling & Failure](#15-scaling--failure)
+- [16. YouTube vs Netflix — Deeper](#16-youtube-vs-netflix--deeper)
+- [17. Interview Cheat Sheet](#17-interview-cheat-sheet)
+- [18. API Design](#18-api-design)
+- [19. Consistency & CAP Tradeoffs](#19-consistency--cap-tradeoffs)
+- [20. How to Drive the Interview (framework)](#20-how-to-drive-the-interview-framework)
+- [21. Design Patterns (that can be used)](#21-design-patterns-that-can-be-used)
+- [22. Final Takeaways](#22-final-takeaways)
 
 ---
 
@@ -119,13 +122,9 @@ one 1080p viewer      = 5 Mbps
 
 No single data center or database can push 50 Tbps. That's why the answer is a **CDN** (§9): thousands of edge servers spread worldwide, each pushing a slice of that traffic from close to viewers. The database (metadata like titles, view counts) is *tiny* by comparison — it handles clicks and lookups, not the video bytes themselves.
 
-#### Q: The videos take exabytes of storage — isn't storage the real problem?
+The videos take exabytes of storage, but that isn't the real problem — storage is big and costs money, but it's a *solved, boring* problem: object stores (S3/GCS) are effectively infinite and cheap, and you tier cold content to even cheaper archives (§6). The thing that's genuinely hard to engineer and easy to get wrong at scale is **sustained outbound bandwidth to millions of concurrent viewers** — hence "it's a CDN problem."
 
-Storage is big and costs money, but it's a *solved, boring* problem: object stores (S3/GCS) are effectively infinite and cheap, and you tier cold content to even cheaper archives (§6). The thing that's genuinely hard to engineer and easy to get wrong at scale is **sustained outbound bandwidth to millions of concurrent viewers** — hence "it's a CDN problem."
-
-#### Q: Why store 5–10× the source? Isn't that wasteful?
-
-Because you keep **many renditions** of the same video — 144p, 240p, 480p, 720p, 1080p, 4K, each possibly in multiple codecs (§5). Each rendition is a full copy of the video at that quality. It looks wasteful, but it's what makes smooth playback on every device/network possible, and cheap storage makes the trade-off worth it.
+Storing 5–10× the source size sounds wasteful, but it isn't: because you keep **many renditions** of the same video — 144p, 240p, 480p, 720p, 1080p, 4K, each possibly in multiple codecs (§5). Each rendition is a full copy of the video at that quality. It looks wasteful, but it's what makes smooth playback on every device/network possible, and cheap storage makes the trade-off worth it.
 
 ---
 
@@ -154,9 +153,9 @@ Take one master file and produce many re-encoded versions at different resolutio
 
 > **Transcode = decode the video back into raw frames, then re-encode it into a different resolution / bitrate / codec.** You do it many times per upload to build the "encoding ladder" (§5).
 
-#### Q: What is "chunking into segments," and why do it?
+> 💡 **First-jargon glossary (all expanded below):** **transcoding ladder** = the set of quality versions you pre-make (§5) · **ABR** = the player picking the best rung each segment (§7) · **HLS/DASH** = the two streaming formats (§7) · **manifest** = the text file listing segment URLs per quality (§7) · **keyframe/GOP** = the self-contained frame a segment must start on (§5) · **DRM** = encrypt segments + hand out keys only to entitled devices (§10).
 
-The transcoder also **cuts the video into short pieces** (typically 2–10 seconds each), called **segments** (or chunks). So a 10-minute video at one quality becomes ~100 tiny files instead of one big file.
+What is "chunking into segments," and why do it? The transcoder also **cuts the video into short pieces** (typically 2–10 seconds each), called **segments** (or chunks). So a 10-minute video at one quality becomes ~100 tiny files instead of one big file.
 
 Why segments are the magic ingredient:
 
@@ -165,9 +164,7 @@ Why segments are the magic ingredient:
 - **Cacheable** — small immutable files are perfect for CDN caching (§9).
 - **Seek/resume** — jump to minute 8 = just fetch the segments covering minute 8.
 
-#### Q: What does "resumable / chunked upload" mean — is it the same as segments?
-
-**No — different thing, easy to confuse.** Chunked *upload* is about getting the raw file *in* reliably; segments are about breaking the *transcoded output* up for *playback*.
+"Resumable / chunked upload" is easy to confuse with segments, but it's a **different thing**: chunked *upload* is about getting the raw file *in* reliably; segments are about breaking the *transcoded output* up for *playback*.
 
 - **Resumable upload:** the client sends the raw file in pieces with byte offsets. If Wi-Fi dies at 70%, it retries only the missing pieces instead of restarting the whole 4 GB upload.
 - **Segments:** produced *later*, by the transcoder, for streaming.
@@ -224,6 +221,16 @@ def on_all_segments_done(video_id):
 
 Key ideas the code shows: **fan-out on write** (one upload explodes into thousands of independent little jobs), a **state machine** (`UPLOADING → TRANSCODING → READY/FAILED`), and **retry + DLQ** so one bad segment doesn't sink the whole video.
 
+### Thumbnails, sprites & captions (side outputs of the pipeline)
+
+The same pipeline also produces the small stuff a player needs, all stored in blob/CDN and referenced from metadata/manifest:
+
+- **Thumbnails:** a few poster frames per video for the grid/card.
+- **Preview sprite sheet:** one image packing dozens of tiny frames on a grid, plus a **WebVTT map** of `time → (x, y, w, h)`. When you hover the scrubber, the player shows the right thumbnail by cropping the sprite — **one HTTP request, not one per hover position**. That's why the sprite exists.
+- **Captions/subtitles:** extracted or uploaded, stored as **WebVTT/SRT** per language, listed as alternate tracks in the manifest (see the `captions` table in §14).
+
+> 💡 **Sprite over N images:** a single sprite sheet + VTT map means the scrubber-hover feature costs one cached request, not hundreds of tiny ones.
+
 ---
 
 ## 5. Encoding Ladder & Codecs
@@ -259,9 +266,7 @@ A **ladder** = the set of (resolution, bitrate) "rungs" the player can choose fr
 - **Codec = the *compression method* used to shrink the video** (H.264, VP9, AV1). Think of it like ZIP vs RAR vs 7z for video: same movie, different squeezing algorithm. Newer codecs (AV1) squeeze harder (smaller files, less bandwidth) but take more CPU to make and aren't supported on every old device — so you keep H.264 around as the "everyone can play it" fallback.
 - **Bitrate = size of the size.** 1080p at 5 Mbps vs 1080p at 3 Mbps: same pixel dimensions, but the 3 Mbps one is more compressed (slightly worse looking, cheaper to deliver).
 
-#### Q: What's a "keyframe," and why must they line up across qualities?
-
-A **keyframe** (I-frame/IDR) is a *complete* picture; the frames after it only store "what changed" from it (that's how video compresses). A segment must **start on a keyframe** so it can be decoded on its own.
+What's a "keyframe," and why must they line up across qualities? A **keyframe** (I-frame/IDR) is a *complete* picture; the frames after it only store "what changed" from it (that's how video compresses). A segment must **start on a keyframe** so it can be decoded on its own.
 
 For the player to switch 1080p → 480p mid-video *without a glitch*, the 1080p and 480p versions must be cut at the **exact same time points** — i.e. keyframes aligned across all rungs. Then the player finishes segment #5 in 1080p and picks up segment #6 in 480p as if nothing happened.
 
@@ -272,14 +277,18 @@ time →        0s        6s        12s       18s
                          ↑ same boundary → safe to switch quality here
 ```
 
-#### Q: What is "per-title encoding" (Netflix)?
-
-Instead of blindly using the same ladder for every video, analyze each title's **visual complexity** and tailor the ladder to it:
+"Per-title encoding" (Netflix) means, instead of blindly using the same ladder for every video, analyzing each title's **visual complexity** and tailoring the ladder to it:
 
 - A **simple cartoon** (flat colors, little motion) looks perfect at a *low* bitrate → don't waste 5 Mbps on it; maybe 2 Mbps is plenty.
 - A **fast action film** (explosions, grain, motion) needs a *high* bitrate to look good.
 
-So Netflix picks the optimal (resolution, bitrate) rungs *per title* (even per scene). Result: same perceived quality at lower bitrate → less bandwidth *and* less storage across billions of streams. Netflix can do this because content is curated and encoded once, well ahead of release; YouTube's UGC firehose makes fully per-title tuning harder (§17).
+So Netflix picks the optimal (resolution, bitrate) rungs *per title* (even per scene). Result: same perceived quality at lower bitrate → less bandwidth *and* less storage across billions of streams. Netflix can do this because content is curated and encoded once, well ahead of release; YouTube's UGC firehose makes fully per-title tuning harder (§16).
+
+> ⚠️ **GOP = the group of frames from one keyframe to the next.** A segment must contain whole GOPs and begin on a keyframe, or it can't be decoded on its own. That's why the transcoder forces keyframes at fixed intervals (a "closed GOP") — otherwise segment boundaries and keyframes drift apart and ABR switching/seeking break.
+
+#### Q: Why do keyframes have to line up with segment boundaries — what does that have to do with seeking?
+
+A segment can only be decoded if it **starts with a keyframe** (a complete picture); the frames after it are just deltas from it. Two things depend on this. **(1) ABR switching:** to jump 1080p→480p mid-video without a glitch, every rung must cut segments at the *exact same timestamps* — i.e. keyframes aligned across all rungs — so the player finishes 1080p seg #5 and picks up 480p seg #6 seamlessly (§7). **(2) Seeking:** when you drag to minute 8, the player fetches the segment covering minute 8 and starts decoding from its leading keyframe — it can't start mid-segment because there's no complete frame to build from. So keyframe placement literally sets the granularity at which you can seek and switch quality. Shorter GOP/segment = finer seek + faster quality adaptation, but worse compression (keyframes are big) — the same segment-duration trade-off from §4.
 
 ---
 
@@ -295,6 +304,20 @@ So Netflix picks the optimal (resolution, bitrate) rungs *per title* (even per s
 - Segments are **immutable** → cache forever (long TTL) at the CDN.
 - **Storage tiering:** hot/popular in fast storage; cold long-tail → cheaper/archival tiers. Content-addressed dedup for identical uploads.
 
+### Database & storage choices (which DB, and why at scale)
+
+No single store fits every job here, so this is a textbook **polyglot persistence** system — and the split is extreme: the database is tiny, the media is enormous. The deciding question per data type: *"is this a small structured fact I need to query/join, or a large immutable blob I just need to hand to a browser?"*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Video metadata (title, owner, status, renditions) | **RDBMS**, sharded by `video_id` | Small rows, needs joins (video ↔ renditions ↔ owner) and transactional status transitions (`UPLOADING→TRANSCODING→READY`) | A blob/KV store has no query language for "all READY videos by owner X" and no transactional status updates |
+| Raw master upload + every transcoded rendition | **Object/blob store (S3/GCS) + CDN** | Petabytes of immutable bytes; object stores are cheap, durable, and built to be pushed to the edge | A DB row can't hold gigabytes efficiently, and nobody queries *inside* a video file — storing bytes in the DB only bloats it and kills backup/replication speed |
+| Search/discovery (titles, tags, filters) | **Elasticsearch** | Full-text + faceted queries the RDBMS can't do efficiently at catalog scale | `LIKE` scans don't use an index; ES is the CQRS read side, rebuilt from the RDBMS via CDC |
+| View counts, hot metadata reads | **Redis** | Sub-ms increments absorb billions of heartbeats/day without touching the RDBMS (§13) | Writing every heartbeat straight to the RDBMS is the same firehose problem as ad-click counting — it would melt the primary |
+| Transcoding pipeline jobs | **Message queue (Kafka)** | Durable fan-out of one upload into thousands of segment-encode jobs, consumed independently with retry/DLQ | A DB polling table doesn't scale to "one upload → thousands of parallel jobs" the way a log/queue does |
+
+**Why object store + CDN wins over a database for media, and why metadata stays relational:** the video bytes are 99.9% of this system's footprint but need **zero querying** — you fetch a `(video_id, quality, codec)` key and stream bytes, which is exactly what a blob store + CDN is built for (§9). The tiny sliver that *is* relational — title, owner, status, cached counts — genuinely benefits from an RDBMS's joins and atomic status transitions, and it shards cleanly by `video_id` (or `owner_id`) since almost every metadata query is scoped to one video or one channel. Read replicas absorb catalog-browse traffic; the primary only sees writes on upload/status-change, a rounding error next to the CDN's terabits of read bandwidth. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
+
 ### Two kinds of storage, and why they're separate
 
 Keep the bulky video bytes in a blob/object store, and keep the small facts about each video (title, owner, status, view count) in a database. You never put the media bytes in the database — it would be enormous and impossible to query.
@@ -306,18 +329,14 @@ Keep the bulky video bytes in a blob/object store, and keep the small facts abou
 
 > **Rule of thumb: never put media bytes in your database.** The DB stores a *pointer* (a URL/path) to where the bytes live in blob storage.
 
-#### Q: Why are segments "immutable," and why does that matter so much?
-
-**Immutable** = once written, a segment file never changes. A 1080p segment #5 of video X is the same bytes forever. This is enormously useful:
+Why are segments "immutable," and why does that matter so much? **Immutable** = once written, a segment file never changes. A 1080p segment #5 of video X is the same bytes forever. This is enormously useful:
 
 - **Cache forever.** The CDN can keep it with a very long TTL (time-to-live) and never worry it went stale. That's why hit rates are near 100% for popular content (§9).
 - **Dedup & safe retries.** Re-encoding or re-fetching yields identical bytes — no "which version is right?" confusion.
 
 If videos could be edited in place, every edge cache worldwide would have to be invalidated and re-fetched. Immutability sidesteps that entirely.
 
-#### Q: What is "storage tiering" / cold long-tail?
-
-Most views go to a *tiny* fraction of videos; the vast majority are watched rarely (the **long tail**). So:
+"Storage tiering" / cold long-tail refers to this: most views go to a *tiny* fraction of videos; the vast majority are watched rarely (the **long tail**). So:
 
 - **Hot** (popular, recent) → fast storage + heavily cached at CDN.
 - **Cold** (old, rarely watched) → cheaper "archival" tiers (slower to fetch, but that's fine — almost nobody requests them).
@@ -350,8 +369,10 @@ Startup: fetch a low rung first (fast start) → ramp up as buffer fills
 
 Instead of one giant file, the video is delivered as **small segments requested one at a time**. The player first downloads the **manifest**, which lists every segment available in each quality. It then requests the next segment at the quality its network can currently sustain, measures how fast it arrives, and adjusts the next request up or down.
 
-- **Manifest** = a text file listing the segment URLs for each quality. The player downloads it first. Two flavors: HLS `.m3u8` and DASH `.mpd`.
+- **Manifest** = a text file listing the segment URLs for each quality. The player downloads it first. Two flavors: HLS `.m3u8` and DASH `.mpd`. It also lists **alternate tracks** — audio languages and **caption/subtitle** tracks (WebVTT, from the `captions` table in §14) — so the player can offer a subtitle menu without extra API calls.
 - **The player is in charge** (ABR = Adaptive BitRate). It watches two things every few seconds — how fast segments are arriving (**throughput**) and how much video it has buffered ahead (**buffer level**) — and picks the quality for the *next* segment.
+
+> 💡 **The manifest is just a menu.** It contains no video bytes — only URLs and metadata (qualities, segments, audio/caption tracks). It's tiny and cacheable; the bytes come later, per segment, from the CDN.
 
 What an HLS **master manifest** looks like (the menu of qualities):
 
@@ -466,17 +487,11 @@ def start_playback(user, video_id):
 
 Then the player, on its own, talks to the **CDN** (for bytes) and the **DRM license server** (for the key) — never bothering your backend for the actual video (the full step-by-step is the summary flow at the top of this section).
 
-#### Q: What's an "entitlement check"? Isn't that just login?
+An "entitlement check" isn't just login — it's a different check entirely. Login (**authentication**) = "who are you?" Entitlement (**authorization** for *this* content) = "are you allowed to watch *this specific* video *right now*?" — is your Netflix subscription active, did you rent this movie, is it available in your country/region, is it age-gated? Both must pass before you get a manifest.
 
-Login (**authentication**) = "who are you?" Entitlement (**authorization** for *this* content) = "are you allowed to watch *this specific* video *right now*?" — is your Netflix subscription active, did you rent this movie, is it available in your country/region, is it age-gated? Both must pass before you get a manifest.
+A "signed URL" isn't just a normal link: it has a cryptographic token baked in that encodes "valid for user X until 9:05 PM." The CDN checks it before serving. If someone copies the link and shares it, it **expires** in minutes and is often tied to the user — so it's useless to a stranger. This stops **hotlinking** (others embedding your video/bandwidth) and casual link-sharing of paid content.
 
-#### Q: What is a "signed URL" and why not just a normal link?
-
-A **signed URL** has a cryptographic token baked in that encodes "valid for user X until 9:05 PM." The CDN checks it before serving. If someone copies the link and shares it, it **expires** in minutes and is often tied to the user — so it's useless to a stranger. This stops **hotlinking** (others embedding your video/bandwidth) and casual link-sharing of paid content.
-
-#### Q: What are "heartbeats"?
-
-While you watch, the player periodically pings the backend: "user still watching video X, now at 03:42." These **heartbeats** power **continue watching** (resume where you left off), analytics, and **view counting** (§13).
+"Heartbeats" are what the player sends while you watch — it periodically pings the backend: "user still watching video X, now at 03:42." These power **continue watching** (resume where you left off), analytics, and **view counting** (§13).
 
 ---
 
@@ -524,20 +539,22 @@ origin (blob store)         ─────────► serve + copy back up 
 - **Cache key = the segment URL.** Since segments are immutable (§6), an edge that once fetched `segment5.ts` can keep it basically forever (**long TTL**) and serve it to everyone nearby → **near-100% hit rate** for popular content.
 - **Why the shield tier?** If 500 edges all miss at the same instant (a video just went viral), you don't want 500 requests hammering the origin. They hit a **regional shield** first, which fetches from origin **once** and feeds all 500. This "**fan-in** protection" keeps the origin calm.
 
+> ⚠️ **Origin shield failure modes to name:** (1) **shield itself misses/cold** on a brand-new viral upload → without **request coalescing** the shield forwards N duplicate origin fetches (thundering herd just moves one tier down) — good CDNs collapse concurrent misses for the same key into one origin request. (2) **shield node down** → edges fail over to a secondary shield or straight to a multi-region origin; because segments are immutable, any replica is authoritative. (3) **origin overload** despite the shield (many distinct cold objects, not one hot one) → rate-limit/queue at the shield and pre-warm predictable spikes.
+
 #### Q: Pre-positioning vs pull-through — what's the difference?
 
 - **Pull-through (YouTube):** cache a segment the *first* time someone requests it (it "pulls" from origin on the first miss, then it's cached for everyone after). Best when you can't predict what'll be popular — UGC virality is random.
 - **Pre-positioning (Netflix Open Connect):** *predict* tonight's popular titles and **copy them onto edge boxes ahead of time**, during quiet overnight "fill windows." Netflix even ships its own caching appliances **inside ISPs**, so at prime time your show streams from *within your internet provider's building* — minimal long-distance traffic, lowest latency. Works because Netflix's catalog is curated and predictable.
 
-#### Q: Why does this make the origin/database "barely see traffic"?
-
-Because popularity is wildly **skewed** — a small set of videos drives most views, and those are cached at the edge. The terabits of bandwidth are absorbed by thousands of edges close to users; the origin only handles rare cache misses (cold, long-tail content). That's the whole reason "it's a CDN problem" — the CDN, not your servers, carries the load.
+This is also why the origin/database "barely sees traffic": popularity is wildly **skewed** — a small set of videos drives most views, and those are cached at the edge. The terabits of bandwidth are absorbed by thousands of edges close to users; the origin only handles rare cache misses (cold, long-tail content). That's the whole reason "it's a CDN problem" — the CDN, not your servers, carries the load.
 
 ---
 
 ## 10. DRM & Content Protection
 
 Critical for licensed content (Netflix); relevant for paid/private YouTube content.
+
+> 💡 **DRM in one line:** ship the video **encrypted**, and hand the **decryption key** only to a verified, entitled device's secure module — so downloading the segments gets you nothing without a license.
 
 | Mechanism | Purpose |
 | --- | --- |
@@ -573,9 +590,7 @@ The segments are **encrypted with AES**. Even if someone downloads all of them, 
 
 That's the point of a **secure/hardware-backed playback path** (HDCP, secure enclaves): decryption and decoding happen inside protected hardware where normal software (and screen recorders) can't reach the raw frames or the key. It's not unbreakable, but it raises the bar a lot.
 
-#### Q: What is "forensic watermarking"?
-
-An **invisible, per-user marker** embedded into the video each user receives. If a copy leaks online, the studio can extract the marker and trace **which account** leaked it. It doesn't prevent copying; it enables *accountability* (mostly used by Netflix for high-value licensed content).
+"Forensic watermarking" is a related but distinct protection: an **invisible, per-user marker** embedded into the video each user receives. If a copy leaks online, the studio can extract the marker and trace **which account** leaked it. It doesn't prevent copying; it enables *accountability* (mostly used by Netflix for high-value licensed content).
 
 ---
 
@@ -613,13 +628,26 @@ Live:  broadcaster's camera → RTMP/SRT ingest → REAL-TIME transcode
        → cut into TINY segments → push to CDN immediately → viewers (a few seconds behind)
 ```
 
-#### Q: Why can't live just reuse the normal VOD pipeline?
+Why can't live just reuse the normal VOD pipeline? Two reasons: (1) **there's no file yet** — you can't pre-transcode something still being recorded; (2) **latency budget** — VOD can take minutes to encode all renditions; live has *seconds*. So live uses **LL-HLS / low-latency chunked CMAF**, which pushes *partial* segments out early (before the full segment even finishes) to shave latency, trading a bit of compression efficiency and quality for speed.
 
-Two reasons: (1) **there's no file yet** — you can't pre-transcode something still being recorded; (2) **latency budget** — VOD can take minutes to encode all renditions; live has *seconds*. So live uses **LL-HLS / low-latency chunked CMAF**, which pushes *partial* segments out early (before the full segment even finishes) to shave latency, trading a bit of compression efficiency and quality for speed.
+A "DVR window" in live is a related concept worth naming: even in a live stream, recent segments are kept around so viewers can **pause/rewind** (e.g. re-watch the goal) while the live edge keeps advancing. That rolling buffer of recent segments is the **DVR window**. Old segments age out (short TTL), unlike VOD where segments are cached forever.
 
-#### Q: What's a "DVR window" in live?
+### Segment duration & the latency ladder
 
-Even in a live stream, recent segments are kept around so viewers can **pause/rewind** (e.g. re-watch the goal) while the live edge keeps advancing. That rolling buffer of recent segments is the **DVR window**. Old segments age out (short TTL), unlike VOD where segments are cached forever.
+Latency in live is dominated by **segment size** — the player usually needs a few segments buffered before it starts, so end-to-end lag is roughly *(segments buffered × segment duration) + network + encode*. Shrinking the segment is the main lever.
+
+| Segment target | Used by | Rough glass-to-glass latency | Trade-off |
+| --- | --- | --- | --- |
+| **~6–10s** | Standard HLS/DASH (VOD-style) | **~20–30s** | Most efficient (fewer requests, better compression); fine for VOD, too laggy for interactive live |
+| **~2s** | Tuned standard HLS | **~8–12s** | Middle ground; more requests/overhead |
+| **~200–500ms parts** | **LL-HLS / LL-DASH (CMAF)** | **~2–5s** | Near-broadcast latency; needs partial-segment (chunked) delivery + HTTP/2 push or preload hints; more overhead |
+
+- **Standard HLS** buffers whole multi-second segments → simple and cheap, but ~30s behind reality (a goal spoils in the group chat first).
+- **LL-HLS** splits each segment into tiny **parts** (~200–500 ms) and delivers them *before the full segment closes* (chunked transfer), so the player can start on partial data → ~3s latency. You trade compression efficiency and more requests for that speed.
+
+> 💡 **Pick the segment size for the use case:** interactive (auctions, sports betting, watch-parties) → LL-HLS ~2–5s; passive broadcast (concert stream) → standard HLS is cheaper and fine at ~20–30s.
+
+> ⚠️ **Shorter segments aren't free:** more files means more requests, more manifest churn, and worse cache/compression efficiency. Don't reach for LL-HLS unless the latency actually matters.
 
 ---
 
@@ -643,9 +671,7 @@ DB (catalog) --CDC--> Elasticsearch (search index)
 DB + watch history --> ML pipeline --> ranked recs --> cache --> home feed
 ```
 
-#### Q: Why a separate search engine instead of `WHERE title LIKE '%cooking%'`?
-
-`LIKE '%...%'` can't use an index (it scans every row), can't rank by relevance, and can't do typo-tolerance, synonyms, or multi-field scoring. **Elasticsearch** pre-builds an **inverted index** (word → list of videos containing it), so it answers keyword+filter queries in milliseconds across billions of docs. The trade-off is you now maintain a second store kept in sync with the source DB.
+Why a separate search engine instead of `WHERE title LIKE '%cooking%'`? `LIKE '%...%'` can't use an index (it scans every row), can't rank by relevance, and can't do typo-tolerance, synonyms, or multi-field scoring. **Elasticsearch** pre-builds an **inverted index** (word → list of videos containing it), so it answers keyword+filter queries in milliseconds across billions of docs. The trade-off is you now maintain a second store kept in sync with the source DB.
 
 ---
 
@@ -696,9 +722,7 @@ def on_heartbeat(event):
 
 Because of steps 2–3 above. For virality-prone or monetized videos, YouTube **pauses the displayed count** while it verifies views are real (dedup + bot filtering + fraud checks) rather than show an inflated number it might have to take back. Real humans get counted; bots/duplicates get dropped. That verification lag is the "freeze."
 
-#### Q: Why "approximate for display, exact for money"?
-
-Showing "1.2M views" instantly is fine even if it's off by a few — freshness beats precision for a public counter. But **ad revenue** must be exact and defensible. So (Lambda-style, like ad-click billing): a fast streaming path drives the on-screen number, and a slower **batch job recomputes exact totals from the raw event log** for monetization. Likes/subscriptions are similarly async-aggregated — approximate cached counts are perfectly acceptable there.
+The reasoning behind "approximate for display, exact for money": showing "1.2M views" instantly is fine even if it's off by a few — freshness beats precision for a public counter. But **ad revenue** must be exact and defensible. So (Lambda-style, like ad-click billing): a fast streaming path drives the on-screen number, and a slower **batch job recomputes exact totals from the raw event log** for monetization. Likes/subscriptions are similarly async-aggregated — approximate cached counts are perfectly acceptable there.
 
 ---
 
@@ -730,7 +754,12 @@ CREATE TABLE comments ( comment_id BIGINT PRIMARY KEY, video_id BIGINT, user_id 
 CREATE TABLE likes ( user_id BIGINT, video_id BIGINT, PRIMARY KEY(user_id, video_id) );
 CREATE TABLE playlists ( playlist_id BIGINT PRIMARY KEY, user_id BIGINT, title TEXT );
 CREATE TABLE playlist_items ( playlist_id BIGINT, video_id BIGINT, position INT, PRIMARY KEY(playlist_id, video_id) );
--- Segments/manifests/thumbnails → blob store + CDN (never in RDBMS)
+CREATE TABLE captions (                    -- subtitles/CC per language; VTT file lives in blob/CDN
+    video_id BIGINT, lang VARCHAR(10), kind VARCHAR(12) DEFAULT 'subtitle',  -- subtitle | cc | auto
+    label TEXT, storage_path TEXT,          -- .vtt/.srt in blob; listed in the manifest
+    PRIMARY KEY (video_id, lang, kind)
+);
+-- Segments/manifests/thumbnails/captions → blob store + CDN (never in RDBMS)
 -- View events → Kafka + OLAP; search → Elasticsearch
 ```
 
@@ -762,26 +791,20 @@ WHERE  video_id = 42 AND quality = '1080p' AND codec = 'h264';
 
 The `view_count` column is a **cached, approximate** number for fast display on the page (one quick read). The OLAP/stream aggregation is the **source of the numbers** (and, after batch reconciliation, the exact figure for monetization). The row's counter is periodically updated from the aggregation — display-fast vs money-accurate, the same Lambda split as everywhere else.
 
----
+### Indexes that matter
 
-## 15. Design Patterns (that can be used)
+The DB is tiny here, but a few indexes carry almost every metadata query:
 
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Pipeline** | Transcoding stages (validate→segment→encode→package→publish) | Composable processing |
-| **Producer-Consumer** | Upload events → transcoding worker fleet (Kafka) | Parallel, elastic scale |
-| **Strategy** | Codec/profile selection, per-title encoding, ABR ladder, recommendation model | Swap algorithms |
-| **State** | Video status (UPLOADING→TRANSCODING→READY→FAILED) | Guarded lifecycle |
-| **Observer / Pub-Sub** | Transcode-done → publish, notify, index; heartbeats → analytics | Decouple |
-| **CDN / Cache-Aside** | Edge delivery of immutable segments | Bandwidth offload |
-| **Facade** | Playback service (auth + entitlement + manifest + URL signing) | Simple client API |
-| **Factory** | Encoder per codec, packager per protocol (HLS/DASH) | Extensible |
-| **Repository** | Metadata access | Testable |
-| **Content-Addressed Storage** | Dedup identical uploads/segments | Save storage |
+- `videos (owner_id, created_at DESC)` — a channel's videos newest-first (channel page, "your uploads"). The composite lets one index seek to the owner and return rows already sorted, no filesort.
+- `watch_history (user_id, watched_at DESC)` — "continue watching" and history for a user, most-recent-first. `(user_id, video_id)` stays the PK for upsert-by-position; this second index serves the timeline read.
+- `transcoding_jobs (status, updated_at)` — the worker/monitoring path: find `QUEUED`/`FAILED`/stuck jobs to schedule, retry, or alert on. Partial index `WHERE status IN ('QUEUED','RUNNING','FAILED')` keeps it small since most jobs are `DONE`.
+- `video_renditions (video_id)` (PK already covers it) — fetch all rungs for a video when writing the manifest / picking a `(quality, codec)`.
+
+> 💡 **Index the sort, not just the filter.** `(owner_id, created_at DESC)` beats a plain `owner_id` index for feed-style "latest N by owner" reads because the DB skips a separate sort step.
 
 ---
 
-## 16. Scaling & Failure
+## 15. Scaling & Failure
 
 - **Transcoding** = massively parallel segment jobs; autoscale the worker fleet; retry failed segments; DLQ poison uploads.
 - **CDN** carries the read bandwidth (terabits); origin blob store hit only on cache miss; shield tier + pre-positioning protect the origin.
@@ -792,7 +815,7 @@ The `view_count` column is a **cached, approximate** number for fast display on 
 
 ---
 
-## 17. YouTube vs Netflix — Deeper
+## 16. YouTube vs Netflix — Deeper
 
 | Dimension | **YouTube** | **Netflix** |
 | --- | --- | --- |
@@ -810,7 +833,7 @@ The `view_count` column is a **cached, approximate** number for fast display on 
 
 ---
 
-## 18. Interview Cheat Sheet
+## 17. Interview Cheat Sheet
 
 > **"How do you stream smoothly on variable networks?"**
 > "Adaptive bitrate (HLS/DASH): transcode into an encoding ladder of resolutions/bitrates, chunk into short keyframe-aligned segments, and let the player pick the best sustainable rung per segment from measured throughput + buffer — switching seamlessly at segment boundaries."
@@ -835,7 +858,109 @@ The `view_count` column is a **cached, approximate** number for fast display on 
 
 ---
 
-## 19. Final Takeaways
+## 18. API Design
+
+> Keep it RESTful. The read path (`GET /playback`) dwarfs the write path (`POST /upload-url`) by orders of magnitude — the API mirrors that asymmetry.
+
+```
+POST /v1/upload-url                                → get a RESUMABLE upload target
+     body: { filename, sizeBytes, contentType }
+     → 200 { videoId, uploadUrl, uploadId }
+     (client PUTs the master in chunks by byte offset; resumes on flaky networks)
+
+GET  /v1/videos/{videoId}                          → metadata (title, owner, status, renditions)
+     → 200 { videoId, status: READY|TRANSCODING|FAILED, title, durationS, ... }
+
+GET  /v1/playback/{videoId}                        → the "press play" call (Facade, §8)
+     header: Authorization: Bearer <token>
+     → 200 {
+         manifestUrl,          # signed HLS/DASH manifest URL (short-lived)
+         drmLicenseUrl,        # where the player fetches the decryption key (§10)
+         segmentBaseUrl,       # signed base for segment fetches
+         startPositionS        # resume point from watch_history
+       }
+     | 403 not entitled  | 404 not ready
+
+POST /v1/views                                     → playback heartbeat (§13)
+     body: { videoId, sessionId, positionS, watchedSeconds }
+     → 202 Accepted   (fire-and-forget; async aggregation, never blocks playback)
+```
+
+- `POST /upload-url` returns a **resumable/multipart** target so a dropped 4 GB upload retries only the missing chunks — the API never streams bytes through your app servers; the client PUTs straight to blob storage.
+- `GET /playback/{videoId}` is the **playback Facade** (§8): one authenticated call does auth + entitlement + manifest + URL signing, returning the manifest plus short-lived signed segment URLs and the DRM license endpoint. Everything after is player ↔ CDN and player ↔ license server directly.
+- `POST /views` is a **heartbeat**, not a transactional write: return `202` immediately and let it flow through Kafka to async counters (§13). A slow analytics path must never stall playback.
+
+> ⚠️ **Don't proxy video bytes through your API.** The playback call hands back *signed URLs*; the actual terabits flow player → CDN edge. If bytes ever traverse your app tier, you've re-created the origin bottleneck the CDN exists to remove (§9).
+
+> 💡 **Signed URLs are the whole auth story on the hot path.** After the one `GET /playback` call, the CDN — not your backend — enforces access by validating the short-lived token on each segment request. No per-segment trip to your servers.
+
+---
+
+## 19. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Video streaming splits cleanly — **money/access must be strong; everything viewer-facing can be eventual.**
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Entitlement / DRM license check** | **CP** (strong) | Serving a paid/licensed video to someone not entitled is a contract/revenue violation — must be correct, even at the cost of a failed play |
+| **View counts, likes, watch progress** | **AP** (eventual) | "1.2M views" being seconds stale is invisible to users; async-aggregate it (§13) |
+| **Catalog / metadata reads** | **AP** (eventual) | A new title appearing a few seconds late is fine; serve from cache/replicas |
+| **Segment delivery (CDN)** | **AP** (eventual) | Immutable segments propagate to edges eventually; a cold edge just misses and back-fills (§9) |
+| **Upload → READY status** | Eventual | Transcoding takes minutes; the video simply isn't playable until the state machine flips to READY (§4) |
+
+- The **entitlement/DRM path is the one place correctness beats availability**: if the license server can't confirm the user is allowed, playback of protected content must fail closed, not open. Make it **HA** so "fail closed" stays rare.
+- Everything the viewer *sees as a number* (views, likes) is eventually consistent by design — approximate for display, reconcile exactly in batch for monetization (Lambda-style, §13).
+
+> One-liner: **"Strong consistency on entitlement and DRM; eventual consistency for view counts, catalog, and segment propagation."**
+
+---
+
+## 20. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6 (transcoding + CDN are where the signal is).
+
+1. **Clarify requirements** (functional + NFRs; VOD vs live? DRM?) — §2
+2. **Estimate scale** — establish that **bandwidth dominates** → "it's a CDN problem" — §3
+3. **Define APIs** — upload-url, playback, views — §18
+4. **High-level pipeline + data model** — upload → transcode → segment → CDN → ABR — §1, §14
+5. **Deep dive: the write path** → transcoding fan-out, encoding ladder, keyframe alignment — §4, §5
+6. **Deep dive: the read path** → ABR, CDN edge→shield→origin, DRM — §7, §9, §10
+7. **Address scale + edge cases** → live, view counting, failure modes — §11, §13, §15
+8. **Summarize tradeoffs** — §19, §17
+
+> 🎤 **Lead with the core insight:** state up front that "you never serve the raw file — you pre-transcode into a ladder of small immutable segments and let a CDN absorb the terabits." That framing drives every later decision.
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Transcode fails mid-ladder** (e.g. 1080p segment #42 errors) | Only that `(segment × quality × codec)` job retries (idempotent, keyed by output path); after N tries → DLQ + alert. Other rungs still publish; the video can go READY with the failed rung excluded from the manifest, or stay TRANSCODING until it succeeds. One bad segment never sinks the whole video (§4). |
+| **CDN cold start / thundering herd on cache miss** (video just went viral) | 500 edges miss at once → they hit the **regional shield**, which fetches from origin **once** and fans out to all 500 (**request coalescing / fan-in protection**). Without a shield, origin gets stampeded. Pre-warm edges for predictable spikes (§9). |
+| **DRM license timeout** | Player retries with backoff; keep the license server **HA + regional**. Protected content **fails closed** (no key → encrypted garbage). Cache license responses per (device, title) within policy to cut load. |
+| **Origin shield itself fails** | Edges fall back to a secondary shield or directly to a multi-region origin; immutable segments mean any replica is authoritative. Degrade to fewer renditions before failing playback. |
+| **Player on terrible network** | ABR floors at the lowest rung; startup fetches the low rung first for fast start, then ramps (§7). Better a grainy stream than a spinner. |
+| **Live stream ingest drops** | Encoder reconnects (RTMP/SRT); DVR window keeps recent segments so viewers can pause/rewind while the live edge catches up (§11). |
+
+---
+
+## 21. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Pipeline** | Transcoding stages (validate→segment→encode→package→publish) | Composable processing |
+| **Producer-Consumer** | Upload events → transcoding worker fleet (Kafka) | Parallel, elastic scale |
+| **Strategy** | Codec/profile selection, per-title encoding, ABR ladder, recommendation model | Swap algorithms |
+| **State** | Video status (UPLOADING→TRANSCODING→READY→FAILED) | Guarded lifecycle |
+| **Observer / Pub-Sub** | Transcode-done → publish, notify, index; heartbeats → analytics | Decouple |
+| **CDN / Cache-Aside** | Edge delivery of immutable segments | Bandwidth offload |
+| **Facade** | Playback service (auth + entitlement + manifest + URL signing) | Simple client API |
+| **Factory** | Encoder per codec, packager per protocol (HLS/DASH) | Extensible |
+| **Repository** | Metadata access | Testable |
+| **Content-Addressed Storage** | Dedup identical uploads/segments | Save storage |
+
+---
+
+## 22. Final Takeaways
 
 - It's a **media pipeline + global CDN**, not a DB problem — **bandwidth dominates**, so caching/CDN is the whole game.
 - **Transcode → segment (keyframe-aligned) → encoding ladder of renditions/codecs → HLS/DASH manifest**; jobs are massively parallel (Producer-Consumer).

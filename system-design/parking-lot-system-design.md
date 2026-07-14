@@ -1,5 +1,7 @@
 # Parking Lot — System Design (OOD / LLD)
 
+> **Core challenge:** **This is a class-modeling problem, not a scale problem.** Model vehicles, spots, tickets, pricing, and payment as clean, swappable objects so that "now add electric scooters / valet pricing / reservations" is a small extension, not a rewrite. The one real runtime hazard is two cars claiming one spot — solved with a single atomic FREE→OCCUPIED flip.
+
 > A classic **object-oriented design (LLD)** problem. Core challenge: model a multi-floor parking lot that handles **different vehicle/spot types**, **assigns spots**, **issues tickets**, and **charges on exit** — with clean, extensible class design. Interviewers grade **your class model and the design patterns you apply**, not scale.
 
 > **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
@@ -19,8 +21,11 @@
 - [7. Data Model (if persisted)](#7-data-model-if-persisted)
 - [8. APIs (if a service)](#8-apis-if-a-service)
 - [9. Concurrency](#9-concurrency)
-- [10. Interview Cheat Sheet](#10-interview-cheat-sheet)
-- [11. Final Takeaways](#11-final-takeaways)
+- [10. State Machines (Ticket & Payment)](#10-state-machines-ticket--payment)
+- [11. Extensibility](#11-extensibility)
+- [12. How to Drive the Interview](#12-how-to-drive-the-interview)
+- [13. Interview Cheat Sheet](#13-interview-cheat-sheet)
+- [14. Final Takeaways](#14-final-takeaways)
 
 ---
 
@@ -63,9 +68,9 @@ Beginners often blur these two lists. A simple way to keep them apart:
 
 > **Why "extensible" is called out as a requirement:** this is an *OOD* problem. The interviewer is really asking "when I later say *now add electric scooters* or *now add valet pricing*, does your design bend gracefully, or do you have to rewrite everything?" Good class design is the actual deliverable — see §3 and §4.
 
-#### Q: Why bother with vehicle *types* at all — isn't a spot just a spot?
+### Why bother with vehicle types at all — isn't a spot just a spot
 
-Because spots have **sizes**, and a vehicle only fits in some of them. A motorcycle fits almost anywhere; a truck needs a large spot. If you ignore types you'll happily assign a bus to a compact slot and it physically won't fit. So "types + a fit rule" is the very first modeling decision (`Vehicle.canFitIn(SpotType)`).
+Spots have **sizes**, and a vehicle only fits in some of them. A motorcycle fits almost anywhere; a truck needs a large spot. If you ignore types you'll happily assign a bus to a compact slot and it physically won't fit. So "types + a fit rule" is the very first modeling decision (`Vehicle.canFitIn(SpotType)`).
 
 ---
 
@@ -117,9 +122,9 @@ A lot **has** floors; a floor **has** spots. This is called **composition** — 
 > - **"is-a" (inheritance):** a `Car` **is a** `Vehicle`. Use `extends`.
 > - **"has-a" (composition):** a `ParkingLot` **has** `ParkingFloor`s. Use a field/list.
 
-#### Q: Why does `Ticket` link vehicle + spot + entry time all together?
+### Why `Ticket` links vehicle + spot + entry time all together
 
-Because at exit you're holding **only the ticket**, and from it alone you must answer: *which spot do I free up?* and *how much do I charge?* The entry time gives you duration (→ fee); the spot reference lets you flip that spot back to FREE. The ticket is the little bundle of state that ties an entry to its future exit.
+At exit you're holding **only the ticket**, and from it alone you must answer: *which spot do I free up?* and *how much do I charge?* The entry time gives you duration (→ fee); the spot reference lets you flip that spot back to FREE. The ticket is the little bundle of state that ties an entry to its future exit.
 
 ---
 
@@ -129,7 +134,7 @@ Because at exit you're holding **only the ticket**, and from it alone you must a
 enum VehicleType { MOTORCYCLE, CAR, TRUCK }
 enum SpotType    { COMPACT, LARGE, MOTORCYCLE, HANDICAPPED, EV }
 enum SpotStatus  { FREE, OCCUPIED, OUT_OF_SERVICE }
-enum TicketStatus{ ACTIVE, PAID, LOST }
+enum TicketStatus{ ACTIVE, PAID, CLOSED, LOST }
 
 abstract class Vehicle {
     String plate; VehicleType type;
@@ -187,8 +192,9 @@ enum SpotType    { COMPACT, LARGE, MOTORCYCLE, HANDICAPPED, EV }
 // A spot is either open, taken, or broken/closed for maintenance.
 enum SpotStatus  { FREE, OCCUPIED, OUT_OF_SERVICE }
 
-// A ticket's life: active while parked → paid at exit → lost if you drop it.
-enum TicketStatus{ ACTIVE, PAID, LOST }
+// A ticket's life: active while parked → paid at exit → closed once you drive out.
+// LOST is the side-branch for a dropped ticket (see the state machine in §10).
+enum TicketStatus{ ACTIVE, PAID, CLOSED, LOST }
 ```
 
 #### Step 2 — the Vehicle hierarchy and the ONE key rule: `canFitIn`
@@ -291,7 +297,7 @@ This is the **Strategy pattern** (see §4): `ParkingLot` holds a `FeeStrategy` b
 
 Rule of thumb: **is-a-kind-of → abstract class; can-do-this-job → interface.**
 
-#### Q: Where does the actual "park a car" flow live?
+### Where the actual "park a car" flow lives
 
 Inside `ParkingLot.parkVehicle(v)`, which orchestrates the smaller objects: ask each floor (via the assignment strategy) for a fitting free spot, atomically claim it, then create and return a `Ticket`. The step-by-step pseudocode for exactly this is in §5.
 
@@ -405,9 +411,9 @@ Each add-on wraps the one beneath it, so the fee is built up layer by layer.
 
 > **Composite** (`Lot → Floors → Spots`) just means you can ask "how many free?" at any level and it recurses down — the lot sums its floors, each floor sums its spots. **Facade** (`ParkingLotService`) is a friendly front desk that hides all these moving parts behind a simple `park()` / `unpark()`.
 
-#### Q: Do I have to use *all* these patterns?
+### Do you have to use all these patterns
 
-No — and cramming all ten in is a red flag. Lead with the five that genuinely fit (Strategy, Factory, Singleton, State, Observer) and mention the rest only if a follow-up invites them (e.g. "how would you add weekend pricing?" → Decorator). Patterns are tools, not a checklist.
+No — cramming all ten in is a red flag. Lead with the five that genuinely fit (Strategy, Factory, Singleton, State, Observer) and mention the rest only if a follow-up invites them (e.g. "how would you add weekend pricing?" → Decorator). Patterns are tools, not a checklist.
 
 ---
 
@@ -442,6 +448,10 @@ class BestFitStrategy implements SpotAssignmentStrategy {
 }
 ```
 
+#### Q: Why best-fit and not first-fit?
+
+**First-fit** grabs the first free spot you stumble across, regardless of size. It's simpler and marginally faster, but it *wastes big spots on small vehicles*: a motorcycle lands in the first LARGE spot it sees, and later a truck (which *only* fits LARGE) is turned away even though a MOTORCYCLE slot sat empty the whole time. **Best-fit** hands each vehicle the *tightest* size it still fits in, keeping scarce large spots free for the vehicles that genuinely need them — higher overall utilization. The cost is a little extra work (walk sizes smallest→largest), but it's the same `SpotAssignmentStrategy` interface either way, so you can start with first-fit and swap in best-fit later with zero changes to `ParkingLot`. 💡 In an interview, name both and say "I'd default to best-fit for utilization, but it's a one-line Strategy swap."
+
 #### The full park flow, annotated
 
 The full `parkVehicle` flow, written out:
@@ -467,11 +477,11 @@ Ticket parkVehicle(Vehicle vehicle) {
 
 > **Two `find` calls can return the same spot** to two different cars a millisecond apart. That's fine — `find` only *suggests*; `assign()` is the real, atomic claim. Only one car's `assign()` succeeds; the other loops on. This split ("suggest cheaply, claim atomically") is the same idea as optimistic locking.
 
-#### Q: How do you find the *nearest* spot?
+### How you find the nearest spot
 
 "Nearest" needs a notion of distance. Give each spot a distance-from-gate number (precomputed) and keep free spots per floor in a **min-heap / sorted structure** ordered by that distance; the nearest free one pops off in O(log n). Swapping best-fit for nearest-first is literally just a different `SpotAssignmentStrategy` implementation — `ParkingLot` doesn't change (that's the whole point of Strategy).
 
-#### Q: What if the lot is completely full?
+### What happens if the lot is completely full
 
 `parkVehicle` finds no spot on any floor and throws `ParkingFullException` (or returns an empty `Optional`, depending on your API taste). The entry gate then shows "LOT FULL" and keeps the barrier down. The display boards (Observer) already show 0 free, so ideally the driver never even pulls up.
 
@@ -558,7 +568,7 @@ FeeStrategy pricer = new TaxDecorator(          // +18% GST, applied on the very
 Money total = pricer.calculate(ticket, Instant.now());
 ```
 
-#### Q: Hourly vs flat vs progressive — how do I pick, and can I change it later?
+### Hourly vs flat vs progressive — how to pick, and can it change later
 
 You don't pick *in the code* — the lot holds a `FeeStrategy` field, and you inject whichever one the business wants (config at startup, or even per-lot). Changing from hourly to flat is swapping one object, zero changes to `ParkingLot` or `ExitGate`. That flexibility is exactly why pricing is a Strategy, not a big `if/else`.
 
@@ -566,7 +576,7 @@ You don't pick *in the code* — the lot holds a `FeeStrategy` field, and you in
 
 Real garages bill in whole blocks — stay 61 minutes and you pay for 2 hours. `Math.ceil` models that. If you used plain integer division you'd under-bill (61 min → 1 hour). Small detail, but interviewers love catching it.
 
-#### Q: Where does "how long did it stay" actually get computed?
+### Where "how long did it stay" actually gets computed
 
 `Duration.between(ticket.entryTime, exitTime)`. The entry time was frozen onto the ticket at the gate; the exit time is "now." The whole fee system leans on that one stored timestamp — which is why `Ticket` carries `entryTime` (see §2).
 
@@ -605,7 +615,7 @@ If the garage runs across many gate machines (not just one program in memory), t
 | `PaymentProcessor` result | `payment` | one row per money movement |
 | `ParkingRate` | `parking_rate` | the price list |
 
-#### Q: Why the partial index `WHERE status='FREE'`?
+### Why the partial index `WHERE status='FREE'`
 
 ```sql
 CREATE INDEX idx_spot_free ON parking_spot(floor_id, type) WHERE status='FREE';
@@ -619,6 +629,17 @@ Both are valid answers depending on scope:
 
 - **Single machine / interview default:** keep everything as in-memory objects (the §3 classes). Simple, fast, no DB.
 - **Multiple gate servers (distributed):** the in-memory picture can't be shared, so the DB becomes the **source of truth**, and the atomic FREE→OCCUPIED flip becomes a conditional SQL `UPDATE` (see §9). The classes still exist in code; they're just loaded from / saved to rows.
+
+### Database & storage choices
+
+The §3 objects are the runtime source of truth — a single-process interview answer needs no database at all. **If you persist** (multi-gate deployment, surviving a restart, or an audit trail):
+
+| Data | Store | Why |
+| --- | --- | --- |
+| Lots/floors/spots, tickets, payments | **RDBMS** (Postgres/MySQL) | Spot assignment is the atomic conditional `UPDATE ... WHERE status='FREE'` from §9 — it needs row-level locking so two gates can never claim the same spot. Ticket + spot + payment also want to commit together (ACID), which a relational engine gives for free. |
+| Real-time free-spot counts (entry gates, display boards) | **Redis** | Counts are read constantly by every gate/board and don't need durability — worst case after a crash is recomputing `COUNT(*) WHERE status='FREE'` from the DB. Redis takes that read/decrement traffic instead of hammering the RDBMS on every park/unpark. |
+
+See [Databases — Deep Dive](../concepts/databases-deep-dive.md) for the general engine trade-offs.
 
 ---
 
@@ -712,13 +733,185 @@ boolean iWonTheSpot = (rows == 1);   // 1 = I flipped it; 0 = someone else alrea
 
 You *could* put one big lock around all parking, but then only **one car can park at a time in the entire garage** — even cars headed to different floors. That kills throughput. Per-spot CAS lets thousands of non-conflicting parks happen in parallel and only serializes the rare case where two cars truly want the *same* spot.
 
-#### Q: Does the availability counter have the same problem?
+### Whether the availability counter has the same problem
 
 Yes — if two cars park at once and both do `freeCount = freeCount - 1` as read-then-write, one decrement is lost. Use an **atomic** counter (`AtomicInteger.decrementAndGet()`), or just derive the count from the DB (`COUNT(*) WHERE status='FREE'`) so there's a single source of truth.
 
 ---
 
-## 10. Interview Cheat Sheet
+## 10. State Machines (Ticket & Payment)
+
+> A **state machine** is just "here are the only states this thing can be in, and the only *legal* moves between them." Interviewers love this because it forces you to name the illegal moves and *guard* against them — the same discipline that stops a car double-parking (§4, State pattern).
+
+### The ticket lifecycle
+
+A `Ticket` is born the moment the entry barrier prints it and dies when you drive out the exit. Its whole life is four states:
+
+```
+                 pay OK                 barrier lifts,
+   ┌────────┐  ─────────► ┌──────┐  ─────► ┌────────┐
+   │ ACTIVE │             │ PAID │         │ CLOSED │  (terminal)
+   └────────┘             └──────┘         └────────┘
+       │  declare lost         ▲
+       ▼                       │ pay penalty
+   ┌────────┐  ────────────────┘
+   │  LOST  │
+   └────────┘
+```
+
+- **ACTIVE** — issued at entry; the car is parked; its spot is `OCCUPIED`.
+- **PAID** — fee has been paid at the exit machine, but the barrier hasn't lifted / the spot isn't freed yet.
+- **CLOSED** — terminal: barrier lifted, spot flipped back to `FREE`, session done.
+- **LOST** — side-branch: driver lost the paper ticket; resolved with a flat/penalty fee, then it re-joins the normal `PAID → CLOSED` path.
+
+> 💡 **Why separate PAID from CLOSED?** They are two *different* real-world moments — money changing hands vs the barrier physically lifting and the spot reopening. Keeping them apart means a crash *between* them (paid, but barrier stuck) leaves the ticket in a clear, recoverable `PAID` state instead of an ambiguous one. (Same "resource state ≠ request state" separation as seats vs bookings in the BookMyShow note.)
+
+### The illegal-transition guard
+
+The point of an enum isn't the four words — it's rejecting the moves that shouldn't happen. Encode the legal edges once and refuse everything else:
+
+```java
+class Ticket {
+    String ticketId; Vehicle vehicle; ParkingSpot spot;
+    Instant entryTime; TicketStatus status = TicketStatus.ACTIVE;
+
+    // The ONLY legal moves. Everything not listed here is rejected.
+    private static final Map<TicketStatus, Set<TicketStatus>> LEGAL = Map.of(
+        ACTIVE, Set.of(PAID, LOST),   // park → pay, or lose the ticket
+        LOST,   Set.of(PAID),         // pay the penalty, then continue
+        PAID,   Set.of(CLOSED),       // barrier lifts, spot freed
+        CLOSED, Set.of()              // terminal — no way out
+    );
+
+    void moveTo(TicketStatus next) {
+        if (!LEGAL.get(status).contains(next))
+            throw new IllegalStateException(status + " ✗→ " + next); // guard
+        status = next;
+    }
+}
+```
+
+> ⚠️ **Pitfall — the moves this blocks:** `ACTIVE → CLOSED` (driving out without paying), `PAID → PAID` (a double-charge from a retry / double-click), and anything out of `CLOSED` (reusing a spent ticket). Without the guard these become silent data corruption; with it they're a loud, testable exception.
+
+#### Q: What if the user loses the ticket?
+
+They can't prove *when* they entered, so you can't compute an honest duration. Model it as the `LOST` branch: the ticket (looked up by plate, or a fresh "lost ticket" record for that spot) moves `ACTIVE → LOST`, and a **lost-ticket `FeeStrategy`** charges a flat maximum-stay penalty (e.g. "one full day") instead of `Duration.between(...)`. Once that penalty is paid it flows `LOST → PAID → CLOSED` exactly like a normal exit, and the spot frees. 💡 Notice this needed **no new control flow** — just another `FeeStrategy` and one extra enum edge. That's the extensibility payoff again (§11).
+
+### The payment lifecycle & the exit flow
+
+Payment is its own little machine, because charging a card can *fail* — and a failed exit payment is the one flow beginners forget.
+
+```
+   ┌─────────┐  charge OK   ┌─────────┐
+   │ PENDING │ ───────────► │ SUCCESS │ ──► ticket ACTIVE→PAID
+   └─────────┘              └─────────┘
+        │  charge declined        ▲
+        ▼                         │ retry / new method
+   ┌─────────┐  ──────────────────┘
+   │ FAILED  │
+   └─────────┘
+```
+
+Here is `unpark` walking `PaymentProcessor` through it, including the failure and refund paths:
+
+```java
+Receipt unpark(Ticket t, PaymentMethod method) {
+    Money amount = feeStrategy.calculate(t, Instant.now());  // duration → money (§6)
+
+    Payment p = new Payment(t.ticketId, amount);             // status = PENDING
+    boolean charged = paymentProcessor.pay(amount, method);  // talk to card/UPI/cash
+
+    if (!charged) {
+        p.status = FAILED;
+        // ⚠️ DO NOT free the spot. Barrier stays DOWN, ticket stays ACTIVE,
+        // spot stays OCCUPIED. The car is still physically here — nothing owed is settled.
+        throw new PaymentFailedException(t.ticketId);        // gate shows "payment failed, retry"
+    }
+
+    p.status = SUCCESS;
+    t.moveTo(PAID);          // guarded: only legal from ACTIVE (or LOST)
+    t.spot.free();           // NOW flip the spot FREE→ ... and lift the barrier
+    t.moveTo(CLOSED);        // terminal
+    return new Receipt(t, amount);
+}
+```
+
+> ⚠️ **The rule that keeps money and spots consistent: the spot stays `OCCUPIED` until payment is confirmed truth.** Freeing the spot first and *then* charging would let a car leave without paying if the charge fails. Order matters: **charge → then free.**
+
+**The refund path (charge succeeded but we couldn't finish).** If `pay()` actually debited the card but the response was lost (timeout), a naive retry would **double-charge**. Guard it the same way BookMyShow does: make the charge **idempotent** (one `Payment` row per ticket-exit attempt, keyed by `ticketId`), and run a **reconciliation** check — if the gateway says "already charged," don't charge again; if we charged but the ticket never reached `CLOSED` (e.g. barrier jammed), issue a **refund** and reset `PAID → ` back through a compensating step so the driver isn't billed for a spot they never left. The spot only leaves `OCCUPIED` once the exit truly completes.
+
+> 💡 **Beginner takeaway:** the happy path is trivial; the grade is in the *unhappy* path. "Payment failed → spot stays occupied, barrier stays down, retry" and "charged twice → idempotent + refund" are exactly the edges interviewers push on.
+
+---
+
+## 11. Extensibility
+
+> The whole reason this problem is *OOD* is the follow-up: "great — now change it." A good design absorbs each of these as a **new class / enum value / Strategy**, with `ParkingLot` untouched. Here are three classic asks and the small, surgical change each needs.
+
+### 1. Add a new vehicle type — the electric scooter
+
+**Ask:** "We now rent electric scooters. Support them." **Change:** one enum value + one subclass. No `if/else` hunt, because the fitting rule lives *inside* the vehicle (§3).
+
+```java
+enum VehicleType { MOTORCYCLE, CAR, TRUCK, ELECTRIC_SCOOTER }   // +1 word
+
+class ElectricScooter extends Vehicle {
+    // Tiny — fits a motorcycle slot, and prefers EV spots for charging.
+    boolean canFitIn(SpotType s){ return s == MOTORCYCLE || s == EV; }
+}
+```
+
+Register it in `VehicleFactory` (one `case`) and you're done — assignment, pricing, ticketing all keep working because they only ever call `canFitIn` / `type`. ✅ **Enum + subclass swap, not a rewrite.**
+
+### 2. Add valet pricing
+
+**Ask:** "Valet customers pay a premium on top of parking." **Change:** a new `FeeStrategy` — or, better, a **Decorator** so it stacks on any base pricing (§6).
+
+```java
+class ValetSurcharge implements FeeStrategy {
+    private final FeeStrategy inner;
+    ValetSurcharge(FeeStrategy inner){ this.inner = inner; }
+    public Money calculate(Ticket t, Instant exit) {
+        return inner.calculate(t, exit).plus(Money.of(200));  // flat valet fee on top
+    }
+}
+// wire it: new ValetSurcharge(new HourlyFee(rates))
+```
+
+`ParkingLot` and `ExitGate` never learn the word "valet" — they just hold a `FeeStrategy`. ✅ **Strategy/Decorator swap.**
+
+### 3. Add a reservation hold
+
+**Ask:** "Let users reserve a spot before arriving." **Change:** one `SpotStatus` value + reuse the *same atomic CAS* as parking (§9).
+
+```java
+enum SpotStatus { FREE, OCCUPIED, OUT_OF_SERVICE, RESERVED }   // +1 word
+
+// Reserve = the same compare-and-set, just a different target state.
+boolean reserve(){ return status.compareAndSet(FREE, RESERVED); }  // FREE→RESERVED
+// On arrival the ticket flips RESERVED→OCCUPIED; on no-show, an expiry job flips it back to FREE.
+```
+
+The "don't let two people grab it" guarantee is *already solved* by CAS — reservation is just a third state on the spot's own state machine, with an expiry sweep (same idea as BookMyShow's lock expiry). ✅ **Enum value + existing CAS, not a rewrite.**
+
+> **Pattern across all three:** the change is *additive* — a new enum value, a new subclass, or a new Strategy/Decorator — and the core `ParkingLot` orchestration is never edited. That "open for extension, closed for modification" property **is** the deliverable being graded.
+
+---
+
+## 12. How to Drive the Interview
+
+> An OOD interview rewards a **visible method**, not a burst of classes. Narrate these four moves in order; each builds on the last.
+
+1. **Nail the entities first (nouns → classes).** Say the requirements out loud and pull out the nouns: lot, floor, spot, vehicle, ticket, gate, fee, payment (§2). Draw the **has-a** hierarchy (`Lot → Floor → Spot`) and the **is-a** hierarchy (`Car/Truck/Motorcycle extends Vehicle`). Land the one key rule early: `Vehicle.canFitIn(SpotType)` (§3). This shows you can model before you code.
+2. **Find the axes of change → introduce Strategy.** Ask "what will they make me change later?" — *how spots are picked* and *how we price*. Pull each behind an interface (`SpotAssignmentStrategy`, `FeeStrategy`) so they're swappable (§5, §6). This is the moment you turn a static class diagram into an *extensible* one.
+3. **Name the one real race → CAS.** Volunteer the "two cars, one spot" hazard before they ask, and solve it with an **atomic FREE→OCCUPIED** compare-and-set (in-memory `AtomicReference`, or a conditional `UPDATE ... WHERE status='FREE'` when distributed) — `find()` only suggests, `assign()` is the atomic claim (§9). Explicitly reject "one big lock on the lot" as a throughput killer.
+4. **Tie it together with patterns + state machines.** Summarize the pattern set (Strategy, Factory, Singleton, State, Observer — §4) and show the **Ticket/Payment state machines with guards** (§10), including the unhappy path (payment fails → spot stays occupied). Close with the extensibility follow-ups (§11) to prove the design bends, not breaks.
+
+> 🎤 **Lead with the core challenge:** "This is graded on class design and extensibility, not scale — so I'll model clean objects, make the *how* parts swappable via Strategy, and guard the one real race with an atomic spot claim." Then spend most of your time in steps 1–3.
+
+---
+
+## 13. Interview Cheat Sheet
 
 > **"How do you model different vehicle and spot types?"**
 >
@@ -740,9 +933,22 @@ Yes — if two cars park at once and both do `freeCount = freeCount - 1` as read
 >
 > "Strategy (assignment + pricing), Factory (vehicles/spots), Singleton (lot), State (spot/ticket), Observer (boards), Decorator (fees), Facade (service API), Composite (lot→floor→spot)."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Lot fills up mid-assignment** | `find()` suggested a spot but it got taken a millisecond ago → `assign()`'s CAS returns false → **loop to the next spot/floor**; if none, throw `ParkingFullException` and show "LOT FULL". |
+| **Two cars, `assign()` CAS lose** | Only one `compareAndSet(FREE, OCCUPIED)` wins; the loser gets `false` and **retries the next candidate spot** — never blocks (§9). |
+| **Redis count says free, DB says taken** | The **DB is the source of truth**. Redis free-counts are a cache/optimization; on mismatch trust the conditional `UPDATE ... WHERE status='FREE'` (0 rows = taken) and let Redis re-sync from `COUNT(*)`. |
+| **Lost ticket** | No entry time to bill → `ACTIVE → LOST`, charge a **flat max-stay penalty** via a lost-ticket `FeeStrategy`, then `LOST → PAID → CLOSED` (§10). |
+| **Exit payment fails** | Ticket stays `ACTIVE`, spot stays `OCCUPIED`, barrier stays **down**; prompt retry / another method. **Charge → then free**, never the reverse (§10). |
+| **Charged but response lost** | Idempotent `Payment` (keyed by ticket-exit) + reconciliation → don't double-charge; if charged but not `CLOSED`, **refund** and keep the spot `OCCUPIED` until resolved. |
+
+> **Ultimate layer model:** `canFitIn` = correct assignment · CAS = single winner on a spot · state-machine guards = no illegal ticket/payment moves · Strategy/Decorator = swap behavior without a rewrite.
+
 ---
 
-## 11. Final Takeaways
+## 14. Final Takeaways
 
 - It's an **OOD/LLD** problem — grade is on **clean, extensible classes + patterns**, not scale.
 - **Strategy** for assignment & pricing; **Factory** for creation; **Singleton** for the lot; **State** for spot/ticket; **Observer** for boards; **Decorator** for fees.

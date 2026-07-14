@@ -28,8 +28,10 @@
 - [18. Final Architecture](#18-final-architecture)
 - [19. How to Drive the Interview](#19-how-to-drive-the-interview)
 - [20. Interview Cheat Sheet](#20-interview-cheat-sheet)
-- [21. Design Patterns (that can be used)](#21-design-patterns-that-can-be-used)
-- [22. Final Takeaways](#22-final-takeaways)
+- [21. Consistency & CAP Tradeoffs](#21-consistency--cap-tradeoffs)
+- [22. Custom Domains, Link Previews & Data Deletion](#22-custom-domains-link-previews--data-deletion)
+- [23. Design Patterns (that can be used)](#23-design-patterns-that-can-be-used)
+- [24. Final Takeaways](#24-final-takeaways)
 
 ---
 
@@ -235,6 +237,8 @@ GET    /v1/users/{userId}/urls?cursor=&limit=20
 
 Use **base62** (`[a-z A-Z 0-9]`, 62 symbols): compact and fully URL-safe.
 
+> 💡 **base62** just means "counting in a 62-symbol number system" (like base10 has 10 digits). Because each character carries one of 62 values instead of 10, you pack a big number into very few characters — that's how you get a 7-char code for trillions of links. Full walkthrough in [What "base62" actually means](#what-base62-actually-means) below.
+
 ```
 62^6  ~ 56.8 billion
 62^7  ~ 3.52 trillion    ← length 7 is plenty for 6B rows
@@ -328,13 +332,9 @@ so id 125  →  code "21"
 
 ### base62 Q&A
 
-#### Q: Why 62? Why not use all 64 base64 symbols to be even shorter?
+Why 62 symbols and not all 64 from base64, to be even shorter? base64 includes `+`, `/`, and `=`. Those have **special meaning inside a URL** (`/` is a path separator, `+` can mean space, `=` is padding), so they'd need escaping and look ugly. base62 sticks to only letters and digits — everything is **safe to put in a URL and easy to type or read aloud**. You give up almost nothing in length.
 
-base64 includes `+`, `/`, and `=`. Those have **special meaning inside a URL** (`/` is a path separator, `+` can mean space, `=` is padding), so they'd need escaping and look ugly. base62 sticks to only letters and digits — everything is **safe to put in a URL and easy to type or read aloud**. You give up almost nothing in length.
-
-#### Q: If I encode 1, 2, 3… won't the codes be guessable?
-
-Yes — that's the trap. Sequential IDs make **adjacent codes**:
+A related worry: if you encode 1, 2, 3… won't the codes be guessable? Yes — that's the trap. Sequential IDs make **adjacent codes**:
 
 ```
 id 1 → "1",  id 2 → "2",  id 61 → "z",  id 62 → "10", ...
@@ -402,6 +402,8 @@ Node serves ids locally from its block; refills when exhausted.
 
 ### Option C — KGS (Key Generation Service)
 
+> 💡 **KGS** = **Key Generation Service**: a small offline service whose only job is to pre-make a big pile of random, unique short codes *ahead of time* and hand them out on request. Because uniqueness was settled when the keys were generated, the create path never does a collision check — it just pops a ready-made key.
+
 ```
 Offline job pre-generates random unique 7-char keys → `keys` table (state = AVAILABLE)
 App servers fetch a batch (e.g. 1,000) into memory, marking them USED atomically
@@ -468,7 +470,7 @@ Server B claims [2000, 3000)   →  hands out 2000,2001,... locally, no network
 
 ### ID generation Q&A
 
-#### Q: Range allocator vs Snowflake vs KGS — when do I reach for each?
+Putting Options A, B, and C side by side as a quick decision guide — which do you reach for?
 
 | You want… | Use | Why / catch |
 | --- | --- | --- |
@@ -476,9 +478,7 @@ Server B claims [2000, 3000)   →  hands out 2000,2001,... locally, no network
 | **Zero** coordination, even with the counter | **Snowflake** (time + machineId + sequence) | Each machine mints locally. Catch: 64-bit ID → **~11-char** code (longer). |
 | **Non-guessable** codes with no write-time check | **KGS** (pre-made random keys) | A batch of keys is pre-generated; servers just pop one. Needs its own key store. |
 
-#### Q: What is a KGS and how is it different from a counter?
-
-**KGS = Key Generation Service.** Instead of computing a code at create-time, an **offline job** pre-generates a big pile of **random, unique** 7-char codes and stores them as `AVAILABLE`. App servers grab a batch into memory and hand them out.
+Worth spelling out what a KGS actually is and how it differs from a counter: **KGS = Key Generation Service.** Instead of computing a code at create-time, an **offline job** pre-generates a big pile of **random, unique** 7-char codes and stores them as `AVAILABLE`. App servers grab a batch into memory and hand them out.
 
 ```java
 // Startup / when running low: claim a batch, marking them USED atomically
@@ -490,9 +490,26 @@ String code = myKeys.remove(myKeys.size() - 1);
 
 Difference from a counter: a counter produces **sequential** numbers (guessable); a KGS produces **random** codes (non-enumerable) and never needs a write-time collision check because uniqueness was guaranteed when they were generated. Cost: you maintain a key store and its concurrency control.
 
+#### Q: KGS or range allocation — which do I actually pick?
+
+Both give you **collision-free codes with no per-write coordination**, so beginners assume they're interchangeable. The deciding question is: **do codes need to be non-guessable?** **Range allocation** hands out *sequential* integers (`base62(1000), base62(1001), …`), so consecutive codes sit next to each other — an attacker can walk the namespace unless you *also* scramble the number before encoding. It's the simplest option and gives the **shortest** codes. **KGS** pre-generates *random* keys, so codes are **non-enumerable by construction** — no scrambling needed — but you pay for a whole extra service (a key store, batch fetching, AVAILABLE→USED concurrency control). One line to land it: *"Range allocation for shortest codes and simplest infra; KGS when enumeration is a real threat and I want randomness baked in rather than bolted on."*
+
 ---
 
 ## 7. Data Model & Schema
+
+### Database & storage choices (which DB, and why at scale)
+
+This system is **polyglot by necessity** — the mapping, the redirect cache, the ID generator, and analytics all have completely different access patterns, so one store can't serve them all well. The deciding question for the core mapping is *"does this need transactions, or just fast single-key lookups?"* — and because `code → long_url` is **write-once, read-constantly, single-key**, the answer points straight at a key-value store, not a relational one.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| `code → long_url` mapping (**source of truth**) | **NoSQL KV** (DynamoDB/Cassandra), or **sharded RDBMS** at modest scale | Every read/write is a **single-key lookup** — exactly what a KV store is built for; auto-sharding + replication out of the box. At billions of rows and tens of thousands of reads/sec, this is the access pattern, not "occasionally join/filter." | An RDBMS with cross-row transactions buys you nothing here — there's no multi-row invariant to protect (unlike BookMyShow's seat booking). If write volume is modest (a startup-scale shortener), a single sharded RDBMS is simpler and still fine — just shard by `code` from day one so you're not stuck later. |
+| Hot redirect reads (the actual hot path) | **Redis** (cache-aside + negative cache) | Sub-ms reads absorb >99% of the 100:1 read:write ratio (§3); a **long TTL** is safe because the mapping is immutable. | Hitting the KV store on every redirect is unnecessary cost at this read:write skew — Redis (plus a CDN in front of it) is what keeps the store's load near-zero even for a viral link. |
+| Unique ID / short-code generation | **Redis `INCRBY`** (range allocator) or a **KGS keys table** | Coordination only happens **once per block of 1,000 IDs** (§6), so it's cheap and never the bottleneck; Redis's atomic `INCRBY` guarantees no two nodes get the same block. | A single DB `AUTO_INCREMENT` is a SPOF and a per-write bottleneck — every create in the world would serialize on one row. |
+| Click analytics (raw events + rollups) | **Kafka → columnar/OLAP store** (warehouse) | Click writes are high-volume and async; a **columnar** store is built for the "aggregate by day/geo" read pattern (`click_stats_daily`), and Kafka decouples ingestion from the redirect path entirely. | Writing clicks straight into the mapping store would compete with the all-important redirect reads on the same hardware — exactly the contention you're trying to avoid. |
+
+**Why the KV store wins at this scale:** the mapping is **immutable** (write-once, read-many, except `is_active`/`expires_at`), which is what makes both the KV store *and* the Redis cache safe to use with long TTLs — there's no invalidation problem to solve on the hot path. **Shard by `code`** (consistent hashing): every request already knows its exact key, so there's no fan-out, no cross-shard query, and adding nodes only reshuffles a minimal slice of keys. **Replicate every shard** (multi-AZ) because a lost shard means permanently dead links — durability matters more here than write throughput, since writes are only ~40–200/sec (§3). The one place consistency is deliberately relaxed is **code allocation**: because IDs are handed out in **pre-claimed blocks** (range allocation) or **pre-generated batches** (KGS), uniqueness is guaranteed *before* the write ever reaches the KV store — so the store itself never needs a collision check, just a `PRIMARY KEY` as the backstop. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ### URL mapping (the core table)
 
@@ -551,7 +568,17 @@ CREATE TABLE click_stats_daily (
 
 Custom aliases live in the **same `url` table** — `code` is just user-supplied instead of generated. Uniqueness is enforced by the `PRIMARY KEY`; reject with `409` if taken. Reserve system words (`api`, `admin`, `login`) via a blocklist.
 
-### The data model is basically one big dictionary
+### Indexes that matter
+
+Unlike BookMyShow, there's almost nothing to index — the hot path is a single-key lookup on the primary key, and *fewer* indexes keep writes cheap. Only three matter:
+
+| Index | On table | Purpose |
+| --- | --- | --- |
+| **`(code)` — PRIMARY KEY / UNIQUE** | `url` | The whole redirect path is `WHERE code = ?`. Being the PK makes it the shard key *and* makes duplicate codes **impossible to store** (a colliding `INSERT` fails) — this is the collision backstop for random/custom-alias creates. |
+| **`(long_url_hash)`** — optional | `url` | Only if you dedup identical long URLs: one indexed lookup answers "already shortened?" Index the 64-char fingerprint, never the giant `TEXT`. Skip it entirely if you don't dedup. |
+| **`(code, day)` — PK of `click_stats_daily`** | analytics | Serves stats reads (`GET /{code}/stats?from=&to=`) as a cheap range scan over pre-aggregated rows instead of scanning billions of raw `click_events`. |
+
+> 💡 **Fewer indexes is a feature here.** Every secondary index is extra work on each write. Since the mapping is write-once and read by exact key, resist adding indexes you won't query — the PK does 99% of the job.
 
 Forget "database" for a second. The core storage is a **dictionary / hash map**:
 
@@ -570,30 +597,14 @@ Every operation is a **single-key lookup** — "give me the value for key `aB3xY
 
 > Because every request already knows the exact key, the store never scans — it jumps straight to the entry, which is the fastest access pattern a database has.
 
-#### Reading the schema line by line
-
-```sql
-CREATE TABLE url (
-    code        VARCHAR(10) PRIMARY KEY,   -- the short code; PRIMARY KEY = must be UNIQUE
-    long_url    TEXT NOT NULL,             -- where we send the user
-    user_id     BIGINT,                    -- who made it (optional)
-    created_at  TIMESTAMP NOT NULL DEFAULT now(),
-    expires_at  TIMESTAMP,                 -- NULL = lives forever; else stop resolving after this
-    is_active   BOOLEAN NOT NULL DEFAULT TRUE,  -- flip to FALSE to "delete" without erasing the row
-    long_url_hash CHAR(64)                 -- fingerprint of long_url, only if we want dedup
-);
-```
-
-Two beginner-facing ideas hide in there:
+Two beginner-facing ideas hide in the schema above:
 
 - **`PRIMARY KEY` on `code`** is what makes collisions *impossible to store*. If two creates ever tried the same code, the second `INSERT` fails — the database itself is our safety net.
 - **`is_active` = soft delete.** Instead of truly deleting a row (which loses history and can break analytics), we just flip a flag. The redirect checks it and returns `410 Gone`.
 
 ### Data model Q&A
 
-#### Q: Why store `long_url_hash` — isn't the long URL already there?
-
-It's a **fingerprint** (e.g. SHA-256) of the long URL, used only for **deduplication**: "has someone already shortened this exact URL?" Comparing/indexing a fixed 64-char hash is far cheaper than indexing a giant `TEXT` column. On create you look up the hash; if found, hand back the existing code instead of minting a new one.
+Why store `long_url_hash` when the long URL is already there? It's a **fingerprint** (e.g. SHA-256) of the long URL, used only for **deduplication**: "has someone already shortened this exact URL?" Comparing/indexing a fixed 64-char hash is far cheaper than indexing a giant `TEXT` column. On create you look up the hash; if found, hand back the existing code instead of minting a new one.
 
 ```sql
 -- "Did we already shorten this exact long URL?" — one indexed lookup
@@ -602,13 +613,9 @@ SELECT code FROM url WHERE long_url_hash = :hashOfIncomingUrl;
 
 Trade-off (noted in §19): dedup saves space but means two users share one code — a mild privacy leak (one can see the other's click stats), so it's optional.
 
-#### Q: Why keep analytics (`click_events`) in a *separate* store?
+Analytics (`click_events`) lives in a *separate* store because they have **opposite** access patterns. The `url` table is read constantly and must stay lean and fast. `click_events` is **append-only and huge** (a row per click). If you wrote clicks into the same store, those heavy writes would fight with your all-important redirect reads. So clicks go to a **column store / warehouse** via Kafka (§12), completely off the hot path.
 
-Because they have **opposite** access patterns. The `url` table is read constantly and must stay lean and fast. `click_events` is **append-only and huge** (a row per click). If you wrote clicks into the same store, those heavy writes would fight with your all-important redirect reads. So clicks go to a **column store / warehouse** via Kafka (§12), completely off the hot path.
-
-#### Q: What does "shard by `code`" mean and why that column?
-
-**Sharding** = splitting the table across many machines so no single machine holds all 6B rows. We split by `code` because **every** query already knows the code (`GET /aB3xY7`), so we can compute exactly which machine holds it — `shard = hash(code) % N` — and go straight there. One hop, no fan-out.
+"Shard by `code`" means, specifically: **sharding** = splitting the table across many machines so no single machine holds all 6B rows. We split by `code` because **every** query already knows the code (`GET /aB3xY7`), so we can compute exactly which machine holds it — `shard = hash(code) % N` — and go straight there. One hop, no fan-out.
 
 ---
 
@@ -700,6 +707,28 @@ INSERT → PK violation → regenerate (new random / rehash with salt) → retry
 ```
 > Range allocation / KGS **never collide**, so no retry loop is needed on the write path.
 
+### Race condition mini deep-dive — two clients, one custom alias
+
+> ❓ Two users submit `POST /shorten` with the **same** `customAlias: "launch"` at the same millisecond. Both pass an application-level "is it taken?" check (the row doesn't exist yet). What stops them both from creating it?
+
+This is the one genuine write-path race in the whole system, and the fix is the same idea as BookMyShow's seat lock: **don't check-then-act — let the database's uniqueness constraint be the referee.**
+
+```
+❌ Check-then-act (racy):
+  A: SELECT ... WHERE code='launch'  → not found
+  B: SELECT ... WHERE code='launch'  → not found   (both see it free)
+  A: INSERT code='launch'            → ok
+  B: INSERT code='launch'            → ??? (would overwrite / duplicate)
+
+✅ Let the PK decide (atomic):
+  A: INSERT code='launch'  → succeeds, returns 201
+  B: INSERT code='launch'  → PRIMARY KEY violation → app maps it to 409 Conflict
+```
+
+Because `code` is the **PRIMARY KEY**, exactly one `INSERT` can ever win — the second is rejected by the database itself, atomically, no matter how close in time. The application just **catches the constraint violation and returns `409`** ("alias taken"). A pre-`INSERT` `SELECT` (or a Bloom-filter check) is fine as a *fast, friendly* rejection for the common case, but it is **never** the source of truth — the unique constraint is.
+
+> 💡 **Same lesson, different system:** BookMyShow relies on an atomic `UPDATE ... WHERE status='AVAILABLE'`; here we rely on an atomic `INSERT` against a unique PK. Both push the correctness decision *into the database* rather than trying to coordinate it in application code.
+
 ### The redirect handler, line by line
 
 The redirect is the busiest, most important piece of code in the whole system, yet it does **almost nothing** — that's the point. Here it is as a small Spring controller:
@@ -759,9 +788,7 @@ The important beginner takeaways:
 | Hard part | Get a unique code, persist durably | Be **fast** — answer from cache |
 | Touches DB? | Yes, one write | Ideally **no** (cache/CDN hit) |
 
-#### Q: Why warm the cache on create (step 4 of the write flow)?
-
-So the creator's **own first click works instantly**. Right after you create `sho.rt/aB3xY7`, you'll probably click it to test. If we only wrote to the DB (and the read path uses replicas), that fresh row might not have **replicated** yet → your click 404s. Doing `cache.set(code, longUrl)` at create time guarantees **read-your-writes** (§13).
+Why bother warming the cache on create (step 4 of the write flow)? So the creator's **own first click works instantly**. Right after you create `sho.rt/aB3xY7`, you'll probably click it to test. If we only wrote to the DB (and the read path uses replicas), that fresh row might not have **replicated** yet → your click 404s. Doing `cache.set(code, longUrl)` at create time guarantees **read-your-writes** (§13).
 
 ---
 
@@ -836,9 +863,7 @@ String getLongUrl(String code) {
 
 ### Caching Q&A
 
-#### Q: What's a "negative cache" / tombstone, and why do I need one?
-
-Bots scan random codes (`/aaaaa`, `/aaaab`, …) hoping to find valid links. Each of those is a **miss** → a DB read for something that *doesn't exist*. If we only cache things that **do** exist, the bot walks right past the cache and hammers the DB.
+A "negative cache" / tombstone earns its keep here: bots scan random codes (`/aaaaa`, `/aaaab`, …) hoping to find valid links. Each of those is a **miss** → a DB read for something that *doesn't exist*. If we only cache things that **do** exist, the bot walks right past the cache and hammers the DB.
 
 Fix: **also cache the "not found" answer** for a short time (a *tombstone*). Then repeated scans of the same bad code are answered by the cache, not the DB.
 
@@ -850,6 +875,24 @@ if (cache.get(code) == TOMBSTONE) return notFound();   // answered without a DB 
 ```
 
 Short TTL (seconds) because a code that's absent now might get created soon.
+
+#### Q: What is a Bloom filter, and how can it say "definitely not here" without storing the codes?
+
+A **Bloom filter** is a tiny, probabilistic "have I seen this?" structure. It's a bit-array plus a few hash functions: to *add* a code you hash it a few ways and flip those bits on; to *check* a code you hash it the same ways and see if **all** those bits are on. The magic is the guarantee it gives:
+
+- If it says **"not present" → it is 100% correct** (no false negatives). Those bits could only all be on if the code had been added.
+- If it says **"maybe present" → it might be lying** (a *false positive*): unrelated codes happened to flip the same bits.
+
+That asymmetry is exactly what we want in front of the DB. On a redirect (or a custom-alias availability check), if `bloom.mightContain(code) == false`, the code **definitely doesn't exist** → return `404` immediately, **zero DB hits** — which is what blunts bots scanning random codes. If it says "maybe," we fall through to the cache/DB as usual and the false positive costs us one wasted lookup, nothing more (we never serve a wrong URL, because the DB still has the final say).
+
+```
+bloom.mightContain(code) == false  → definitely absent → 404, no DB touched
+bloom.mightContain(code) == true   → maybe present     → check cache/DB (may be a false positive)
+```
+
+> 💡 **Why not just cache the 404 (negative cache)?** Negative caching only helps *after* a bad code has been scanned once; a Bloom filter rejects **first-time** scans of never-seen codes too. Use both. False-positive rate is tunable by sizing the bit-array / hash count.
+
+> ⚠️ **Deletes are awkward.** A plain Bloom filter can't remove entries (unflipping a bit might break other codes). For a shortener that's usually fine (codes are rarely deleted); if you must, use a **counting Bloom filter** or periodically rebuild it.
 
 #### Q: What is the "thundering herd" and how does a tiny cache miss cause an outage?
 
@@ -885,6 +928,10 @@ A `301` redirect is even cacheable by the **user's own browser** — after the f
 ---
 
 ## 11. Redirect: 301 vs 302
+
+> 💡 **The whole difference is one word: "permanently" vs "temporarily."** A **301** tells the browser "this mapping is fixed" → it caches the answer and future clicks skip your server entirely. A **302** tells the browser "this might change" → it asks your server *every* click. That single word decides whether you keep control and analytics (302) or shed load (301).
+
+> ⚠️ **Common trap:** reaching for 301 "because it's faster." It is faster and lighter, but the browser then stops asking you — so you **lose per-click analytics and the ability to expire/disable the link**. Most real shorteners choose 302 for exactly this reason.
 
 | | **301 Moved Permanently** | **302 Found (Temporary)** |
 | --- | --- | --- |
@@ -922,18 +969,7 @@ Because "the browser skips us" is a **double-edged sword**. When the browser cac
 
 Most real shorteners (bit.ly, etc.) care about analytics and link control, so they choose **302** and accept the higher server load (which the cache/CDN absorbs anyway).
 
-#### Q: So which do I say in an interview?
-
-> "**302** for a real product — I want per-click analytics and the ability to expire/disable links, so every click must flow through me. I'd use **301** only if analytics don't matter and I want to shed maximum load, since browsers cache it and repeat clicks never reach my servers."
-
-#### Q: Quick recap table
-
-| Situation | Choose | Because |
-| --- | --- | --- |
-| I want to count every click | **302** | Browser re-hits us each time |
-| I might expire/disable/repoint the link | **302** | We stay in control of every hit |
-| I want the least possible server load | **301** | Browser caches it and skips us |
-| I care about SEO link equity to the target | **301** | Passes more ranking signal |
+In an interview, land on: **"302** for a real product — I want per-click analytics and the ability to expire/disable links, so every click must flow through me. I'd use **301** only if analytics don't matter and I want to shed maximum load, since browsers cache it and repeat clicks never reach my servers."
 
 ---
 
@@ -1049,6 +1085,14 @@ URL shorteners are a favorite tool for **phishing and malware** (they hide the d
 | **Analytics pipeline down** | Redirects unaffected (fire-and-forget); Kafka buffers; backfill later |
 | **Duplicate create (retry)** | PK on `code`; custom alias → 409; generated → regenerate; dedup via `long_url_hash` if enabled |
 | **Bot scanning namespace** | Negative caching + rate limiting + Bloom filter short-circuit |
+
+#### Q: What is a "circuit breaker" and where does it help here?
+
+A **circuit breaker** wraps calls to a flaky dependency and behaves like the electrical kind: after too many failures/timeouts in a row, it **"trips" (opens)** and, for a cooldown period, **fails fast** instead of letting every request pile up waiting on the sick service. After the cooldown it lets a trickle of requests through ("half-open") to test recovery, then **closes** again once they succeed.
+
+In this system the classic use is the **Safe Browsing / malware-scan call on create**: if that provider gets slow, you don't want every `POST /shorten` to hang for 30s and exhaust threads. Trip the breaker and degrade gracefully — e.g. **queue the scan to run async and let the create succeed**, or reject new creates with a clear error — rather than dragging the whole write path down. (It's the same reasoning as BookMyShow wrapping the payment gateway.)
+
+> 💡 **Why "fail fast" beats "keep trying":** a hung dependency is more dangerous than a down one. Threads block waiting on it, back up the queue, and the failure cascades. The breaker converts a slow dependency into a quick, contained error so the rest of the system stays healthy.
 
 ---
 
@@ -1170,9 +1214,63 @@ URL shorteners are a favorite tool for **phishing and malware** (they hide the d
 >
 > "CDN and a long-TTL cache absorb it. The `code → url` value is immutable, so even millions of clicks generate near-zero DB load. Request coalescing prevents a thundering herd if it expires from cache."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Viral hot key** (one code getting millions of clicks) | CDN + long-TTL Redis absorb it; the value is **immutable** so DB load stays near-zero. **Request coalescing** guards the moment it expires from cache. |
+| **404 right after create** (replica lag) | The new row hasn't replicated to the read replica yet. **Warm the cache on write** and route fresh-code reads to the **primary** → read-your-writes holds ([§13](#13-consistency--cache-invalidation)). |
+| **KGS / ID generator outage** | App nodes hold a **buffered block/batch** of IDs in memory, so creates keep working through a short outage; a standby KGS covers longer ones. |
+| **Safe Browsing / malware check down** | **Circuit-break** the dependency (§16): don't hang the create path — either queue the scan async and allow the create, or reject with a clear error. Degrade, don't cascade. |
+| **Two clients grab the same custom alias** | The `code` **PRIMARY KEY** lets exactly one `INSERT` win; the loser gets a constraint violation → app returns **`409 Conflict`**. No app-level lock needed ([§9](#9-core-flows)). |
+| **Bot scanning random codes** | **Bloom filter** rejects never-seen codes with no DB hit; **negative cache** absorbs repeat scans; **rate limiting** at the gateway caps the scanner. |
+
+> **Ultimate layer model:** CDN/browser cache = shed load at the edge · Redis = absorb the read firehose · Bloom + negative cache = block scanners · PK/unique = guarantee no duplicate codes · circuit breaker = contain flaky dependencies.
+
 ---
 
-## 21. Design Patterns (that can be used)
+## 21. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" For a shortener the answer is unusually clean, because the core data is **immutable**.
+
+The `code → long_url` mapping is **write-once, read-many** — once created it never changes (only `is_active`/`expires_at` flip, rarely). Immutable data is the friendliest possible case for CAP: there's no update to disagree about, so replicas and caches can serve freely without risking a *wrong* answer. That pushes the **redirect path firmly to AP** (highly available, cache/edge-friendly). The only place strong-ish consistency matters is the **create path**, and only for a brief window (read-your-writes).
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Redirect (read)** | **AP** (availability + eventual) | Mapping is immutable → serving from cache/CDN/any replica is always correct. A redirect outage breaks *every* link, so availability wins; a few seconds of replica staleness is harmless. |
+| **Create (write)** | **CP-ish for a brief window** | Needs **read-your-writes**: the creator's own first click must resolve. Warm the cache on write and/or read fresh codes from the primary; after replication catches up it relaxes to AP. |
+| **Delete / disable / expiry** | **Eventual** | Invalidate the cache (or write a tombstone); a short window where an already-cached 301 still resolves is acceptable — this is also why 302 is preferred when you need instant takedown. |
+| **Analytics** | **Eventual** | Fire-and-forget, aggregated async; approximate counts and lag are fine — it must never affect the redirect. |
+
+> ⚠️ **The subtle one:** a link created on the primary but read from a lagging replica can **404 right after create**. That's not a bug in the mapping — it's replication lag on the read path. Fix it with cache-on-write + primary reads for fresh codes, **not** by making the whole system strongly consistent (which would throw away the availability the redirect path depends on).
+
+> **One-liner:** "The mapping is immutable, so the redirect path is **AP** — cache and replicas everywhere. The only consistency concern is **read-your-writes right after create**, which I handle with cache-on-write and primary reads for fresh codes."
+
+---
+
+## 22. Custom Domains, Link Previews & Data Deletion
+
+> These come up as "what else would a real product like bit.ly need?" follow-ups. Keep each to a sentence or two in an interview — but knowing they exist signals product depth.
+
+### Custom / branded domains (CNAME)
+
+Businesses want links on **their own domain** (`go.nike.com/xyz` instead of `sho.rt/xyz`) for trust and branding. The customer points their subdomain at you via a **CNAME** DNS record; you serve TLS for it (issue a cert per domain, e.g. via ACME/Let's Encrypt) and store a `domain → tenant` mapping so an incoming request resolves the code **within that domain's namespace**.
+
+> 💡 **Design impact:** the short code is now unique **per domain**, not globally — so the lookup key becomes `(domain, code)`. `go.nike.com/promo` and `sho.rt/promo` are different links. Plan the schema/shard key for this if branded domains are in scope.
+
+### Link preview / Open Graph
+
+Chat apps and social platforms fetch the link to show a rich **preview card** (title, description, image) using **Open Graph** (`og:title`, `og:image`) meta tags. A shortener has two options: **(a)** let the redirect happen and let the crawler read the *destination's* OG tags, or **(b)** serve an **interstitial preview page** for flagged/uncrawlable links. Note that preview-fetching bots generate a burst of "click-like" traffic that you may want to **filter out of analytics** so counts aren't inflated.
+
+### GDPR / link-owner deletion
+
+Users (and regulations like **GDPR**) require the ability to **delete a link and its data**. Two wrinkles: **(1)** a hard delete frees the code, but re-issuing it later would send old clickers to a *new* destination — usually you **soft-delete** (`is_active = FALSE`, return `410 Gone`) and never recycle the code; **(2)** deletion must also **purge associated analytics** (which may contain IPs → personal data) from the warehouse, not just flip the mapping flag. Honor the request across cache (invalidate), primary, replicas, and the analytics store.
+
+> ⚠️ **Don't recycle codes.** Handing a deleted code to a new URL silently repoints anyone who still has the old link (or a cached 301). Treat codes as permanently retired once used.
+
+---
+
+## 23. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -1190,7 +1288,7 @@ URL shorteners are a favorite tool for **phishing and malware** (they hide the d
 
 ---
 
-## 22. Final Takeaways
+## 24. Final Takeaways
 
 - **Read-heavy** (~100:1) → **cache + CDN + read replicas** dominate; writes are tiny.
 - **Short code = base62 of a uniquely-generated ID** — range allocator (shortest), KGS (non-enumerable), or Snowflake (no coordination, longer codes).

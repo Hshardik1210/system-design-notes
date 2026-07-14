@@ -13,6 +13,7 @@
 - [3. gRPC](#3-grpc)
 - [4. Comparison & When to Use](#4-comparison--when-to-use)
 - [5. Related: Webhooks & Polling](#5-related-webhooks--polling)
+- [Common Mistakes](#common-mistakes)
 - [6. Interview Cheat Sheet](#6-interview-cheat-sheet)
 - [7. Final Takeaways](#7-final-takeaways)
 
@@ -77,6 +78,21 @@ Not quite. REST means you model your app as **resources (nouns) addressed by URL
 
 Because `GET /users/123` is a plain URL with no side effects, any layer in between — browser, CDN, proxy — can remember "the answer for this URL is X" and hand it back without bothering the server. GraphQL and gRPC lose this because they POST to a single endpoint (nothing distinctive in the URL to cache on).
 
+#### Q: How do I paginate a REST list — offset or cursor?
+
+Two styles, and interviewers love the trade-off:
+
+- **Offset pagination** → `GET /users?limit=20&offset=40` ("skip 40, give me 20"). Dead simple and lets you jump to any page. But it's **slow on big tables** (the DB still scans the skipped rows) and **unstable**: if a row is inserted while you page, items shift and you see duplicates or skips.
+- **Cursor pagination** → `GET /users?limit=20&after=eyJpZCI6NDB9` ("give me 20 after *this* item"). The cursor is an opaque pointer to the last item you saw (often an encoded id/timestamp). **Fast and stable** even as data changes, because it seeks instead of counting — but you can't jump straight to "page 7."
+
+Rule of thumb: **offset for small/admin tables, cursor for large or fast-changing feeds** (this is why timelines and infinite scroll use cursors).
+
+#### Q: What is OpenAPI / Swagger, and why do people mention it with REST?
+
+REST has **no built-in schema** — that's the "Cons" cell above. **OpenAPI** (formerly Swagger) is the fix: a machine-readable spec (YAML/JSON) that describes every endpoint, its params, and its response shapes. From that one file you get **interactive docs (Swagger UI), client SDK code-gen, and request validation** — basically the typed-contract benefit that gRPC/GraphQL get for free, bolted onto REST. When someone says "document the API," they usually mean "write the OpenAPI spec."
+
+> 💡 **Idempotency-Key for POST.** `GET`/`PUT`/`DELETE` are naturally **idempotent** (repeat them safely), but `POST /payments` is not — a retry after a dropped response could **charge twice**. The fix: the client sends an `Idempotency-Key: <uuid>` header; the server records that key with the first result and **returns the same result** for any retry with the same key. Stripe and every serious payments API work this way. *(See the Idempotency note for the full pattern.)*
+
 ---
 
 ## 2. GraphQL
@@ -138,6 +154,47 @@ Two REST problems, solved in one shot:
 #### Q: If it's so flexible, why not use GraphQL for everything?
 
 The flexibility moves the cost onto the server. Because everything is one `POST /graphql`, that friendly HTTP caching from REST is gone (you cache at the field/resolver level instead — harder). And a client can write a nasty deep query (`user → posts → comments → author → posts → …`) that hammers the DB, so servers add **depth/cost limits**. There's also the **N+1 resolver problem**: fetching 3 posts can naïvely fire 3 separate "get author" DB calls — fixed with **DataLoader**-style batching. Power for the client = complexity for the server.
+
+> ⚠️ **pitfall — the GraphQL N+1 resolver problem.** A resolver runs **per item**, so a list of N posts triggers N extra DB calls to resolve each post's author (1 query for posts + N for authors = **N+1**). It hides in innocent-looking nested queries and quietly melts your DB under load.
+>
+> **Before (naïve — 1 + N queries):**
+>
+> ```js
+> // author resolver runs once PER post → 100 posts = 100 author queries
+> const resolvers = {
+>   Post: {
+>     author: (post) => db.users.findById(post.authorId),   // ← fires N times
+>   },
+> };
+> ```
+>
+> **After (DataLoader batches into 1 query):**
+>
+> ```js
+> // one loader collects all authorIds in a tick, then fetches them together
+> const authorLoader = new DataLoader(async (ids) => {
+>   const users = await db.users.findByIds(ids);            // ← ONE query for all ids
+>   return ids.map((id) => users.find((u) => u.id === id)); // return in the same order
+> });
+>
+> const resolvers = {
+>   Post: {
+>     author: (post) => authorLoader.load(post.authorId),   // batched + cached per request
+>   },
+> };
+> ```
+>
+> DataLoader **coalesces** all the `.load(id)` calls fired in one event-loop tick into a **single batched fetch**, and de-dupes repeated ids — turning 1 + N into 1 + 1.
+
+#### Q: What are GraphQL subscriptions, and how do they differ from WebSocket/SSE?
+
+**Subscriptions** are GraphQL's answer to real-time: a client subscribes to an event (`subscription { messageAdded(room: 5) { text } }`) and the server **pushes** matching data as it happens — same field-selection power as queries, but streamed. Under the hood they usually **run over a WebSocket**. So it's not an alternative to WebSocket/SSE so much as a **typed, schema-driven layer on top**:
+
+- **WebSocket** = raw two-way byte pipe; *you* invent the message format.
+- **SSE** = simple one-way server→client stream over plain HTTP.
+- **GraphQL subscription** = structured events **shaped by your schema**, typically transported over a WebSocket.
+
+Use subscriptions when you're already all-in on GraphQL and want real-time updates in the same typed model; drop to raw WebSocket/SSE when you want something lighter or non-GraphQL.
 
 #### Q: Is GraphQL a database or a replacement for REST?
 
@@ -205,6 +262,28 @@ System.out.println(u.getName());           // "Ada" — the network trip is invi
 
 Both are "call a function on another server" (RPC in spirit). The differences are the **wire format and contract**: gRPC uses **binary protobuf over HTTP/2** with a **generated, strongly-typed contract** and multiplexing/streaming built in; hand-rolled JSON-RPC uses text over HTTP/1.1 with no enforced schema. gRPC is faster and safer for internal traffic; JSON is easier to read and debug.
 
+### The four gRPC call types (not just unary)
+
+Beginners assume gRPC always means one request → one response (**unary**). In fact HTTP/2 lets gRPC stream in either or both directions, and the `stream` keyword in the `.proto` is what switches modes:
+
+```proto
+service ChatService {
+  rpc GetUser      (GetUserRequest)         returns (User);              // 1) unary
+  rpc ListUpdates  (Query)           returns (stream Update);            // 2) server-streaming
+  rpc UploadPhotos (stream Photo)    returns (UploadResult);             // 3) client-streaming
+  rpc Chat         (stream Message)  returns (stream Message);           // 4) bidirectional
+}
+```
+
+| Type | Shape | One real use case |
+| --- | --- | --- |
+| **Unary** | 1 request → 1 response | `GetUser(123)` — an ordinary RPC call |
+| **Server-streaming** | 1 request → *stream* of responses | subscribe to a **live price feed** / tail logs (server keeps pushing) |
+| **Client-streaming** | *stream* of requests → 1 response | **upload a large file** in chunks, get one final ack |
+| **Bidirectional** | *stream* ↔ *stream* (independent) | **real-time chat** or multiplayer game state (both sides talk freely) |
+
+> 💡 **tip** Streaming direction = "who has more to say." One-off call → unary. Server firehoses events → server-streaming. Client sends many chunks → client-streaming. A live conversation → bidirectional.
+
 ---
 
 ## 4. Comparison & When to Use
@@ -219,6 +298,23 @@ Both are "call a function on another server" (RPC in spirit). The differences ar
 | Best for | **Public APIs, CRUD** | **Flexible client queries** | **Internal microservices** |
 
 > **Rule of thumb:** REST for public/simple APIs, **gRPC for internal service-to-service**, GraphQL when diverse clients need tailored data. They coexist — public REST/GraphQL gateway → internal gRPC.
+
+> 💡 **The canonical layout: public REST/GraphQL edge → internal gRPC.** They aren't rivals — most real systems use each where it shines. The **edge** speaks the browser-friendly, cacheable, `curl`-able protocol; **behind** the gateway, your own services talk fast typed gRPC to each other.
+>
+> ```
+>   Browser / mobile / 3rd-party
+>            │  REST / GraphQL  (JSON, cacheable, public)
+>            ▼
+>     ┌─────────────────┐
+>     │   API Gateway   │  ← auth, rate-limit, translate
+>     └─────────────────┘
+>            │  gRPC  (protobuf/HTTP2, fast, typed, private)
+>     ┌──────┼──────┐
+>     ▼      ▼      ▼
+>   Users  Orders  Payments      (internal microservices)
+> ```
+>
+> The gateway is the **only** thing exposed publicly; it translates the outside JSON world into internal gRPC calls.
 
 ### The three, back-to-back
 
@@ -294,6 +390,26 @@ Content-Type: application/json
 ```
 
 Two must-dos for webhooks: **verify the signature** (confirm the event really came from the sender, not an attacker) and **dedup** (the sender may retry, so the same event can arrive twice — guard with the event id). Reach for **WebSocket/SSE** instead when you need a continuous real-time stream (chat, live prices) rather than occasional event pings.
+
+| | **Short polling** | **Long polling** | **Webhook** |
+| --- | --- | --- | --- |
+| Who initiates | Client, on a timer | Client, request held open | **Server** pushes on event |
+| Wasted requests | Many ("not yet") | Few | None |
+| Latency to event | Up to one poll interval | Near-real-time | Near-real-time |
+
+> ⚠️ **pitfall — a failed signature check is a security event, not a retry.** If the `X-Signature` doesn't match, the payload may be forged — **reject it with 4xx and do NOT process or retry** it. Only *genuinely received* events should ever be reprocessed. Also compute the signature over the **raw request body** (before JSON parsing/reserialization changes bytes), or valid events will fail verification.
+>
+> **Retries + idempotency go together.** Senders retry (with backoff) until you return `2xx`, so the *same* event **will** arrive more than once. Make your handler **idempotent**: record each `event.id` (or use it as a unique key / `Idempotency-Key`) and **skip** an event you've already applied. Acknowledge fast with `200`, then do slow work async — if you do heavy processing before replying, you may time out and trigger a needless retry.
+
+---
+
+## Common Mistakes
+
+Three traps that show up constantly in real code and interviews:
+
+- **`POST /getUserById` — RPC dressed as REST.** Putting a **verb in the URL** and always using `POST` throws away everything REST gives you: no HTTP caching, wrong semantics, confusing status codes. **Fix:** model a **noun** and use the verb slot for the action → `GET /users/123`. (Rule: REST URLs are nouns, RPC URLs are verbs — see §1.)
+- **Caching GraphQL `POST` responses at the HTTP layer.** GraphQL sends everything as `POST /graphql`, and `POST` is (correctly) treated as non-cacheable — so a CDN/proxy cache does nothing, or worse, serves a stale/wrong body if you force it. **Fix:** cache **below** GraphQL — persisted queries + per-field/resolver caching (DataLoader, Redis), not the HTTP response. (Some setups use `GET` for cacheable *queries*, but the default `POST` won't cache.)
+- **Using gRPC for browser-facing / public APIs.** Browsers can't speak raw gRPC (you'd need a **grpc-web** proxy), it's not `curl`-friendly, and external developers expect REST/JSON. **Fix:** expose **REST/GraphQL at the edge** and keep gRPC **internal** between your own services (see the diagram in §4).
 
 ---
 

@@ -19,10 +19,12 @@
 - [9. Freshness / Recrawl & Traps](#9-freshness--recrawl--traps)
 - [10. Data Model / Stores](#10-data-model--stores)
 - [11. Sequences](#11-sequences)
-- [12. Design Patterns (that can be used)](#12-design-patterns-that-can-be-used)
-- [13. Scaling & Failure](#13-scaling--failure)
-- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
-- [15. Final Takeaways](#15-final-takeaways)
+- [12. Scaling & Failure](#12-scaling--failure)
+- [13. Interview Cheat Sheet](#13-interview-cheat-sheet)
+- [14. JavaScript Rendering & Edge Cases](#14-javascript-rendering--edge-cases)
+- [15. How to Drive the Interview (framework)](#15-how-to-drive-the-interview-framework)
+- [16. Design Patterns (that can be used)](#16-design-patterns-that-can-be-used)
+- [17. Final Takeaways](#17-final-takeaways)
 
 ---
 
@@ -81,9 +83,13 @@ It "works" on a 5-page toy site and **explodes** on the real web:
 
 That "explicit queue instead of recursion" turns a toy function into a distributed **breadth-first search (BFS)** over the web — which is exactly the architecture in §4.
 
+> 💡 **tip:** two words recur everywhere below — the **frontier** is the durable to-do list of URLs waiting to be crawled (*what's next*), and **politeness** is the rule that you never fetch from one host too fast (*how fast, per site*). If you keep those two straight, the whole design falls into place.
+
 ---
 
 ## 2. Requirements
+
+> 💡 **tip:** start the interview here. Pin down *scale* (how many pages, how fresh) and the two non-negotiables — **dedup** and **politeness** — before drawing boxes. It frames every later decision.
 
 **Functional**
 - Crawl from seed URLs; extract + follow links; store page content.
@@ -93,6 +99,24 @@ That "explicit queue instead of recursion" turns a toy function into a distribut
 
 **Non-functional**
 - **Scalable** (billions of pages), **fault-tolerant**, **polite**, **extensible** (new parsers), robust to **traps** (infinite/spider traps).
+
+### Non-functional (NFRs)
+
+| NFR | Target / Note |
+| --- | --- |
+| **Scale** | Billions of pages; ~hundreds–thousands of fetches/sec sustained; 10B+ URLs in the seen-set. |
+| **Politeness** | Hard constraint — never overload a host; obey robots.txt. Correctness of politeness > raw throughput. |
+| **Fault tolerance** | A worker/DNS/host crash must not lose the frontier or re-crawl the whole web. Durable frontier + retries/DLQ. |
+| **Freshness** | Important/fast-changing pages recrawled sooner; stable pages age. Eventual, not real-time. |
+| **Availability** | The crawl is a best-effort background pipeline — no strict SLA per page; keep making forward progress. |
+| **Extensibility** | New content parsers (PDF, JS-rendered) plug in without touching the core loop. |
+
+### Out of scope (state assumptions)
+
+- Building the **search index / ranking** itself (we produce the corpus + link graph; indexing is a downstream system).
+- **Authenticated / paywalled** crawling, form submission, and login flows.
+- **Real-time** crawling (sub-second freshness) and full **JS execution** by default (see §14 for the optional headless path).
+- Deep **content understanding** (entity extraction, dedup of *meaning* vs bytes) beyond near-duplicate fingerprints.
 
 ---
 
@@ -185,6 +209,8 @@ If they were one giant function, a slow index step would stall your fetchers. In
 
 The frontier decides **what to crawl next** and enforces **politeness**. Classic **Mercator** design = **two levels of queues**.
 
+> 💡 **tip:** **Mercator** is just the name of the classic crawler design that split the frontier into *priority* front queues and *politeness* back queues. Say "Mercator-style two-level frontier" in an interview and you signal you know the canonical answer.
+
 ```
 FRONT queues (priority):  F1..Fn by importance (PageRank-ish, freshness, depth)
                           a prioritizer assigns each URL to a front queue
@@ -252,9 +278,31 @@ String next() {
 
 The min-heap is the key trick: instead of scanning every host asking *"are you ready?"*, the heap always hands you **the one host that's ready soonest** in O(log n).
 
-#### Q: Why must the to-do list be *durable* (on disk/Kafka), not just in memory?
+#### Priority scoring — how a URL picks its front queue
 
-Because the frontier can hold **billions** of pending URLs and represents **weeks of discovered work**. If it lived only in RAM and a worker crashed (or you deployed new code), you'd lose the entire to-do list and restart the crawl from the seed URLs. So the frontier is backed by durable storage (Kafka / DB / disk) — a crash loses at most a few in-flight URLs, not the whole plan.
+`prioritizer.score(url)` above is a black box; here's a concrete sketch. Blend a few signals into one number, then bucket it into a front lane:
+
+```
+score = α·PageRank(host/page)     # importance in the link graph (authority)
+      + β·freshness(url)          # how often this page/host changes (news > static)
+      + γ·(1 / (1 + depth))       # shallower = closer to a seed = usually more important
+```
+
+```java
+int frontQueueFor(Url u) {
+    double s = ALPHA * pageRank(u)        // e.g. precomputed from the link graph
+             + BETA  * changeRate(u.host) // observed change frequency (§9)
+             + GAMMA * (1.0 / (1 + u.depth));
+    // Map the continuous score into N discrete priority lanes (F1..Fn).
+    return clamp((int) (s * NUM_FRONT_QUEUES), 0, NUM_FRONT_QUEUES - 1);
+}
+```
+
+How it feeds the frontier: the score only decides **which front lane** a URL lands in. A background mover then samples higher-priority lanes **more often** when pushing URLs down into the per-host back queues — so important URLs *flow through faster*, but the back-queue heap still gates the actual fetch on politeness. **Priority influences order; politeness always has the final say on timing.**
+
+> ⚠️ **pitfall:** don't let priority override politeness. A high score just means "route this sooner," never "fetch this host now" — the back-queue timer still rules, or you'll hammer popular hosts (which are exactly the high-PageRank ones).
+
+The to-do list must be *durable* (on disk/Kafka), not just in memory, because the frontier can hold **billions** of pending URLs and represents **weeks of discovered work**. If it lived only in RAM and a worker crashed (or you deployed new code), you'd lose the entire to-do list and restart the crawl from the seed URLs. So the frontier is backed by durable storage (Kafka / DB / disk) — a crash loses at most a few in-flight URLs, not the whole plan.
 
 #### Q: How does "one host per back queue" actually enforce politeness?
 
@@ -295,13 +343,9 @@ class CachingResolver {
 
 Why this works so well: the web has billions of *URLs* but only millions of *hosts*, and most links point back into the same site (`wikipedia.org/A` links to `wikipedia.org/B`). So after the first lookup of a host, thousands of that host's pages hit the cache.
 
-#### Q: Why not just cache forever? What's the TTL for?
+Why not just cache the DNS answer forever, then, and skip the TTL entirely? An IP can change (site moves servers). DNS answers come with a **TTL** ("this is valid for 300 seconds"). Honoring it keeps you from crawling a dead IP. In practice crawlers cache generously (and sometimes past the TTL for hosts that rarely move) to save lookups.
 
-An IP can change (site moves servers). DNS answers come with a **TTL** ("this is valid for 300 seconds"). Honoring it keeps you from crawling a dead IP. In practice crawlers cache generously (and sometimes past the TTL for hosts that rarely move) to save lookups.
-
-#### Q: Why "async resolution + a resolver pool"?
-
-A DNS lookup **blocks** — the thread just sits waiting for the reply. If a fetcher thread blocks on DNS, it's not fetching. So crawlers resolve DNS **asynchronously** (fire the lookup, do other work, handle the answer when it arrives) and keep a **pool** of resolver threads/connections so many lookups happen at once instead of one-at-a-time.
+It's also worth resolving DNS **asynchronously with a resolver pool** rather than inline: a DNS lookup **blocks** — the thread just sits waiting for the reply. If a fetcher thread blocks on DNS, it's not fetching. So crawlers fire the lookup, do other work, and handle the answer when it arrives, keeping a **pool** of resolver threads/connections so many lookups happen at once instead of one-at-a-time.
 
 ---
 
@@ -344,6 +388,40 @@ String normalize(String raw, String pageUrl) {
 }
 ```
 
+**Worked example** — one messy link, discovered on the page `https://blog.example.com/posts/`:
+
+| Step | URL |
+| --- | --- |
+| raw (as found in `<a href>`) | `../Foo/?utm_source=twitter&id=42&ref=home#section-2` |
+| resolve relative → absolute | `HTTP://Blog.Example.com/Foo/?utm_source=twitter&id=42&ref=home#section-2` |
+| lowercase host + force https | `https://blog.example.com/Foo/?utm_source=twitter&id=42&ref=home#section-2` |
+| strip fragment (`#...`) | `https://blog.example.com/Foo/?utm_source=twitter&id=42&ref=home` |
+| drop tracking params (`utm_*`, `ref`) | `https://blog.example.com/Foo/?id=42` |
+| sort remaining params + strip trailing slash | `https://blog.example.com/Foo?id=42` |
+| **canonical form** (what we dedup + store) | **`https://blog.example.com/Foo?id=42`** |
+
+Every variant of that link — with a different `utm_source`, a `#anchor`, `HTTP://`, or a trailing slash — now collapses to the **same** string, so the seen-set catches it as one URL.
+
+#### Redirect chains — follow, but cap the hops
+
+A fetch can return `301/302 → another URL → another…`. You **normalize and follow** each hop, but cap the chain (**~5 hops max**) so a misconfigured site (or a redirect loop `A→B→A`) can't trap a worker. Dedup on the **final** landing URL, and record redirect sources as aliases so you don't re-crawl them.
+
+```java
+String followRedirects(String url) {
+    Set<String> seenHops = new HashSet<>();
+    for (int hop = 0; hop < MAX_REDIRECTS; hop++) {     // MAX_REDIRECTS = 5
+        HttpResponse r = fetch(url);
+        if (!r.isRedirect()) return url;                // landed — this is the canonical target
+        String next = normalize(r.location(), url);     // normalize each hop too
+        if (!seenHops.add(next)) break;                 // loop detected (A→B→A) → bail
+        url = next;
+    }
+    return null;   // too many hops / loop → drop this URL
+}
+```
+
+> ⚠️ **pitfall:** dedup on the URL you *requested* and you'll re-crawl the same page under every redirecting alias. Always key the seen-set on the **final normalized target**.
+
 #### The Bloom filter (URL dedup at 10B scale)
 
 We have **10 billion+** URLs. Keeping every full URL string in memory to check "seen it?" would need terabytes of RAM. A **Bloom filter** solves this: a small bit-array (a few GB) that answers "have I seen this?" using a handful of hash functions — no strings stored.
@@ -381,6 +459,8 @@ Even with perfect URL dedup, two *different* URLs can hold **identical or nearly
 - **Exact duplicate → a normal hash (SHA-256).** Hash the page bytes; identical bytes → identical hash → skip. But one changed character → totally different hash, so it only catches *exact* copies.
 - **Near-duplicate → SimHash / MinHash.** These are "**fuzzy** fingerprints": pages with *similar* text get *similar* fingerprints, so you can detect "95% the same" and skip it.
 
+> 💡 **tip:** **SimHash** maps similar text to *similar* bit-strings, so "almost the same" pages sit a few bits apart (small **Hamming distance**). A plain hash (SHA) does the opposite — one changed byte → a totally different value — which is why SHA catches only *exact* dupes and SimHash catches *near* dupes.
+
 ```java
 void maybeIndex(String url, String html) {
     long simhash = simHash(extractText(html));   // fuzzy fingerprint of the text
@@ -399,6 +479,10 @@ void maybeIndex(String url, String html) {
 #### Q: If the Bloom filter can be wrong, why trust it at all?
 
 Because it's wrong in only the *safe* direction. A false positive costs one extra KV lookup (we verify). A false *negative* would be dangerous (we'd re-crawl or loop forever) — and Bloom filters **guarantee** those never happen. So "definitely new" is always safe to act on, and "maybe seen" is always verified. You get near-database accuracy at a fraction of the memory.
+
+#### Q: What does a "1% false-positive rate" actually mean here?
+
+It means that out of the URLs the Bloom filter flags as **"maybe seen,"** about 1% are actually **brand new** — the filter guessed "seen" because their hash bits happened to collide with other URLs' bits. Concretely, at 10B URLs with a 1% FP rate: for every ~100 genuinely-new URLs the filter *thinks* it has seen, ~1 gets an unnecessary KV lookup that comes back empty, and we crawl it anyway. So the cost of 1% FP is a **1% sliver of extra KV verifications**, never a missed page — false positives only ever add work, they never cause us to skip a real page (that would require a false *negative*, which can't happen). The knobs: more bits per element and more hash functions drive the FP rate down (1% → 0.1%) at the cost of more RAM. 1% is a common sweet spot — cheap memory, negligible wasted lookups.
 
 ---
 
@@ -467,14 +551,15 @@ void handleResponse(String host, HttpResponse resp) {
 }
 ```
 
-#### Q: robots.txt vs rate-limiting — aren't they the same "politeness"?
+robots.txt and rate-limiting can look like the same "politeness," but they answer different questions: **robots.txt = *"am I allowed here at all?"*** (a yes/no per path, plus the site's requested delay) — it's about **permission**. **Rate-limiting = *"how fast may I go where I'm allowed?"*** — it's about **pace**. You can be allowed everywhere but still be rude by fetching too fast; you can pace perfectly but still be rude by crawling `/private/`. A polite crawler does **both**.
 
-They answer different questions:
+#### Part D — Honor `<link rel="canonical">`
 
-- **robots.txt = *"am I allowed here at all?"*** (a yes/no per path, plus the site's requested delay). It's about **permission**.
-- **Rate-limiting = *"how fast may I go where I'm allowed?"*** It's about **pace**.
+A page can declare its own canonical address in the HTML head: `<link rel="canonical" href="https://site.com/article">`. This is the *site telling you* "these variants (`?ref=`, AMP, mobile, print) are all really this one URL." Treat it as an authoritative normalization hint: index the canonical, and fold the variant into the seen-set as an alias so you don't store the same article ten times. (It complements the syntactic normalization in §7, which the site's canonical can override.)
 
-You can be allowed everywhere but still be rude by fetching too fast; you can pace perfectly but still be rude by crawling `/private/`. A polite crawler does **both**.
+#### Q: You have to crawl `robots.txt` to obey it — but is fetching it itself "allowed"?
+
+Yes, and it's a special case: `/robots.txt` is **always fetchable** — a crawler is *expected* to request it, and robots rules never apply to the robots file itself. Practical rules: fetch it **once per host** and cache it (with a TTL, e.g. re-check daily) so you're not re-downloading it constantly; the fetch **doesn't count against** the site's normal `Crawl-delay` budget for content. Handle the edge cases explicitly — **`404`/missing** → assume *everything is allowed*; **`5xx`/timeout** → be conservative and treat the host as *disallowed* until you can fetch it (don't crawl a site whose rules you can't read); an **oversized/garbage** file → cap the parse size and fall back to "allow all" or a safe default.
 
 ---
 
@@ -537,9 +622,11 @@ boolean shouldSkipAsTrap(Url u) {
 
 A **duplicate** is the *same* URL/content seen again → caught cheaply by the seen-set / content hash. A **trap** produces endless *distinct* URLs (each genuinely new to the Bloom filter), so dedup never triggers. Traps are stopped by **limits and pattern rules** (depth, per-host caps, param counts), not by dedup.
 
-#### Q: What's the freshness-vs-politeness tension?
+There's a real tension between freshness and politeness: you'd *like* to recrawl a busy news site every few minutes to stay fresh — but politeness (§8) caps how fast you may hit that host. So you spend your limited per-host budget on the pages that **change most and matter most** (high priority + short recrawl), and let stable/unimportant pages age. It's a budgeting problem, not a "crawl everything constantly" problem.
 
-You'd *like* to recrawl a busy news site every few minutes to stay fresh — but politeness (§8) caps how fast you may hit that host. So you spend your limited per-host budget on the pages that **change most and matter most** (high priority + short recrawl), and let stable/unimportant pages age. It's a budgeting problem, not a "crawl everything constantly" problem.
+#### Q: If we discover URLs by following links, why bother with `sitemap.xml`?
+
+They're **complementary discovery paths**, and a good crawler uses both. **Link discovery** finds pages by following `<a href>`s from pages you've already fetched — but it only reaches pages that are *linked* from somewhere you've been, and it discovers them *lazily*, one hop at a time. A **`sitemap.xml`** (often advertised in `robots.txt`) is the site handing you an explicit, complete list of its URLs — including **orphan pages** nobody links to and **deep pages** that are many hops from the homepage. Better still, sitemap entries carry `<lastmod>` / `<changefreq>` hints, which feed the recrawl scheduler directly (freshness for free, without re-fetching to detect a change). Rule of thumb: **seed from the sitemap for coverage, then let link discovery fill the gaps** — but still verify (a sitemap can lie or be stale), and dedup both streams through the same seen-set.
 
 ---
 
@@ -566,6 +653,20 @@ CREATE TABLE robots_cache ( host VARCHAR(255) PRIMARY KEY, rules TEXT, crawl_del
 ```
 
 > **Stores to consider:** URL registry/seen-set (KV + Bloom filter), content blob store (S3, compressed), robots cache, durable frontier queue, link graph, extracted-text/search index, DNS cache.
+
+### Database & storage choices (which DB, and why at scale)
+
+Crawler storage splits along one line: **coordination state** (small, hot, needs correctness) vs **bulk archive** (huge, cold, needs cheapness). Deciding question: *"do I need this to be durable-and-transactional, or just a fast 'have I seen this?' check?"*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| URL frontier (work queue + politeness state) | **Kafka/queue** (durable work) + **RDBMS** (frontier row state, robots cache) | The frontier represents weeks of discovered work — must survive a worker crash; per-host politeness timers need one authoritative place to check "is this host due?" (§5) | An in-memory queue loses billions of pending URLs on a crash; recomputing the crawl plan from seeds isn't an option at this scale |
+| Seen-URL dedup (10B+ URLs) | **Bloom filter** (in-memory/Redis) fronting a **KV store** | A few GB of bits answers "definitely new" for the overwhelming majority of checks in O(1), with no false negatives, so it's safe to trust (§7) | Checking a full KV/RDBMS on every discovered link (hundreds of thousands/sec) makes the durable store the bottleneck for a check that's almost always "yes, it's new" |
+| Raw fetched pages | **Blob/object store (S3)**, compressed | ~100KB per page × billions of pages is squarely "cheap bulk immutable storage," never queried by content | A database row per page wastes space on data nobody `SELECT`s by field — you only ever fetch it by `url_hash` |
+| Parsed/searchable content | **Inverted index (Elasticsearch)** | Full-text search over billions of pages needs an index built for exactly that access pattern | The URL registry answers "what's this URL's status," not "which pages mention X" — a different query shape entirely |
+| Crawl metadata/scheduling (status, priority, `next_recrawl`) | **RDBMS/KV with indexes** | Structured, small rows, looked up by `url_hash` and range-queried by `next_recrawl` for the recrawl scheduler | Doesn't fit the Bloom filter (no range queries) or S3 (needs random small-row access, not blob fetches) |
+
+**Why a Bloom filter + queue beats a database lookup per URL at billions scale:** at 10B+ URLs, a straight "has this URL been seen?" query against a database — for *every single link* extracted from *every single page* — would mean hundreds of thousands of DB reads per second just to decide whether to do any work at all, making the correctness store the bottleneck for a check that's almost always "yes, it's new." A Bloom filter flips that: a small in-memory bit array answers "definitely new" instantly for the common case, and only the rare "maybe seen" falls through to the KV store for verification — so the durable store is touched for a tiny fraction of checks instead of all of them (§7). The **frontier** gets the same treatment on the write side: instead of every worker writing directly into a shared table (lock contention, hot rows), discovered URLs flow through a **durable queue** partitioned by host, so politeness (§8) and durability are enforced by the queue/heap structure, not by transactions on a database row. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ### Why so many different stores?
 
@@ -605,24 +706,7 @@ Scheduler: select urls WHERE next_recrawl <= now() → re-enqueue to frontier (p
 
 ---
 
-## 12. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Producer-Consumer** | Frontier → fetcher/parser workers | Decouple + parallelize |
-| **Strategy** | URL prioritization, recrawl policy, parser per content-type | Swap algorithms |
-| **Bloom Filter** | Seen-URL membership | Cheap dedup at 10B scale |
-| **Pipeline / Chain of Responsibility** | fetch → parse → extract → normalize → filter → store | Composable stages |
-| **Factory** | Parser per MIME type (HTML/PDF/image) | Extensible content handling |
-| **Rate Limiter / Token Bucket** | Per-host politeness (back-queue heap) | Don't overload sites |
-| **Priority Queue / Heap** | Front queues + per-host next-fetch heap | Priority + politeness scheduling |
-| **Repository** | URL/content stores | Abstraction |
-| **Circuit Breaker** | Failing hosts | Back off gracefully |
-| **Observer/Pub-Sub** | New links → dedup → frontier | Decouple |
-
----
-
-## 13. Scaling & Failure
+## 12. Scaling & Failure
 
 - **Shard frontier + workers by host hash** → each host handled in one place (politeness + locality); scale by adding shards.
 - **Bloom filter** for the seen-set keeps dedup cheap; KV store is the durable truth (verify on "maybe").
@@ -659,11 +743,7 @@ Why "shard by **host**" (not by URL) is the magic choice:
 - **robots.txt fetched once.** The owning node caches the host's rules and every worker there reuses them.
 - **Scaling = add shards.** More hosts than you can handle? Add nodes and rebalance the hash ring (**consistent hashing** keeps reshuffling minimal).
 
-#### Q: How does the crawler survive crashes without losing or double-doing work?
-
-- **Durable frontier:** the to-do list lives in Kafka/DB, not RAM, so a dead worker loses at most a few in-flight URLs, not the plan (§5).
-- **Retries + DLQ:** a failed fetch is retried with backoff; after N failures it goes to a **dead-letter queue** for later inspection instead of blocking forever.
-- **Idempotent dedup:** re-processing a URL after a crash is harmless — the seen-set/content-hash checks make "crawl it again" a no-op for anything already stored.
+Putting the crash-survival story together: the **durable frontier** means the to-do list lives in Kafka/DB, not RAM, so a dead worker loses at most a few in-flight URLs, not the plan (§5); **retries + DLQ** mean a failed fetch is retried with backoff, and after N failures it goes to a **dead-letter queue** for later inspection instead of blocking forever; and **idempotent dedup** means re-processing a URL after a crash is harmless — the seen-set/content-hash checks make "crawl it again" a no-op for anything already stored.
 
 #### Q: Do the thousands of workers need to talk to each other?
 
@@ -671,7 +751,7 @@ Almost never — and that's the point. Workers are **stateless** and coordinate 
 
 ---
 
-## 14. Interview Cheat Sheet
+## 13. Interview Cheat Sheet
 
 > **"What decides what to crawl next?"**
 > "The **URL frontier** (Mercator two-level): **front queues** by priority (importance/freshness) and **back queues** per host for politeness, with a **min-heap** of next-allowed-fetch times so no host is hammered. Sharded by host hash and durable so a crash doesn't lose it."
@@ -685,9 +765,109 @@ Almost never — and that's the point. Workers are **stateless** and coordinate 
 > **"What breaks a crawler and how do you handle it?"**
 > "DNS bottleneck → cache aggressively. Spider traps → depth/pattern/host caps. Crash → durable frontier + retries/DLQ. Duplicate content → SimHash."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Bloom filter says "maybe seen"** | It could be a **false positive** — verify against the KV store (source of truth). Only skip if the KV confirms it; a "definitely new" from Bloom is always safe to crawl (§7). |
+| **Host-shard rebalance (add/remove nodes)** | Use **consistent hashing** so only a small slice of hosts move; drain in-flight fetches, hand off each host's frontier + robots cache + DNS to the new owner, so politeness state isn't lost (§12). |
+| **Worker crashes mid-fetch** | The URL was leased, not deleted — the durable frontier **re-leases** it after a visibility timeout; **idempotent dedup** makes a re-fetch a harmless no-op. At most a few in-flight URLs are retried, never the whole plan (§12). |
+| **Infinite redirect loop (A→B→A)** | Cap the chain at **~5 hops** and track seen hops; bail and drop the URL if it loops or exceeds the cap. Dedup on the final landing URL (§7). |
+| **Spider trap (infinite distinct URLs)** | Not caught by dedup (each URL is genuinely new) — stop with **depth limits, per-host caps, and pattern filters** (§9). |
+| **`robots.txt` unreachable (5xx/timeout)** | Be conservative: treat the host as **disallowed** until you can read its rules; a `404` means allow-all (§8). |
+
 ---
 
-## 15. Final Takeaways
+## 14. JavaScript Rendering & Edge Cases
+
+> A static HTTP fetch gets you 90% of the web cheaply. This section covers the awkward remainder — JS-heavy pages, canonical/cert edge cases, per-domain budgets, and the ops knobs you need to actually run a crawler.
+
+### JavaScript rendering — the optional headless queue
+
+Many modern pages ship a nearly-empty HTML shell and build their real content with JavaScript in the browser. A plain fetch sees the shell and **misses the content**. Executing JS requires a **headless browser** (Chromium), which is **10–100× more expensive** (CPU, memory, seconds per page) than a raw fetch — so you never do it by default.
+
+The pattern: fetch statically first; if a cheap heuristic says "this looks JS-rendered and we got nothing," **route it to a separate, small, rate-limited headless-render queue.**
+
+```
+Fetcher → static GET ─► looks empty? (tiny body, <div id="root"></div>, no links)
+                          │ no  → parse normally
+                          │ yes → enqueue to HEADLESS RENDER queue (small, expensive pool)
+                                     └► Chromium renders → extract links + text → back into the pipeline
+```
+
+```java
+boolean needsJsRender(String html) {
+    String text = extractText(html);
+    // Heuristic: almost no visible text but a known SPA mount point ⇒ content is JS-built.
+    return text.length() < MIN_TEXT
+        && html.matches(".*(id=\"root\"|id=\"app\"|__NEXT_DATA__).*");
+}
+```
+
+> ⚠️ **pitfall:** rendering every page in a headless browser will bankrupt the crawl (and still needs politeness). Keep the render pool **small and prioritized** — render only pages that (a) failed static extraction *and* (b) are worth it (high priority). Everything else stays on the cheap path.
+
+### Other real-world edge cases
+
+| Case | Handling |
+| --- | --- |
+| **`<link rel="canonical">`** | The site's own "this is the real URL" hint — index the canonical, fold variants (AMP, `?ref=`, print) into the seen-set as aliases so one article isn't stored ten times (§8). |
+| **Crawl budget per domain** | Cap how many pages/day you'll pull from any one host (not just rate) so a giant site doesn't monopolize workers; allocate more budget to high-value domains. Prevents slow-motion trap explosions too. |
+| **HTTPS cert errors** | Expired / self-signed / hostname-mismatch certs: log and **skip by default** (don't silently ignore — that's how you crawl spoofed content). Optionally retry over `http` only if policy allows; never send credentials. |
+| **Non-HTML content types** | Route by MIME: PDFs/docs → a text-extraction parser; images/video/binaries → record metadata, don't try to parse as HTML (Factory-per-MIME, §16). |
+| **Huge pages / slow servers** | Cap response size and set fetch timeouts; a 500 MB page or a server that trickles bytes must not tie up a worker forever. |
+
+### Admin / Ops API
+
+An operator needs live control over a running crawl — expose a small internal API:
+
+```
+POST /admin/seeds            { urls: [...] }        → inject new seed URLs into the frontier
+POST /admin/hosts/{host}/pause                       → stop fetching a host (complaint / outage)
+POST /admin/hosts/{host}/resume
+POST /admin/urls/recrawl     { url | pattern }       → force an immediate recrawl (bypass schedule)
+GET  /admin/stats                                    → frontier size, fetch rate, DLQ depth, per-host budgets
+PUT  /admin/hosts/{host}/crawl-delay { ms }          → override politeness delay for a host
+```
+
+> 💡 **tip:** the "**pause a host**" button is the one you'll actually use in an incident — when a site owner emails "stop crawling us," you need to halt one host in seconds without redeploying. Mentioning an ops API signals production maturity.
+
+---
+
+## 15. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–7.
+
+1. **Clarify requirements** (functional + NFRs, scale) — §2
+2. **Estimate capacity** (pages/sec, storage, seen-set size) — §3
+3. **Sketch the architecture + crawl loop** — §4
+4. **Name the two hotspots** up front: the **URL frontier** and the **seen-set** — §5, §7
+5. **Deep dive: the hard part** → **frontier (priority + politeness)** and **dedup at 10B scale** — §5–§8
+6. **Deep dive: freshness, traps, and failure/scaling** — §9, §12
+7. **Address edge cases** — JS rendering, redirects, sitemaps, ops — §14
+8. **Summarize tradeoffs** — freshness vs politeness, Bloom vs KV, cheap fetch vs headless — §13
+
+> 🎤 **Lead with the core challenge:** state up front that "the crux is *what to crawl next, politely, without re-crawling duplicates, at billions scale*" — the frontier + dedup + politeness triangle. Then spend most of your time there.
+
+---
+
+## 16. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Producer-Consumer** | Frontier → fetcher/parser workers | Decouple + parallelize |
+| **Strategy** | URL prioritization, recrawl policy, parser per content-type | Swap algorithms |
+| **Bloom Filter** | Seen-URL membership | Cheap dedup at 10B scale |
+| **Pipeline / Chain of Responsibility** | fetch → parse → extract → normalize → filter → store | Composable stages |
+| **Factory** | Parser per MIME type (HTML/PDF/image) | Extensible content handling |
+| **Rate Limiter / Token Bucket** | Per-host politeness (back-queue heap) | Don't overload sites |
+| **Priority Queue / Heap** | Front queues + per-host next-fetch heap | Priority + politeness scheduling |
+| **Repository** | URL/content stores | Abstraction |
+| **Circuit Breaker** | Failing hosts | Back off gracefully |
+| **Observer/Pub-Sub** | New links → dedup → frontier | Decouple |
+
+---
+
+## 17. Final Takeaways
 
 - **URL frontier (Mercator)** = front queues (priority) + per-host back queues + a next-fetch heap (politeness); durable + sharded by host.
 - **Dedup:** URL normalization + **Bloom filter** (+ KV truth); content near-dup via **SimHash**.

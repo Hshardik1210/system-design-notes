@@ -2,6 +2,10 @@
 
 > Companion to **BookMyShow — System Design**. This doc is split into **Part A: High-Level Design (HLD)** — the big-picture architecture — and **Part B: Low-Level Design (LLD)** — concrete schema, contracts, classes, state machines, and algorithms.
 
+> **Core challenge:** **Never double-book a seat** — under a blockbuster stampede, exactly **one** of many concurrent requests for a seat must win. This companion shows the *code-level* mechanics (schema, ports/adapters, algorithms) that make that guarantee real.
+
+> **How to read this doc:** this is the **LLD companion / reference appendix** to the main note — Part B is the payload. To not get lost, either **read the main doc §9–§12 first** (the concurrency + Redis/DB reasoning), **OR** read **B8 (Concurrency & Correctness Summary) + B5 (Core Algorithms) here first** to anchor the "why," then work through B1→B12 top-to-bottom. Part A is a **condensed index** of the HLD (enough to stand alone for revision); the deep rationale lives in the main doc. Watch for `#### Q:` callouts — they answer the exact confusions that trip people up while learning.
+
 ---
 
 # PART A — High-Level Design (HLD)
@@ -24,11 +28,15 @@
 - [B5. Core Algorithms](#b5-core-algorithms)
 - [B6. Sequence — Happy Path (async payment via Saga)](#b6-sequence--happy-path-async-payment-via-saga)
 - [B7. Sequence — Payment Failure (compensation)](#b7-sequence--payment-failure-compensation)
+- [B7b. Sequence — Cancel / Refund (compensation after CONFIRMED)](#b7b-sequence--cancel--refund-compensation-after-confirmed)
 - [B8. Concurrency & Correctness Summary](#b8-concurrency--correctness-summary)
 - [B9. Caching Design](#b9-caching-design)
 - [B10. Error Handling & Edge Cases](#b10-error-handling--edge-cases)
 - [B11. Cheat-Sheet Mapping (HLD ↔ LLD)](#b11-cheat-sheet-mapping-hld-↔-lld)
 - [B12. Design Patterns (that can be used)](#b12-design-patterns-that-can-be-used)
+- [B13. Virtual Waiting Room (LLD stub)](#b13-virtual-waiting-room-lld-stub)
+- [Interview Cheat Sheet](#interview-cheat-sheet)
+- [Final Takeaways](#final-takeaways)
 
 ---
 
@@ -39,6 +47,15 @@
 - **Style:** strong consistency on the **seat write**, eventual consistency everywhere else.
 
 > Full requirements + estimation live in the main **BookMyShow — System Design** note (§2, §3).
+
+> **Capacity (condensed — so this doc stands alone):**
+> ```
+> DAU ~10M · bookings ~1M/day · ~2 seats/booking → ~2M seats/day
+> Write QPS  ~12/s avg · ~200–250/s peak (10–20x on a big release)
+> Read  QPS  ~100x writes → up to ~25k/s (browse + seat-map polling)
+> Storage    booking row ~300B → ~110 GB/yr; seats bounded by shows×capacity
+> ```
+> **Drives design:** read-heavy → cache + read replicas; the pain is **write contention on a few hot seat rows**, not raw volume → per-seat atomic updates (+ Redis gate), shard by `show_id`.
 
 ---
 
@@ -102,6 +119,8 @@
 | Catalog → Booking (seat inventory) | seeded per show; Booking owns live seat state | avoid cross-service chatter on hot path |
 
 > **Rule:** synchronous on the user-facing read/lock path; asynchronous for anything downstream of a confirmed state change.
+
+> 💡 **Jargon, once:** a **saga** = a multi-step workflow (lock → pay → confirm) run as *separate* local transactions, each with a **compensating** undo step (payment fails → release seats) instead of one big distributed transaction. The **outbox** = a table you write your event into *in the same DB transaction* as the state change, so a poller can later publish it to Kafka without ever losing an event. Both are detailed in B3/B5.
 
 ---
 
@@ -457,6 +476,8 @@ PAYMENT_SUCCESS · PAYMENT_FAILED · REFUND_INITIATED
 
 > **Design rule:** the **Controller** speaks HTTP, the **Service** owns business logic + transactions, and **everything external** (DB, Redis, payment, messaging) sits behind an **interface (port)**. This keeps the core testable and swappable (hexagonal / ports-and-adapters).
 
+> 💡 **Jargon, once — hexagonal / ports & adapters:** a **port** is an interface the business logic depends on (e.g. `SeatLockManager`); an **adapter** is a concrete implementation of it (e.g. `RedisSeatLockManager`). The core logic never imports Redis/JDBC/Kafka directly — it only knows the ports — so you can swap Redis for another store, or plug in a fake in tests, without touching business rules. That's the whole point of the layering below.
+
 ### B3.1 Domain models, enums, DTOs
 
 ```java
@@ -606,6 +627,10 @@ class BookingService {
 
 > **Significance:** the service is the **only place that knows the rules** — lock order, all-or-nothing locking, what goes in one transaction (state change **+** outbox), and which path is a compensation. It depends only on **interfaces**, never on Redis/JDBC/Kafka directly.
 
+#### Q: Why is this split across `createBooking` / `onPaymentResult` / `confirmBooking` — why not wrap lock → pay → confirm in one big transaction?
+
+Because the middle step, **payment**, talks to an **external gateway** that can take seconds and may time out. You cannot hold a DB transaction (and its seat row locks) open across a slow third-party call — you'd pin hot rows and exhaust connections under load. So the flow is a **saga**: `createBooking` commits `PENDING` and kicks off payment, then the gateway result arrives *later* (webhook/Kafka) and `onPaymentResult` runs a **fresh** transaction — `confirmBooking` on success, or `releaseSeats` (the **compensation**) on failure. Each step is its own small local transaction; the compensation is how you "undo" without a distributed transaction. Note what *does* stay in one transaction: the state change **and** its outbox event (see `confirmBooking`) — those must be atomic together.
+
 ### B3.4 Interfaces (ports) — and why each exists
 
 ```java
@@ -667,6 +692,86 @@ class RedisIdempotencyStore implements IdempotencyStore { /* SET NX IN_PROGRESS 
 > - `OutboxPublisher` — polls `outbox` (`FOR UPDATE SKIP LOCKED`) → Kafka → marks `SENT`.
 > - `LockExpiryJob` — scheduled sweep calling `SeatRepository.findExpiredLocks` / release.
 > - `PaymentReconciliationJob` — settles `UNKNOWN`/`PENDING` payments via `PaymentPort.queryStatus`.
+
+#### B3.5a `IdempotencyStore.execute()` — run-once-or-replay
+
+```java
+class RedisIdempotencyStore implements IdempotencyStore {
+    public <T> T execute(String key, Supplier<T> action) {
+        String k = "idem:" + key;
+        // claim the key: only the FIRST caller sets IN_PROGRESS
+        if (redis.set(k, "IN_PROGRESS", NX, EX_72H)) {
+            try {
+                T result = action.get();                 // do the real work once
+                redis.set(k, "SUCCESS:" + serialize(result), EX_72H);
+                return result;
+            } catch (RuntimeException e) {
+                redis.del(k);                            // failed → let a retry try again
+                throw e;
+            }
+        }
+        String state = redis.get(k);                     // a duplicate arrived
+        if (state.startsWith("SUCCESS:")) return deserialize(state.substring(8)); // replay result
+        throw new RequestInProgressException(key);        // first call still running → 409/retry-later
+    }
+}
+```
+
+> ⚠️ **pitfall:** don't leave the key as `IN_PROGRESS` forever on failure — either delete it (shown) or store a `FAILED` marker, or a crash mid-request wedges that key until TTL. The DB-level `UNIQUE(idempotency_key)` is the durable backstop if Redis is lost.
+
+#### Q: A retry lands while the first request is still running — what does the caller see?
+
+Three outcomes, decided by the stored state. If the first request already finished, the key is `SUCCESS:<payload>` and we **replay the stored response** — the action never runs twice (no second lock, no second charge). If the first request **failed**, we deleted the key, so the retry re-claims it and genuinely re-runs. If the first request is **still in flight** (`IN_PROGRESS`), we don't run in parallel — we throw `RequestInProgressException` so the client sees a "try again shortly" (HTTP 409) and polls. The key insight: the `SET NX` is what makes "am I the first?" an **atomic** decision, exactly like the seat lock.
+
+#### B3.5b `RedisSeatLockManager` — `SET NX` + Lua compare-and-delete
+
+```java
+class RedisSeatLockManager implements SeatLockManager {
+    // release only if WE still own the key (value == userId) — atomic check+del
+    static final String UNLOCK = """
+        if redis.call('get', KEYS[1]) == ARGV[1]
+        then return redis.call('del', KEYS[1]) else return 0 end""";
+
+    public boolean tryLock(long showId, String seatNo, long userId, int ttlSec) {
+        String k = "seat_lock:" + showId + ":" + seatNo;
+        return redis.set(k, String.valueOf(userId), NX, EX(ttlSec)); // one atomic acquire
+    }
+    public void release(long showId, String seatNo, long userId) {
+        String k = "seat_lock:" + showId + ":" + seatNo;
+        redis.eval(UNLOCK, List.of(k), List.of(String.valueOf(userId))); // don't delete another's lock
+    }
+    public void releaseAll(long showId, List<String> seatNos, long userId) {
+        for (String s : seatNos) release(showId, s, userId);
+    }
+}
+```
+
+> ⚠️ **pitfall:** a plain `DEL` is unsafe — if your lock already expired and another user re-acquired it, a naive delete wipes *their* lock. The Lua **compare-and-delete** (`get == myId then del`) makes release atomic and owner-scoped. (This is the Redlock-adjacent concern; for correctness the DB conditional update is still the real guard — see B5.)
+
+#### B3.5c `OutboxPublisher` — poll loop
+
+```java
+class OutboxPublisher {                     // runs every ~500ms on N instances
+    @Scheduled(fixedDelay = 500)
+    public void publishBatch() {
+        tx.execute(() -> {
+            // SKIP LOCKED lets multiple pollers run without stepping on each other
+            List<OutboxEvent> batch = outboxRepo.pickPending(100); // SELECT ... WHERE status='PENDING'
+                                                                   //   ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED
+            for (OutboxEvent e : batch) {
+                kafka.send(topicFor(e.eventType), e.payload);      // at-least-once: may re-send on crash
+                outboxRepo.markSent(e.eventId);                    // status → SENT in the same TX
+            }
+        });
+    }
+}
+```
+
+> 💡 **tip:** publishing is **at-least-once** — if we crash after `kafka.send` but before `markSent`, the row stays `PENDING` and gets re-sent next poll. That's why **consumers must dedup on `event_id`** (B8). Losing an event is unacceptable; a duplicate event is merely annoying.
+
+#### Q: Why a polling `OutboxPublisher` at all — why not just publish to Kafka right after committing the booking?
+
+Because "commit to DB, then send to Kafka" is a **dual write** across two systems with no shared transaction: if the process dies *between* the DB commit and the Kafka send, the booking is confirmed but the `BOOKING_CONFIRMED` event is **lost forever** — no notification, no invoice. The outbox fixes this by writing the event into the **same DB transaction** as the state change (so it's atomically durable), then a separate poller ships `PENDING` rows to Kafka and flips them to `SENT`. The publish can now be retried safely because the intent is persisted. `FOR UPDATE SKIP LOCKED` lets several poller instances share the table without double-grabbing rows.
 
 ---
 
@@ -732,6 +837,14 @@ lockSeats(showId, seatNos[], userId):
     return OK(expiresAt)
 ```
 
+#### Q: There's a Redis `SET NX` *and* a DB `UPDATE` here — isn't that redundant? Which one actually prevents double-booking?
+
+The **DB** prevents double-booking; Redis does not. The atomic `UPDATE ... WHERE status='AVAILABLE'` is what guarantees a single winner even at the same microsecond — it's the source of truth. Redis is a **cheap front-door gatekeeper**: on a blockbuster on-sale, tens of thousands of requests would otherwise all reach the DB and fight over the same hot rows. `SET NX` rejects the obvious losers in-memory so only the likely winner proceeds to the DB. If Redis is down or a key expires early, you're **slower but still correct** because the DB check remains. Mental model: **Redis = fast bouncer, DB = final judge.**
+
+#### Q: Two of my three seats lock but the third is taken — what happens to the two I got?
+
+They're **rolled back — all-or-nothing.** The DB does the whole set in one statement (`... seat_number IN (seatNos) AND status='AVAILABLE'`) and returns *rows affected*; if `rows != len(seatNos)` we know at least one seat wasn't `AVAILABLE`, so we immediately release the ones we did grab (`WHERE ... AND locked_by=userId`) plus their Redis keys, and return `409`. You never leave a user holding a partial, unusable booking (you can't watch a movie in seats A1 and A2 while someone else has A3 between them). Doing it as **one `IN (...)` statement** also sidesteps deadlocks entirely — there's no per-seat acquire order to get wrong.
+
 ### Confirm (on payment success)
 
 ```
@@ -796,6 +909,31 @@ Redis: del seat_lock:*
 (If server crashed before release → expiry sweep frees seats)
 ```
 
+### B7b. Sequence — Cancel / Refund (compensation after CONFIRMED)
+
+> This is the compensation for an **already-confirmed** booking (seats `BOOKED`, payment `SUCCESS`) — distinct from B7, which undoes a booking that never got past `PENDING`. The refund is the money-side compensating action of the saga.
+
+```
+Client   Gateway   Booking          DB            Payment/Gateway   Kafka   Notify
+  │ POST /bookings/{id}/cancel        │                 │             │        │
+  ├───────►├───────►│ (Idempotency-Key)                 │             │        │
+  │        │        ├─ TX BEGIN                          │             │        │
+  │        │        │   check policy/window (refundable?)│             │        │
+  │        │        │   seats BOOKED → AVAILABLE ───────►│             │        │
+  │        │        │   booking → CANCELLED              │             │        │
+  │        │        │   insert refund (INITIATED)        │             │        │
+  │        │        │   outbox.append(BOOKING_CANCELLED, REFUND_INITIATED)     │
+  │        │        ├─ TX COMMIT                          │             │        │
+  │◄───────┤◄───────┤ 200 { CANCELLED, refund: INITIATED }│             │        │
+  │        │        │                                     │  refund API │        │
+  │        │        │   PaymentService.refund(paymentId) ►│────────────►│(gateway)
+  │        │        │◄── RefundSucceeded (webhook) ───────┤             │        │
+  │        │        ├─ payment → REFUNDED, refund → DONE  │             │        │
+  │        │        ├─ outbox → REFUND_DONE ─────────────────────────► │──────► SMS/email
+```
+
+> ⚠️ **pitfall:** free the seats and flip `booking=CANCELLED` **in the local transaction**, but treat the actual gateway refund as **async** (INITIATED → DONE via its own webhook) — never hold the DB transaction open across the external refund call. The `refund` row is the durable record that a refund is owed, so a `RefundReconciliationJob` can retry stuck `INITIATED` refunds. Cancel is **idempotent** (Idempotency-Key + `WHERE status='CONFIRMED'`): a double-click cancels once and initiates one refund.
+
 ---
 
 ## B8. Concurrency & Correctness Summary
@@ -837,6 +975,10 @@ Redis: del seat_lock:*
 | Duplicate webhook | Idempotent payment update (dedup on `gatewayRef`) |
 | Booking confirmed, event unsent | Outbox retries until SENT |
 
+#### Q: Payment gateways send the same webhook two or three times — how do I not confirm the booking twice?
+
+Treat webhooks as **at-least-once** and dedup on the gateway's **event id**. The first thing the handler does is `INSERT` the event into `payment_webhook_events (event_id PK)`; if that insert hits the primary-key/`processed` guard, this is a **replay** and you return `200 OK` without re-processing. Only a *new* event id proceeds to update payment/booking state — and that update is itself conditional (`WHERE status != 'SUCCESS'`), so even a racing duplicate flips nothing extra. Return `200` even for duplicates, otherwise the gateway keeps retrying. Same pattern, three layers: unique event id (webhooks), `UNIQUE(idempotency_key)` (client retries), consumer dedup on `event_id` (Kafka).
+
 ---
 
 ## B11. Cheat-Sheet Mapping (HLD ↔ LLD)
@@ -873,6 +1015,119 @@ Redis: del seat_lock:*
 | **Factory** | Payment-provider / notification-channel creation | Extensible providers |
 
 > **How to say it:** "The correctness core is **optimistic locking + idempotency**; the failure handling is **saga + compensation**; reliable eventing is **outbox**; the architecture is **hexagonal (ports & adapters)** so Redis/DB/gateway are swappable; and spikes are handled with **token-bucket rate limiting + a virtual waiting room**."
+
+---
+
+## B13. Virtual Waiting Room (LLD stub)
+
+> 💡 **Why:** on a blockbuster on-sale, 1M users hit one show at 10:00. The waiting room converts a **stampede into an orderly line** so the booking core only ever sees a safe trickle. Correctness still comes from the atomic seat update (B5); this just controls *how many* requests reach it.
+
+**Idea:** every arriving user gets a **queue position**; a drainer admits users in controlled batches by minting a short-lived **admission token** that the booking endpoints require.
+
+```
+POST /v1/shows/{showId}/waiting-room/enter
+  → 200 { position: 48210, waitToken: "wr_...", etaSec: 90 }
+
+GET  /v1/shows/{showId}/waiting-room/status?waitToken=wr_...
+  → 200 { status: "WAITING", position: 12000 }
+  → 200 { status: "ADMITTED", admissionToken: "adm_...", expiresIn: 300 }
+
+# booking endpoints require a valid admission token when a show is gated:
+POST /v1/shows/{showId}/lock
+  Admission-Token: adm_...        → 403 if missing/expired while gated
+```
+
+**Redis structures + drainer:**
+
+```
+# 1. append arrivals to a per-show FIFO (score = arrival time)
+ZADD  wr:queue:{showId}  {arrivalTs}  {userId}
+# 2. count admitted so we respect a concurrency budget
+GET   wr:admitted_count:{showId}
+
+# Drainer (scheduled, per show): keep ~N users active at once
+adminBudget = MAX_ACTIVE - redis.get("wr:admitted_count:{showId}")
+if adminBudget > 0:
+    batch = ZPOPMIN wr:queue:{showId}  adminBudget      # oldest first (fair FIFO)
+    for userId in batch:
+        token = mint(showId, userId, ttl=300)           # signed / stored in Redis
+        redis.set("wr:adm:{token}", userId, EX=300)
+        redis.incr("wr:admitted_count:{showId}")
+        notify(userId, ADMITTED, token)                 # push/poll picks it up
+# admission token expiry (or booking completion) frees a slot → decr admitted_count
+```
+
+> ⚠️ **pitfall:** the queue must be **fair (FIFO)** and admission tokens must **expire**, else squatters hold slots and real buyers starve. Pair with **gateway rate limiting** (token bucket) and a **CDN/cache-served seat map** so browsing never touches the DB while gated. See main doc §18 / §23 for the HLD rationale.
+
+---
+
+## Interview Cheat Sheet
+
+> Speakable answers, each with a pointer to the LLD section that backs it up. Mirrors the main doc §26 — say the one-liner, then cite the mechanism.
+
+> **"Design BookMyShow — the core."**
+>
+> "Lock seats with an **atomic conditional `UPDATE ... WHERE status='AVAILABLE'`** so exactly one request wins (B5), hold with a TTL, and **confirm only after payment** via a **saga** — commit `PENDING`, then confirm or compensate on the async result (B3.3). Reliable events go through the **outbox** written in the same transaction as the state change (B3.5c). Scale reads with cache/replicas, writes by **sharding on `show_id`**, spikes with a **virtual waiting room** (B13)."
+
+> **"How do you prevent double-booking?"**
+>
+> "One atomic conditional update; the DB serializes it at the row level and I branch on **rows affected** — a single winner, no external lock needed (B5, B8)."
+
+> **"Why Redis *and* the DB for locking?"**
+>
+> "The DB guarantees correctness; Redis is a **cheap gatekeeper** that absorbs contention so the hot rows aren't hammered. Drop Redis and I'm slower but still correct — fast bouncer vs final judge (B5)."
+
+> **"Multiple seats — deadlocks?"**
+>
+> "Lock all seats in **one `IN (...)` statement** and check `rows == count`; all-or-nothing, and one statement means no acquire-order to deadlock on (B5)."
+
+> **"Safe retries / no double charge?"**
+>
+> "**Idempotency key** wrapped by an `IdempotencyStore`: first caller sets `IN_PROGRESS`, replays `SUCCESS` for duplicates, backed by `UNIQUE(idempotency_key)` (B3.5a). Gateway webhooks dedup on **event id** (B10)."
+
+> **"Payment times out?"**
+>
+> "Treat as **UNKNOWN**, never assume failure; a **reconciliation job** queries the gateway and a webhook settles the truth before I confirm (B4 payment state machine, B10)."
+
+> **"Booking committed but the event never published?"**
+>
+> "Can't happen with the **outbox** — the event is in the same transaction as the state change and a poller ships it at-least-once; consumers dedup on `event_id` (B3.5c, B8)."
+
+> **"1M users, one show?"**
+>
+> "**Virtual waiting room** admitting FIFO batches via expiring admission tokens, gateway rate limiting, CDN-served seat map, per-show sharding (B13)."
+
+### Tricky scenarios
+
+| Scenario | What happens / what to do | LLD ref |
+| --- | --- | --- |
+| Redis lock OK, DB update returns 0 rows | Release the Redis key, return `409` "seat unavailable" — DB is the truth | B5, B10 |
+| Redis lock expires mid-payment (6-min pay, 5-min TTL) | Another user may grab the Redis key, but the **DB conditional update still blocks** double-booking; use longer TTL / refresh | B5, B10 |
+| Multi-seat partial lock (2 of 3 free) | Roll back the two you got + their Redis keys; return `409`; do it as one `IN (...)` statement | B5 |
+| User double-clicks Pay | `IdempotencyStore` replays the stored `SUCCESS` result; no second booking/charge | B3.5a |
+| Webhook delivered 3× | Dedup on gateway `event_id` (PK insert guard); return `200` for replays | B10 |
+| Booking confirmed, worker crashes before Kafka send | Outbox row stays `PENDING`, re-sent next poll; consumers idempotent | B3.5c, B8 |
+| Confirmed booking cancelled | Free seats + `CANCELLED` in local TX; refund async (INITIATED → DONE) via reconciliation | B7b |
+| Server crashes holding a lock | `LockExpiryJob` sweep frees `LOCKED` seats past `lock_expiry` | B3.5, B5 |
+
+> **Ultimate layer model:** Redis = reduce contention · DB = guarantee correctness · Idempotency = safe retries · Saga = handle failures · Outbox = guarantee event delivery.
+
+---
+
+## Final Takeaways
+
+- **Correctness lives in the DB, not the app** — one atomic conditional `UPDATE` picks a single winner (B5, B8).
+- **Lock first (with TTL) → confirm after payment**; never book directly.
+- **Redis = fast bouncer, DB = final judge** — Redis absorbs contention but is never the source of truth.
+- **Lock multiple seats in one `IN (...)` statement** — all-or-nothing and deadlock-free.
+- **Idempotency everywhere on the write path** — `IN_PROGRESS → SUCCESS` replay, backed by `UNIQUE(idempotency_key)`; webhooks dedup on `event_id`.
+- **Saga, not a big transaction** — payment is external/slow; use separate local steps + compensation (release seats / refund).
+- **Outbox** makes eventing lossless — write the event in the state-change transaction, publish at-least-once, dedup downstream.
+- **Everything external sits behind a port** (hexagonal) — Redis/JDBC/gateway/Kafka are swappable, the core is testable.
+- **Background jobs are the safety nets** — lock-expiry sweep, payment/refund reconciliation, outbox publisher.
+- **Handle spikes with a virtual waiting room + sharding + caching**; correctness still rests on the atomic seat update.
+
+> One line: **push concurrency into the database with atomic operations, wrap the external/slow parts in a saga, and make every side effect idempotent and replayable.**
 
 ---
 

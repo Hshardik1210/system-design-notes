@@ -15,6 +15,11 @@
 - [5. Covering Index (big optimization)](#5-covering-index-big-optimization)
 - [6. Composite (Multi-Column) Indexes & Leftmost Prefix](#6-composite-multi-column-indexes--leftmost-prefix)
 - [7. Why Not Index Everything](#7-why-not-index-everything)
+- [When to Index / When NOT To](#when-to-index--when-not-to)
+- [Reading the Query Plan (EXPLAIN ANALYZE)](#reading-the-query-plan-explain-analyze)
+- [Specialized Index Variants](#specialized-index-variants)
+- [Index Types Beyond B-Tree](#index-types-beyond-b-tree)
+- [Common Mistakes](#common-mistakes)
 - [8. Interview Cheat Sheet](#8-interview-cheat-sheet)
 - [9. Final Takeaways](#9-final-takeaways)
 
@@ -230,6 +235,8 @@ Because "clustered" means the rows are **physically stored** in that order, and 
 
 👉 No row fetch → much faster. (This is an "index-only scan".) *(Full annotated example in the deep dive below.)*
 
+> ⚠️ **pitfall:** `SELECT *` silently kills a covering index. The moment you ask for a column that isn't in the index, the DB must fetch the full row — turning a fast index-only scan back into a per-row table lookup. Select **only the columns you need** if you want the covering benefit.
+
 ### When the index answers the whole question
 
 Normally a secondary index gets you a pointer, and you still fetch the row to read the columns you need. But if the index *already contains* every column the query asks for, the DB can answer from the index alone and skip fetching the row entirely.
@@ -286,6 +293,8 @@ The index is usable for queries that filter on a **leftmost prefix**:
 | `status, created_at` | ❌ |
 
 > **Order matters.** Put the most selective / always-filtered column first.
+
+> ⚠️ **pitfall (leftmost-prefix trap):** a composite index on `(user_id, status, created_at)` does **nothing** for `WHERE status = 'PAID'` — you skipped the leftmost column, so the DB falls back to a full scan. Don't assume "the column is *in* an index" means "the query is indexed." Only a filter that starts at the first column (and doesn't skip) can use it.
 
 ### Why column order is everything
 
@@ -362,6 +371,8 @@ Table with 4 indexes, one INSERT:
 
 The more indexes a table has, the more structures every write must keep in sync — so more indexes means slower writes.
 
+> ⚠️ **pitfall (write amplification on hot insert paths):** on a high-throughput write table (event logs, order intake, IoT telemetry), each extra index multiplies the work of **every** insert. Ten indexes = ten sorted structures to update per row. On hot paths this write amplification can dominate — sometimes the fix is to *drop* indexes, not add them.
+
 #### Q: So why not add indexes "just in case"?
 
 Because each one has ongoing costs even if no query uses it:
@@ -387,6 +398,157 @@ EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 7 AND status = 'PAID';
 -- "Seq Scan" (Postgres) / "type: ALL" (MySQL) = full scan → an index may help
 -- "Index Scan" / "type: ref" = an index is being used → good
 ```
+
+---
+
+## When to Index / When NOT To
+
+The default instinct — "this query is slow, add an index" — is right *often enough* to be dangerous. Indexes have a real cost (§7), so the decision is a trade-off, not a reflex.
+
+**Good candidates (index these):**
+
+- Columns in `WHERE`, `JOIN ... ON`, and `ORDER BY` that are used **frequently**.
+- **Highly selective** columns — lots of distinct values, so each lookup narrows to few rows (`email`, `user_id`, `order_id`).
+- Foreign keys you join on constantly.
+
+**Poor candidates (usually skip):**
+
+- **Low-cardinality columns** — a handful of distinct values (`gender`, `status` with 3 states, a `boolean` flag). The index barely narrows anything, so the planner often ignores it (see selectivity below).
+- **Small tables** — a few hundred rows scan instantly; an index adds maintenance cost for no measurable gain.
+- **Write-heavy, rarely-read paths** — append-only logs or ingestion tables pay the write tax (§7) on every insert while almost never reading.
+- Columns you never actually filter, join, or sort on.
+
+> 💡 **tip:** let real, measured queries drive indexing. Find the slow, *common* queries (via `EXPLAIN ANALYZE` and slow-query logs), index those, and re-measure. Don't index speculatively.
+
+### Selectivity — why the planner sometimes ignores your index
+
+**Selectivity** = how much a filter narrows the result. An index is only worth using if it eliminates *most* rows.
+
+Numeric example — a `users` table with 1,000,000 rows:
+
+- Index on `gender` (2 values, ~50% each): a lookup for `gender = 'F'` still matches ~500,000 rows. Walking the index **and** doing 500k row fetches is *slower* than a straight sequential scan — so the planner **ignores the index** and scans.
+- Index on `email` (≈1,000,000 distinct values): `email = 'a@x.com'` matches ~1 row. The index is enormously valuable.
+
+Rule of thumb: an index helps when a lookup returns a **small fraction** of the table (often cited as < ~5–10%). Above that, a sequential scan wins because sequential disk reads are cheaper than thousands of scattered random fetches.
+
+> ⚠️ **pitfall:** "the query didn't use my index" usually isn't a bug — the planner estimated the index would match too many rows and chose a scan on purpose. Check cardinality before blaming the optimizer.
+
+---
+
+## Reading the Query Plan (EXPLAIN ANALYZE)
+
+`EXPLAIN` shows the plan the optimizer *intends* to run; `EXPLAIN ANALYZE` actually runs it and reports real timings and row counts. It's the single best tool for "is my index being used?"
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'a@x.com';
+```
+
+The node type at the top tells you what happened:
+
+**Sequential scan** — no usable index, read every row:
+
+```
+Seq Scan on users  (cost=0.00..18334.00 rows=1 width=...) (actual time=42.1..119.8 rows=1 loops=1)
+  Filter: (email = 'a@x.com')
+  Rows Removed by Filter: 999999      ← read a million rows to return one = slow
+```
+
+**Index scan** — walk the index, then fetch each matching row from the table (the "second lookup" from §4):
+
+```
+Index Scan using idx_users_email on users  (cost=0.42..8.44 rows=1 ...) (actual time=0.03..0.04 rows=1 loops=1)
+  Index Cond: (email = 'a@x.com')      ← a few page reads instead of a million
+```
+
+**Index-only scan** — a covering index (§5) answered the query entirely from the index, no table fetch:
+
+```sql
+EXPLAIN ANALYZE SELECT email, name FROM users WHERE email = 'a@x.com';
+```
+```
+Index Only Scan using idx_email_name on users  (actual time=0.02..0.02 rows=1 loops=1)
+  Index Cond: (email = 'a@x.com')      ← never touched the heap; the fastest case
+```
+
+**Bitmap scan** — the middle ground when a filter matches *many* scattered rows: the DB first builds a bitmap of matching row locations from the index, then fetches them in **physical disk order** (fewer random seeks). You'll see this when a lookup is too broad for a plain index scan but too narrow for a full seq scan.
+
+```
+Bitmap Heap Scan on orders  (actual time=...)
+  Recheck Cond: (status = 'PAID')
+  ->  Bitmap Index Scan on idx_orders_status  (actual time=...)
+```
+
+> 💡 **tip:** read the plan bottom-up (inner nodes run first) and watch two things: the **node type** (Seq vs Index vs Index Only) and **`Rows Removed by Filter`** — a huge number there means the DB scanned far more than it returned, a classic "missing/unused index" smell.
+
+MySQL equivalent: `EXPLAIN` shows a `type` column — `ALL` = full scan (bad), `ref`/`range` = index used, `eq_ref`/`const` = best, and `Extra: Using index` = index-only scan.
+
+---
+
+## Specialized Index Variants
+
+Beyond the plain B-tree, a few index *shapes* solve specific problems. Each is still a B-tree under the hood — just built differently.
+
+### Partial (filtered) index
+
+Indexes only the **subset of rows matching a condition** — smaller, cheaper to maintain, and often the exact rows you query.
+
+```sql
+-- Only index ACTIVE orders (say 2% of the table), not the archived 98%
+CREATE INDEX idx_active_orders ON orders (created_at) WHERE status = 'ACTIVE';
+```
+
+Great when queries almost always target one slice (`WHERE status = 'ACTIVE'`). The index is a fraction of the size and skips maintenance for rows you never look up. (MySQL has no direct equivalent; Postgres/SQLite call it a *partial* index, SQL Server a *filtered* index.)
+
+### Unique index
+
+Enforces that no two rows share a value **and** doubles as a fast lookup index. A `PRIMARY KEY` or `UNIQUE` constraint is backed by one automatically.
+
+```sql
+CREATE UNIQUE INDEX idx_users_email ON users (email);   -- no duplicate emails, fast lookups
+```
+
+> 💡 **tip:** a unique index is both a **correctness guarantee** (dedup) and a **performance structure** — one object, two wins.
+
+### Functional / expression index
+
+Indexes the result of an **expression**, not a raw column — so a transformed lookup can still be indexed.
+
+```sql
+-- A plain index on `email` can't help a case-insensitive search:
+SELECT * FROM users WHERE LOWER(email) = 'a@x.com';   -- would scan
+
+-- Index the expression itself:
+CREATE INDEX idx_users_email_lower ON users (LOWER(email));   -- now it's a fast lookup
+```
+
+The query's expression must **match** the indexed expression for the planner to use it (`LOWER(email)` in both).
+
+---
+
+## Index Types Beyond B-Tree
+
+B-tree (default) and hash (§3) cover most needs, but databases offer specialized structures for data B-trees handle poorly. Names worth recognizing:
+
+| Type | Good for |
+| --- | --- |
+| **B-tree** | the default — equality + range + sort on scalar values |
+| **Hash** | pure equality lookups (no ranges) |
+| **GIN** (Generalized Inverted Index) | "many values per row" — full-text search, `JSONB`, array containment |
+| **GiST** (Generalized Search Tree) | geometric / spatial data, nearest-neighbor, range overlap |
+| **BRIN** (Block Range Index) | huge, naturally-ordered tables (time-series logs) — tiny index, stores min/max per block |
+
+> 💡 **tip:** you rarely need these early on, but recognizing the names matters. If someone mentions full-text or `JSONB` search, think **GIN**; geospatial, think **GiST**; a massive append-only time-ordered table, think **BRIN**.
+
+---
+
+## Common Mistakes
+
+- **Indexing every column.** Each index taxes writes and RAM (§7). Index for real, frequent queries — not "just in case."
+- **Wrong composite column order.** `(status, user_id)` won't serve a `user_id`-only filter; the leftmost column must be the one you always filter on. Order by equality-first, range/sort-last, most-selective-earlier (§6).
+- **Assuming `OR` uses a composite index.** `WHERE a = 1 OR b = 2` generally **cannot** use one `(a, b)` index efficiently — the two conditions are independent, so the DB may scan or need a *separate* index per column (then combine via a bitmap). Composite indexes are for `AND`-ed leftmost prefixes, not `OR`.
+- **Ignoring write cost.** A covering index that makes reads 2× faster but every insert 3× slower is a loss on a write-heavy table. Weigh both sides.
+- **Trusting `SELECT *`.** It defeats covering/index-only scans (§5). Select only the columns you need.
+- **Not verifying with `EXPLAIN ANALYZE`.** "I added an index" ≠ "the query uses it." Always confirm the plan actually changed.
 
 ---
 

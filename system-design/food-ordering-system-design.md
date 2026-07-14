@@ -29,8 +29,10 @@
 - [19. Observability](#19-observability)
 - [20. How to Drive the Interview](#20-how-to-drive-the-interview)
 - [21. Interview Cheat Sheet](#21-interview-cheat-sheet)
-- [22. Design Patterns (that can be used)](#22-design-patterns-that-can-be-used)
-- [23. Final Takeaways](#23-final-takeaways)
+- [22. Consistency & CAP Tradeoffs](#22-consistency--cap-tradeoffs)
+- [23. Surge & Dynamic Pricing](#23-surge--dynamic-pricing)
+- [24. Design Patterns (that can be used)](#24-design-patterns-that-can-be-used)
+- [25. Final Takeaways](#25-final-takeaways)
 
 ---
 
@@ -76,11 +78,11 @@ When you open **Swiggy** and order a biryani, three different parties have to be
 
 The platform is the coordinator sitting in the middle. It never cooks food and never rides a bike — it just makes sure the right message reaches the right party at the right moment, keeping restaurant, rider, and customer in sync.
 
-#### Q: Why is "30 minutes" such a big deal? Amazon takes 2 days and nobody complains.
+### Why "30 minutes" is such a big deal (Amazon takes 2 days and nobody complains)
 
-Because **food goes cold and soggy**. With Amazon, if a package is an hour late, you shrug. With food, an hour late means the biryani is inedible → you demand a refund → the platform *loses money on that order*. This one fact — **food is perishable** — is why almost every hard design choice (fast dispatch, live tracking, tight ETAs) exists.
+**Food goes cold and soggy**. With Amazon, if a package is an hour late, you shrug. With food, an hour late means the biryani is inedible → you demand a refund → the platform *loses money on that order*. This one fact — **food is perishable** — is why almost every hard design choice (fast dispatch, live tracking, tight ETAs) exists.
 
-#### Q: What actually happens between "I tap Order" and "food arrives"?
+### What actually happens between "I tap Order" and "food arrives"
 
 Follow one order end to end (this exact list drives the whole doc):
 
@@ -165,7 +167,7 @@ tracking.streamRiderLocationToCustomer(rider, order);     // real-time map
 
 Because Flipkart's fulfillment assumes **days and warehouses**. It has no concept of "find a free human on a bike within 3 km in the next 10 seconds," or "the food is ready NOW, hurry." Those real-time, location-aware, human-in-the-loop problems simply don't exist in classic e-commerce, so there's nothing to copy — you build them fresh.
 
-#### Q: Is the restaurant like a Flipkart warehouse?
+### Is the restaurant like a Flipkart warehouse?
 
 Sort of, but with two twists: (1) it **cooks on demand** (nothing is pre-packed on a shelf), and (2) its "inventory" is basically a set of **on/off switches** — "we're open," "paneer tikka is sold out" — not a count of "37 units in stock." That's simpler to model but changes in **real time** during a busy dinner rush.
 
@@ -222,7 +224,7 @@ interface RestaurantApp { setMenuAvailable(item, false); accept(order, prepMins)
 interface RiderApp { goOnline(); acceptOffer(offer); markPickedUp(); markDelivered(); pingLocation(); }
 ```
 
-#### Q: The NFRs say "strong consistency for orders, eventual for discovery/tracking." What does that mean in plain words?
+### "Strong consistency for orders, eventual for discovery/tracking" in plain words
 
 - **Strong consistency (orders/payments):** the answer must be *exactly right, immediately*. If you paid, the order **must** exist and you **must** be charged exactly once. No "give it a second to sync." Money is involved.
 - **Eventual consistency (discovery/tracking):** "close enough, corrects itself in a moment" is fine. If a restaurant just marked a dish sold-out and it takes 3 seconds to vanish from search, nobody gets hurt. If one GPS ping is lost, the next one fixes the map.
@@ -276,11 +278,11 @@ double locationWritesPerSec = 300_000 / 4.0;          // 75,000 → NEVER put in
 // So: locations live in fast, ephemeral stores (Redis), orders live in a durable RDBMS.
 ```
 
-#### Q: Why compute "browse:order ratio"?
+### Why compute the "browse:order ratio"
 
-Because for every 1 person who orders, ~50 people are *just browsing* the home screen. So **reads massively outnumber writes** on discovery → that's the signal to lean on **caches and a search index**, not the main database. The math tells you where to spend your engineering effort.
+For every 1 person who orders, ~50 people are *just browsing* the home screen. So **reads massively outnumber writes** on discovery → that's the signal to lean on **caches and a search index**, not the main database. The math tells you where to spend your engineering effort.
 
-#### Q: Do I need to memorize these exact numbers?
+### Do you need to memorize these exact numbers?
 
 No. The point isn't "58.02 orders/sec" — it's the **conclusion**: location is the volume monster (→ Redis/stream), browse dominates orders (→ cache), and peaks are spiky (→ autoscale). Numbers are just the argument for those design moves.
 
@@ -364,11 +366,11 @@ WebSocket ws = connect("/v1/orders/9001/track");
 ws.onMessage(update -> map.moveRiderMarker(update.lat, update.lng));  // updates arrive on their own
 ```
 
-#### Q: What is that `Idempotency-Key` header actually for?
+### What the `Idempotency-Key` header is actually for
 
 It's a **"this is the same request as before, don't do it twice" tag**. If your phone's network hiccups and the app re-sends "Place Order," both requests carry the *same* key. The server sees the key already used and returns the **existing** order instead of making a second one (and a second charge). One tap = one order, even if the message physically arrives twice. (More in §10.)
 
-#### Q: Why is placing an order synchronous but tracking is a WebSocket?
+### Why placing an order is synchronous but tracking is a WebSocket
 
 You *place* an order once and need an immediate yes/no — a normal request/response fits. But tracking means dozens of updates flow **from server to you** over several minutes; opening a fresh HTTP request for each would be wasteful. A **WebSocket** is one long-lived pipe the server can keep pushing through.
 
@@ -427,11 +429,11 @@ kafka.publish(new OrderPlaced(o.id));       // publish the event — ONCE
 // dispatch, notification, analytics each react on their own, independently
 ```
 
-#### Q: Why so many services? Why not one big program?
+### Why so many services instead of one big program
 
-Because the pieces have **wildly different needs**. Location handles 75k writes/sec and can lose data; orders handle money and must never lose data; discovery is read-heavy. Splitting them lets you **scale and tune each independently** — add 50 location servers during dinner without touching the payment code. It also means a crash in "ratings" can't take down "checkout."
+The pieces have **wildly different needs**. Location handles 75k writes/sec and can lose data; orders handle money and must never lose data; discovery is read-heavy. Splitting them lets you **scale and tune each independently** — add 50 location servers during dinner without touching the payment code. It also means a crash in "ratings" can't take down "checkout."
 
-#### Q: What does "Kafka is the event backbone" really mean?
+### What "Kafka is the event backbone" really means
 
 It means services **don't call each other directly** for after-the-fact news. Instead of Order Service phoning Dispatch, Notification, *and* Analytics one by one (and breaking if one is down), it just drops **one message** — `ORDER_PLACED` — onto Kafka. Each interested service picks it up on its own schedule. Add a new listener later (say, a loyalty-points service) and *nobody else changes*. That's decoupling.
 
@@ -456,17 +458,7 @@ It means services **don't call each other directly** for after-the-fact news. In
 
 ### Who does what
 
-Each service has one clear responsibility. "Orchestrates" just means the Order Service owns the order and coordinates the other services — but doesn't cook or drive.
-
-| Service | Responsibility |
-| --- | --- |
-| **Discovery/Search** | Returns restaurants that can deliver to the user right now |
-| **Cart** | Holds the pre-checkout order |
-| **Order Service** | Owns the order and its state machine; coordinates the rest |
-| **Payment** | Charges, refunds, wallet |
-| **Dispatch** | Finds and assigns a free rider |
-| **Location** | Ingests each rider's GPS position |
-| **Notification** | Sends "your food is on the way" updates |
+Each service has one clear responsibility, mapped to a plain-English job: Discovery returns restaurants that can deliver to you right now; Cart holds the pre-checkout order; Order Service owns the order and its state machine and coordinates the rest; Payment charges/refunds/holds the wallet; Dispatch finds and assigns a free rider; Location ingests each rider's GPS; Notification sends "your food is on the way" updates. "Orchestrates" just means the Order Service coordinates the others — but doesn't cook or drive.
 
 ```java
 // "Orchestrates" = the Order Service tells others what to do, but doesn't do their jobs
@@ -480,17 +472,35 @@ class OrderService {
 }
 ```
 
-#### Q: Why does each service "own its own store"? Can't they share one database?
+### Why each service "owns its own store" instead of sharing one database
 
 If everyone wrote to one giant database, they'd fight over it and a schema change for ratings could break orders. Instead each service **privately owns its data** and others must ask via its API. This is the **service-ownership boundary**: the Location Service is the *only* one that touches location data. It keeps teams and failures isolated.
 
-#### Q: What does "Order Service owns the state machine" mean here?
+### What "Order Service owns the state machine" means here
 
 It means only the Order Service is allowed to change an order's status (`PLACED → ACCEPTED → …`). When the restaurant hits "accept," it doesn't reach into the order database itself — it **asks** the Order Service to move the state. One owner = one source of truth = no conflicting edits. (Full state machine in §11.)
 
 ---
 
 ## 8. Data Model & Schema
+
+### Database & storage choices (which DB, and why at scale)
+
+§7's "Store" column already hinted at this, but it's worth pulling into one place: this system is **polyglot persistence by necessity**, because "orders" and "where's my rider right now" have almost opposite shapes — one is low-volume and must never be wrong, the other is a 75k-writes/sec firehose where a lost value is harmless. The deciding question per data type is *"does this need strong consistency, or is it a disposable high-frequency signal?"*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Orders, payments, order state machine (**source of truth**) | **RDBMS**, sharded by **region/city** (or `customer_id`) | Orders are a **transactional state machine** with money attached — `idempotency_key` UNIQUE + ACID transactions guarantee "one tap = one order, one charge" (§10), and every transition must be durably auditable (`order_status_history`). Modest volume (~58 orders/sec avg, §4) means an RDBMS handles it comfortably. | An eventually-consistent NoSQL store can't give you the "charge once, create the order once" all-or-nothing guarantee without you rebuilding transactions by hand — not worth it when the write volume doesn't demand NoSQL's scale in the first place. |
+| Restaurant/menu discovery | **Elasticsearch** (geo-index), fed via CDC from the catalog RDBMS (see 💡 below) | Hyperlocal search needs geo-radius + text + facet filtering (open, veg, rating) at ~30k searches/sec (§4) — a search index is built for exactly this, and it's rebuilt async so it never touches the order DB. | Querying the transactional catalog DB directly for every browse would hammer the same store that must stay fast and available for order writes. |
+| Rider proximity index ("who's near this restaurant") | **Redis GEO** | `GEOADD`/`GEOSEARCH` answers "riders within 3km" in-memory, sub-ms — dispatch runs this query continuously as part of a real-time loop (§12), which an RDBMS spatial query is too slow for at this frequency. | Storing rider positions relationally and querying with lat/lng range scans doesn't scale to a live, constantly-updating index queried every dispatch cycle. |
+| Cart (pre-checkout) | **Redis**, ephemeral, no durability needed | A cart is a draft that's cheap to lose — if Redis restarts mid-session, the user just re-adds items. No transaction, no audit trail required until checkout. | Persisting carts to the order RDBMS would pollute the durable, auditable order table with throwaway drafts that outnumber real orders many times over. |
+| Rider GPS pings (the volume monster — 75k writes/sec) | **Redis** (latest-value + TTL) **+ Kafka** stream; only aggregates archived to a time-series/warehouse store | Every ping only matters for a few seconds (§13) — you need the *latest* dot, not a permanent row per ping. Redis overwrite + short TTL handles this at zero durability cost, and Kafka fans it out to the WebSocket tracking layer. | Writing every ping into the orders RDBMS would be ~1,300× the order write volume (§4) hitting the one store that absolutely cannot be slowed down — it would take down the transactional path for data nobody needs to keep. |
+| Kafka event backbone | **Kafka** | Decouples `ORDER_PLACED`/`ORDER_READY`/`DELIVERED` from every downstream reactor (dispatch, notifications, analytics) — add a new consumer without touching the producer. | Direct service-to-service calls on every event couple services to each other's uptime/latency and lose events on a crash mid-fan-out. |
+| Menu/restaurant images | **Blob store + CDN** | Large, immutable bytes served from the edge — cheap, fast, and keeps binary data out of the relational catalog. | Storing images in the DB bloats rows and backups for no query benefit. |
+
+> 💡 **What is CDC (Change Data Capture)?** A way to **stream every insert/update from a database to other systems** by tailing its write-ahead log (e.g. **Debezium** → Kafka). Instead of the catalog service explicitly pushing "menu changed" messages, CDC watches the catalog DB and automatically emits each change, which the search index consumes to stay fresh. It keeps the read model (Elasticsearch) in sync with the source of truth (RDBMS) **without dual-writes**.
+
+**Why orders must be relational, and GPS pings absolutely must not be:** the split comes straight from §4's capacity math — orders are a manageable ~58/sec average that needs to be **exactly right** (money, state transitions), while location pings are a **75,000/sec firehose** that only needs to be **roughly current**. Putting both in the same store would force you to either slow down the order path to survive the location firehose, or relax correctness on money to handle the volume — neither is acceptable, so they're deliberately isolated into stores that match their actual shape. **Scaling:** shard the order RDBMS by **region/city** (§17) — a food marketplace is inherently local, so a Bangalore order never needs a Delhi row, which keeps shards small and isolates a regional incident from the rest of the country. Redis GEO and the location stream scale horizontally by simply adding nodes, since they hold no durable state that requires careful partitioning. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ### Order (the core — same shape as any e-commerce order)
 
@@ -571,6 +581,39 @@ Historical track (time-series / archived for analytics only)
 
 > **Key modeling decision:** high-frequency location data does **not** go in the transactional DB. It lives in **Redis (GEO + latest value)** and optionally a time-series store — otherwise 75k writes/sec crushes the order DB.
 
+### Indexes that matter
+
+The order table is small by row-count but **queried hard from three directions** — customers, restaurants, and ops dashboards — so a few targeted indexes matter more than the row count suggests:
+
+```sql
+-- 1) Customer "my orders" screen (already above) — newest first
+CREATE INDEX idx_orders_customer  ON orders (customer_id, placed_at DESC);
+
+-- 2) Restaurant dashboard: "my live orders" filtered by status
+CREATE INDEX idx_orders_restaurant_status ON orders (restaurant_id, status);
+
+-- 3) Rider's current/past assignments
+CREATE INDEX idx_orders_rider     ON orders (rider_id);
+
+-- 4) Ops/analytics dashboards & archival: slice by time window
+CREATE INDEX idx_orders_placed_at ON orders (placed_at);
+
+-- 5) Timeout sweeper: find stuck orders to auto-cancel (see §11)
+--    Partial index keeps it tiny — only rows still awaiting the restaurant.
+CREATE INDEX idx_orders_status_sweep ON orders (status, placed_at)
+    WHERE status IN ('PLACED','PENDING_PAYMENT');
+```
+
+| Index | Serves |
+| --- | --- |
+| `(customer_id, placed_at DESC)` | Customer order history, reorder |
+| `(restaurant_id, status)` | Restaurant tablet: pending / active orders |
+| `(rider_id)` | Rider's assigned + completed orders |
+| `(placed_at)` | Ops dashboards, hourly volume, archival cutoffs |
+| `(status, placed_at)` partial | **Status-sweep** job that auto-cancels silent orders |
+
+> 💡 **Why a partial (filtered) index for the sweeper?** The auto-cancel job only ever asks "which orders are *still* `PLACED`/`PENDING_PAYMENT` and too old?" — a tiny slice. A partial index over just those statuses stays small and fast even as millions of `DELIVERED` rows pile up, so the periodic sweep never does a full-table scan.
+
 ### What each table stores
 
 What each table holds:
@@ -593,15 +636,15 @@ subtotal INT NOT NULL,   -- 48000 means ₹480.00
 -- Floats round badly (0.1 + 0.2 != 0.3); with money that becomes lost rupees. Use integers.
 ```
 
-#### Q: Why keep a separate `order_status_history` table instead of just one `status` column?
+### Why keep a separate `order_status_history` table instead of just one `status` column
 
 The `status` column tells you where the order is **now** ("Out for delivery"). But you also want the **story**: *when* did the restaurant accept, *when* did the rider pick up, *who* cancelled? The history table records every transition, which powers the customer's tracking timeline, debugging ("why was this late?"), and audits. One column = current snapshot; the history table = the movie.
 
-#### Q: Why is rider location the ONE thing not in the SQL database?
+### Why rider location is the ONE thing not in the SQL database
 
-Because it changes **75,000 times per second** across all riders and it's disposable — you only ever care about the *latest* dot, and a lost ping is harmless. A transactional SQL database is built for durable, carefully-locked writes (orders, payments); flooding it with 75k throwaway updates/sec would grind it to a halt. So live location goes to **Redis** (fast, in-memory, has built-in geo search) with a short TTL, and only *aggregated* history is archived. **Right tool for the data's shape.**
+It changes **75,000 times per second** across all riders and it's disposable — you only ever care about the *latest* dot, and a lost ping is harmless. A transactional SQL database is built for durable, carefully-locked writes (orders, payments); flooding it with 75k throwaway updates/sec would grind it to a halt. So live location goes to **Redis** (fast, in-memory, has built-in geo search) with a short TTL, and only *aggregated* history is archived. **Right tool for the data's shape.**
 
-#### Q: What's `GEOADD` / Redis GEO doing?
+### What `GEOADD` / Redis GEO is doing
 
 It's a special Redis feature that stores points by latitude/longitude and lets you ask **"who's within 3 km of here?"** instantly. That's exactly the question dispatch asks ("which riders are near this restaurant?") and discovery asks ("which restaurants are near this user?"). It's a map with a built-in "find nearby" button. (Used heavily in §9 and §12.)
 
@@ -671,17 +714,17 @@ for (Restaurant r : geoSearch(userLat, userLng, radiusKm)) {
 results.sort(byEtaThenRating());   // best/nearest/fastest on top
 ```
 
-#### Q: What's the difference between "nearby" and "serviceable"?
+### "Nearby" vs "serviceable"
 
 "Nearby" = physically close to you. "Serviceable" = the restaurant is **willing and able** to deliver *to your exact address*. A place 500 m away across a river with no bridge is nearby but not serviceable. Serviceability checks the restaurant's delivery radius/polygon **and** whether riders are actually free in that area right now.
 
-#### Q: Why does discovery read from Elasticsearch instead of the main orders/restaurant database?
+### Why discovery reads from Elasticsearch instead of the main orders/restaurant database
 
 Two reasons. (1) **Volume** — ~30k searches/sec would hammer the transactional DB. (2) **Different job** — search needs "find nearby + filter veg + sort by rating" fast, which a search index (Elasticsearch) is built for. So we keep a **separate read-optimized copy** of restaurant data, kept fresh from the real DB via CDC/Kafka. The order DB is never touched by browsing.
 
-#### Q: A restaurant marks a dish sold-out — why is it OK if search shows it for a few more seconds?
+### A restaurant marks a dish sold-out — why it's OK if search shows it for a few more seconds
 
-Because discovery is **eventually consistent** and the truth is re-checked at checkout. Worst case, you add a sold-out item to your cart and at checkout the system says "sorry, that's unavailable." Mildly annoying, not dangerous. Compare to orders/payments, where a few seconds of staleness could double-charge you — *that's* why those stay strongly consistent. Speed where it's safe, correctness where it matters.
+Discovery is **eventually consistent** and the truth is re-checked at checkout. Worst case, you add a sold-out item to your cart and at checkout the system says "sorry, that's unavailable." Mildly annoying, not dangerous. Compare to orders/payments, where a few seconds of staleness could double-charge you — *that's* why those stay strongly consistent. Speed where it's safe, correctness where it matters.
 
 ---
 
@@ -734,15 +777,15 @@ Order placeOrder(PlaceOrderRequest req) {
 }
 ```
 
-#### Q: Why re-validate at checkout if the cart already had valid items?
+### Why re-validate at checkout if the cart already had valid items
 
-Because time passed between "add to cart" and "pay." The restaurant may have **closed**, the dish may have **sold out**, or the **price** may have changed. The cart is a hopeful draft; checkout is the moment of truth, so everything is re-checked against live data right before charging you.
+Time passed between "add to cart" and "pay." The restaurant may have **closed**, the dish may have **sold out**, or the **price** may have changed. The cart is a hopeful draft; checkout is the moment of truth, so everything is re-checked against live data right before charging you.
 
 #### Q: Why never trust the total the app sends?
 
 Because anyone can tamper with what the phone sends ("pay ₹1 for a ₹500 order"). The server **recomputes** the price from the real menu, coupons, and fees. The client's number is only for display. Rule: **the server is the source of truth for money.**
 
-#### Q: What does "then async fulfillment kicks off" mean?
+### What "then async fulfillment kicks off" means
 
 Once you're charged and the order is `PLACED`, the platform doesn't make you wait while it finds a rider and notifies the restaurant. It **fires an event** (`ORDER_PLACED`) and returns your confirmation *immediately*. Behind the scenes, dispatch, the restaurant tablet, and notifications all react in parallel. You get instant confirmation; the slow coordination happens after, driven by Kafka.
 
@@ -813,17 +856,50 @@ void transition(Order o, OrderStatus next, Actor who) {
 }
 ```
 
-#### Q: Why is a food order's state machine more complex than Flipkart's?
+### Why a food order's state machine is more complex than Flipkart's
 
-Because **three different actors** drive it in real time. The **restaurant** accepts and cooks, the **rider** picks up and delivers, and the **system** handles payment and timeouts — all within 30 minutes. Flipkart mostly has "placed → shipped → delivered" over days, driven by one warehouse process. More actors + tighter clock = more states and more possible transitions (and cancellations from any of them).
+**Three different actors** drive it in real time. The **restaurant** accepts and cooks, the **rider** picks up and delivers, and the **system** handles payment and timeouts — all within 30 minutes. Flipkart mostly has "placed → shipped → delivered" over days, driven by one warehouse process. More actors + tighter clock = more states and more possible transitions (and cancellations from any of them).
 
-#### Q: "Dispatch runs in parallel with prep" — meaning?
+### "Dispatch runs in parallel with prep" — what this means
 
 Notice `RIDER_ASSIGNED` and `PREPARING` can happen at the **same time**. You don't wait for the food to be cooked before hunting for a rider — you look for a rider *while* the kitchen cooks, so the rider shows up right as the food is ready. If you did them one after another, every order would take prep-time **plus** rider-search-time, blowing the 30-min SLA.
 
-#### Q: Why guard transitions instead of just setting `status = whatever`?
+### Why guard transitions instead of just setting `status = whatever`
 
-To prevent impossible or fraudulent states — e.g. marking an order `DELIVERED` when it was never picked up, or reviving a `CANCELLED` order. The guard is a bouncer: it only allows moves that make real-world sense, so the data always reflects a physically possible situation.
+This prevents impossible or fraudulent states — e.g. marking an order `DELIVERED` when it was never picked up, or reviving a `CANCELLED` order. The guard is a bouncer: it only allows moves that make real-world sense, so the data always reflects a physically possible situation.
+
+### Restaurant accept/reject — and the silent-restaurant timeout
+
+`PLACED → ACCEPTED / REJECTED` is a **human-in-the-loop** transition: a person at the restaurant taps the tablet. Humans forget, get slammed during the dinner rush, or leave the tablet in the back room. Since the customer is already **charged** and a 30-minute clock is ticking, the system can never wait forever — every `PLACED` order carries an **accept deadline** (e.g. 90s), and a background job resolves anything that blows it.
+
+```
+On ORDER_PLACED:
+  start accept-timer (e.g. 90s)
+
+Restaurant taps ACCEPT (prepTimeMins) → status = ACCEPTED → cancel timer → dispatch continues
+Restaurant taps REJECT (reason)       → status = REJECTED → refund → notify customer → suggest alternatives
+Timer fires, still PLACED             → treat as "silent" → run the auto-cancel saga (below)
+```
+
+**Auto-cancel saga (compensation on a stuck order):**
+
+```
+1. Sweeper finds PLACED orders older than the deadline   (uses idx_orders_status_sweep, §8)
+2. Guarded transition PLACED → CANCELLED (actor = SYSTEM) -- atomic, so a late human ACCEPT loses the race
+3. Compensations, each idempotent + retried:
+     - refund the payment            (money back — the un-do of the charge)
+     - release any tentatively-assigned rider  (DEL rider lock, §12)
+     - emit ORDER_CANCELLED to Kafka → notify customer, dashboards
+4. If the restaurant is repeatedly silent → suppress it from discovery (below)
+```
+
+> ⚠️ **Race to guard:** the restaurant might tap **Accept** at the exact moment the timeout fires. Because the transition is a **guarded, atomic state change** (§11), only one wins — if `CANCELLED` commits first, the late `ACCEPT` fails the `LEGAL`-transitions check and the tablet shows "order expired." Never let both proceed, or you'd cook food for a refunded order.
+
+**Discovery suppression when a restaurant is offline/unresponsive:** a restaurant that is closed, logged-out, or repeatedly ignoring orders should stop appearing in search *before* more customers order from it. The signal (`is_open = false`, or an "auto-offline after N misses" flag) is pushed into the discovery index (CDC / short-TTL cache, §9) so new searches skip it within seconds — eventual consistency is fine here, since the order path already re-validates `restaurant.is_open` at checkout (§10).
+
+#### Q: What happens if the restaurant never responds at all?
+
+The order does **not** hang forever. An **accept deadline** turns "no response" into a definite outcome: once the timer expires, the system itself moves the order `PLACED → CANCELLED`, **auto-refunds** the customer, releases any rider that was being lined up, and notifies the customer (usually with nearby alternatives). Persistent non-response also **auto-marks the restaurant offline** so it drops out of discovery. The rule mirrors payments: *never leave a charged customer in limbo* — resolve every order to a terminal state (delivered or refunded), even when a human simply goes quiet.
 
 ---
 
@@ -919,11 +995,11 @@ Because the rider's **first job is to pick up the food**. The bottleneck is gett
 
 Two dispatch workers running at once might both pick rider #42 for two different orders in the same instant → rider #42 gets double-booked. `NX` means "set this lock **only if nobody else has**"; the first worker wins, the second sees the lock and moves on. `EX 30` auto-expires the lock in 30s so a crashed worker can't freeze rider #42 forever. It's a **"claim it before you use it"** guard.
 
-#### Q: What's "batching" (order pooling)?
+### "Batching" (order pooling)
 
 If two orders come from the *same or nearby* restaurants heading in the *same direction* around the *same time*, one rider can carry **both** — pick up two bags, drop both off on one trip. Cheaper per delivery. The catch: the second customer waits a little longer, so you only batch when it won't blow either order's SLA.
 
-#### Q: Greedy vs batch optimization — which is "right"?
+### Greedy vs batch optimization — which is "right"
 
 - **Greedy (nearest free rider):** decide each order instantly, on its own. Simple and fast, but can make globally silly choices (grabs the only rider who was perfect for a closer order arriving 2 seconds later).
 - **Batch optimization:** every few seconds, look at *all* waiting orders and *all* free riders together and solve the best overall matching. Smarter globally, but adds a little delay and lots of compute.
@@ -985,15 +1061,15 @@ void onRiderMoved(RiderPing p) {
 
 Because for a moving dot, **only "where is the rider now?" matters** — the position from 8 seconds ago is useless. Keeping every ping would pile up 75k rows/sec of instantly-stale data. So we overwrite one value per rider (with a short TTL so it auto-cleans if pings stop). Historical breadcrumbs are downsampled and archived separately, only for analytics.
 
-#### Q: Why a WebSocket instead of the app asking "where's my rider?" every second?
+### Why a WebSocket instead of the app asking "where's my rider?" every second
 
 If the app **polled** ("any update? any update?") every second, you'd have millions of pointless requests, most returning "no change." A **WebSocket** is one open pipe: the server **pushes** a new position only when the rider actually moves. Far less traffic, and the update feels instant.
 
-#### Q: Only `OUT_FOR_DELIVERY` orders are tracked — why not all riders?
+### Only `OUT_FOR_DELIVERY` orders are tracked — why not all riders
 
-Because you only care about a rider's live position when they're **carrying your food**. Broadcasting all 300k riders' positions to nobody would be a massive waste. So the WebSocket fan-out is limited to active deliveries, which is a tiny slice at any moment.
+You only care about a rider's live position when they're **carrying your food**. Broadcasting all 300k riders' positions to nobody would be a massive waste. So the WebSocket fan-out is limited to active deliveries, which is a tiny slice at any moment.
 
-#### Q: Why is it fine for tracking to be "eventually consistent"?
+### Why it's fine for tracking to be "eventually consistent"
 
 If one GPS ping drops or arrives late, the *next* ping (4 seconds later) corrects the map — no harm done. The client even animates smoothly between updates so you don't notice. Contrast with payments, where a single lost/duplicated message means real money is wrong. Tracking is the **opposite** of the order path: speed and cheapness over perfect accuracy.
 
@@ -1034,15 +1110,15 @@ onEvent(RESTAURANT_ACCEPTED, o -> pushEta(o, estimateEta(o)));   // now we know 
 onEvent(RIDER_PICKED_UP,     o -> pushEta(o, estimateEta(o)));   // now only travel-to-you remains
 ```
 
-#### Q: Why does the ETA keep changing while I watch?
+### Why the ETA keeps changing while you watch
 
-Because each real event **removes a guess and replaces it with a fact**. Before the restaurant accepts, prep time is a guess. Once the rider picks up, "time to cook" and "rider→restaurant" are done and certain — only "restaurant→you" remains, and traffic may have shifted. So the number gets more accurate (and jumps around a bit) as the order progresses.
+Each real event **removes a guess and replaces it with a fact**. Before the restaurant accepts, prep time is a guess. Once the rider picks up, "time to cook" and "rider→restaurant" are done and certain — only "restaurant→you" remains, and traffic may have shifted. So the number gets more accurate (and jumps around a bit) as the order progresses.
 
-#### Q: Where does traffic come from?
+### Where traffic data comes from
 
 From a **routing service** (Google Maps, OSRM) that knows real roads and current congestion — the same tech that gives you driving times in a maps app. The platform asks it "how long from A to B right now?" for each travel leg.
 
-#### Q: The notes say ETA is "often an ML model" — do I need to understand the ML?
+### ETA is "often an ML model" — do you need to understand the ML?
 
 No. In an interview, say "**treat the ETA predictor as a black box**" and focus on what feeds it (prep time, distance, traffic, hour, weather, restaurant load) and how it's **continuously refined and pushed** to the customer. The systems-design value is in the inputs and the update loop, not the model's math.
 
@@ -1059,6 +1135,8 @@ Same pattern as any e-commerce/BookMyShow flow:
 - Reconciliation via **outbox** so a paid order never fails to progress (dual-write safety).
 
 > Reuse the payment design from BookMyShow / Notification notes — this is genuinely the "same as Flipkart" part.
+
+> 💡 **Saga & compensation, in one line:** the order is a **multi-step workflow across services** (pay → accept → dispatch → deliver) that can't be one big database transaction — the steps span services and take minutes. A **saga** runs them as separate local steps; if a later step fails or times out, it triggers a **compensating action** that undoes the earlier ones. Here the classic compensation is a **refund**: if the restaurant rejects or nobody can deliver, the "charge" step is un-done by refunding. Every compensation must be **idempotent** (safe to retry) since it may fire from a background job.
 
 ### Taking money without double-charging
 
@@ -1082,11 +1160,11 @@ void onPaymentResult(PaymentResult res) {
 }
 ```
 
-#### Q: What's a "refund depends on stage" situation?
+### What a "refund depends on stage" situation looks like
 
 If the restaurant **rejects** before cooking → **full refund** (nothing was made). If you cancel *after* the food's cooked or the rider's en route → maybe a **partial refund** (someone already spent effort/ingredients). The refund amount is a function of *how far the order got* in the state machine.
 
-#### Q: What's the "outbox" doing here (dual-write safety)?
+### What the "outbox" is doing here (dual-write safety)
 
 Scary scenario: payment succeeds, but the server crashes **before** it records "order is placed." Now you're charged with no order — the worst possible bug. The **outbox pattern** writes "payment done" and "publish ORDER_PLACED" in the **same database transaction**, so they can't get out of sync. A background process then reliably emits the event. Net effect: **a paid order can never get stranded.** (Same pattern as the BookMyShow/Notification notes.)
 
@@ -1122,13 +1200,13 @@ void recompute(ReviewAdded e) {              // background worker, off the hot p
 }
 ```
 
-#### Q: Why is a slightly-stale average rating OK?
+### Why a slightly-stale average rating is OK
 
-Because a restaurant's rating drifting from 4.31 to 4.32 a few seconds late affects nobody. It's **eventually consistent**, like discovery. The synchronous, must-be-exact treatment is reserved for money and order state — not for a star average.
+A restaurant's rating drifting from 4.31 to 4.32 a few seconds late affects nobody. It's **eventually consistent**, like discovery. The synchronous, must-be-exact treatment is reserved for money and order state — not for a star average.
 
-#### Q: Why rate the restaurant and rider separately?
+### Why rate the restaurant and rider separately
 
-Because they're different jobs and both feed back into the system: restaurant ratings influence **discovery ranking** (better places surface higher), and rider ratings influence **dispatch scoring** (better riders get offered more/better orders). Blending them would hide who's actually responsible when something goes wrong.
+They're different jobs and both feed back into the system: restaurant ratings influence **discovery ranking** (better places surface higher), and rider ratings influence **dispatch scoring** (better riders get offered more/better orders). Blending them would hide who's actually responsible when something goes wrong.
 
 ---
 
@@ -1165,15 +1243,15 @@ orders.scale()     = rdbms.shardBy(city).partitionBy(placedAt);  // durable, but
 peaks.scale()      = autoscaleStatelessServices + kafkaBuffersBursts + surgePricing;
 ```
 
-#### Q: What is "geo-sharding by city," and why does it fit food delivery so well?
+### What "geo-sharding by city" is, and why it fits food delivery so well
 
 Sharding = splitting your data across machines so no single one holds everything. For food, the natural split is **geography**: a Bangalore order will *never* need a Delhi rider or a Delhi restaurant. So you keep each city's orders, riders, and restaurants on their own shard. Benefits: queries stay **local and fast**, and a problem in one city's shard **doesn't affect** others. A food marketplace is inherently local, so the data splits cleanly.
 
-#### Q: How does Kafka help during the lunch/dinner rush?
+### How Kafka helps during the lunch/dinner rush
 
 When 10× the normal orders hit at 8 PM, downstream services (dispatch, notifications) might not keep up instantly. Kafka acts as a **shock absorber / buffer**: events pile up safely in the queue and get processed as fast as possible, instead of overwhelming and crashing a service. Combined with **autoscaling** (spinning up more servers during peaks) and **surge pricing** (gently reducing demand), the spike is smoothed out.
 
-#### Q: Why can you "autoscale stateless services" but not the database so easily?
+### Why you can "autoscale stateless services" but not the database so easily
 
 A **stateless** service (like discovery or the API gateway) holds no data of its own — any copy can handle any request, so you just add more copies during peaks and remove them after. Databases hold **state** (the actual orders), so scaling them means the harder work of sharding/replication. Rule: **make services stateless where possible so scaling is just "add more boxes."**
 
@@ -1210,11 +1288,11 @@ onRedisDown()               -> tracking.degradeToLastKnownLocation();       // o
 
 This is where you could **charge someone and give them nothing**. The fix is the **idempotency key + outbox + reconciliation** combo (§10, §15): the payment and the order-record are tied together so they can't drift apart, and a reconciliation job sweeps up any stragglers — auto-refunding if the order truly can't be recovered. The guiding rule: **never take money without either delivering an order or refunding.**
 
-#### Q: Why does a Redis/location outage NOT break orders?
+### Why a Redis/location outage does NOT break orders
 
-Because location lives in a **completely separate store** from orders (a deliberate design choice, §8). If Redis dies, live tracking degrades to "last known position + ETA" — annoying but survivable — while the order itself, safe in the SQL database, keeps progressing normally. **Isolating the risky, high-volume data protects the critical path.**
+Location lives in a **completely separate store** from orders (a deliberate design choice, §8). If Redis dies, live tracking degrades to "last known position + ETA" — annoying but survivable — while the order itself, safe in the SQL database, keeps progressing normally. **Isolating the risky, high-volume data protects the critical path.**
 
-#### Q: What does "load-shed non-critical" mean during overload?
+### What "load-shed non-critical" means during overload
 
 When the system is drowning, it **temporarily switches off nice-to-haves** (personalized recommendations, fancy ranking) to save capacity for the essentials (placing orders, dispatching riders, taking payments). Better to serve a plain-but-working app than to crash trying to serve a fancy one.
 
@@ -1248,11 +1326,11 @@ gauge("kafka_consumer_lag");      // is the event backbone falling behind?
 gauge("geo_index_freshness");     // is discovery showing stale restaurants?
 ```
 
-#### Q: Why track *business* metrics, not just CPU/memory?
+### Why track *business* metrics, not just CPU/memory
 
-Because servers can look perfectly healthy while customers are miserable — e.g. CPU is fine but every delivery is 20 minutes late because riders are scarce. **Business metrics catch problems the infra metrics miss.** The headline one, **order-to-delivery time vs promised ETA**, directly measures the promise the whole product is built on.
+Servers can look perfectly healthy while customers are miserable — e.g. CPU is fine but every delivery is 20 minutes late because riders are scarce. **Business metrics catch problems the infra metrics miss.** The headline one, **order-to-delivery time vs promised ETA**, directly measures the promise the whole product is built on.
 
-#### Q: What's "Kafka consumer lag" and why alert on it?
+### What "Kafka consumer lag" is, and why alert on it
 
 Kafka carries the published events; a **consumer** (like the notification or dispatch service) reads them. "Lag" = how far *behind* the consumer is. Rising lag means events are piling up faster than they're processed → notifications and dispatch start arriving late. It's an early warning that a downstream service is overwhelmed, often before users notice.
 
@@ -1297,7 +1375,7 @@ minute(20..32) = deepDive(interviewerPicks);   // usually dispatch, geo-search, 
 minute(32..35) = wrapUp("consistency split, failures, geo-sharding, trade-offs");
 ```
 
-#### Q: What if the interviewer just says "design Swiggy" with no guidance?
+### What if the interviewer just says "design Swiggy" with no guidance
 
 Drive it yourself using the phases above: **clarify → frame → estimate → HLD → deep-dive → wrap-up.** Offer the deep-dive options ("I can go deep on dispatch, geo-search, or tracking — any preference?") so *they* steer while *you* stay in control. Proactively mention trade-offs (strong vs eventual consistency, greedy vs batch dispatch) — that's what separates a senior answer.
 
@@ -1337,41 +1415,107 @@ Drive it yourself using the phases above: **clarify → frame → estimate → H
 >
 > "Autoscale stateless services, Kafka buffers event bursts, surge pricing shapes demand, dispatch batching raises rider throughput, and geo-sharding by city isolates load."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Payment succeeds but order creation fails** | Idempotency key + **outbox** (payment→order in one txn) + reconciliation sweep; auto-refund if the order truly can't be recovered. Never charge without an order or a refund (§10, §15). |
+| **Dispatch assigns one rider to two orders** | Atomic **Redis claim** `SET rider:{id}:lock NX EX 30` — first worker wins, the second sees the lock and moves on (§12). |
+| **Restaurant goes silent (never accepts)** | Accept-deadline timer → auto-cancel saga → refund + release rider + notify; repeated silence auto-marks the restaurant offline / suppressed from discovery (§11). |
+| **Discovery index stale at checkout** (sold-out item still shown) | Fine — discovery is eventually consistent; checkout **re-validates** open/available/price against live data and rejects if changed (§9, §10). |
+| **Duplicate "Place Order" tap** | Idempotency key → return the existing order, one charge only (§10). |
+| **Rider cancels mid-delivery** | Re-dispatch to a new rider, recompute ETA, notify customer; order state rolls back to needs-a-rider (§18). |
+| **Redis / location store down** | Tracking degrades to "last known + ETA"; the order itself (in the SQL DB) keeps progressing — risky high-volume data is isolated (§8, §18). |
+
+> **Ultimate layer model:** Idempotency = handle retries · Saga/compensation = handle failures · Outbox = guarantee event delivery · Redis claim = prevent double-assignment · Timeout sweeper = never leave an order stuck.
+
 ---
 
-## 22. Design Patterns (that can be used)
+## 22. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability, and why?" Food delivery is a great answer because it needs **both**, on different paths.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Order placement & state machine** | **CP** (strong) | Money + inventory of *your* order — a paid order must exist exactly once and transition correctly; a wrong answer loses money or trust |
+| **Payments / refunds** | **CP** (strong) | Charge/refund exactly once; ambiguity here is a real financial bug |
+| **Restaurant/menu discovery** | **AP** (available + eventual) | A menu edit or sold-out flag taking a few seconds to appear is harmless — availability > freshness for browse |
+| **Live location & tracking** | **AP** (available + eventual) | A dropped GPS ping self-corrects on the next one; the map staying up matters more than any single point |
+| **Ratings / analytics** | **Eventual** | A star average drifting a few seconds late affects nobody; recompute off the hot path |
+
+- The **CP core** (orders, payments) lives in the RDBMS with `idempotency_key` UNIQUE + ACID transactions — a single source of truth per order.
+- The **AP fulfillment layer** (discovery, location) lives in Redis / Elasticsearch / Kafka, kept fresh **asynchronously** (CDC, streams) and re-validated at the one moment correctness matters — **checkout**.
+
+> ⚠️ **Common trap:** trying to make discovery strongly consistent (block the search until the index is perfectly fresh). That trades away availability for freshness nobody needs, and re-validation at checkout already makes staleness safe. Spend consistency budget only where money/inventory lives.
+
+> One-liner: **"Strong consistency where money or a specific order is involved; eventual consistency for discovery, tracking, and ratings — and re-validate the stale stuff at checkout."**
+
+---
+
+## 23. Surge & Dynamic Pricing
+
+> When demand outruns the supply of riders (rain, match day, lunch peak), a **delivery-fee multiplier** rebalances the two sides and keeps the SLA intact. This is the food-delivery cousin of ride-hailing surge.
+
+### The imbalance it solves
+
+Discovery and dispatch both depend on **enough free riders in an area**. When open orders pile up faster than idle riders can clear them, ETAs blow out and orders start failing with "no riders" (§18). Surge is the pricing lever that (a) nudges some price-sensitive demand to wait, and (b) pulls more riders online where they're needed.
+
+### Computed per geohash cell, in near-real-time
+
+Surge is **local** — it's raining in one neighborhood, not the whole city — so it's computed per **geohash / S2 cell** (the same cells discovery uses, §9):
+
+```
+for each geohash cell, every ~1–2 min:
+    demand = open_orders + active_carts_heading_to_checkout
+    supply = idle_riders_in_cell
+    ratio  = demand / max(supply, 1)
+    multiplier = clamp(1.0, f(ratio), CAP)      # e.g. 1.0x .. 2.5x
+    publish surge:{cell} = multiplier           # read by pricing at checkout
+```
+
+- The multiplier applies to the **delivery fee** (and sometimes a small platform fee) — typically **not** the food price, which the restaurant sets.
+- It's read at **checkout** and shown transparently ("Delivery fee higher due to heavy rain"), then **snapshotted onto the order** like any other price (§8) so it can't change after you pay.
+
+### When surge applies to food vs ride-hailing
+
+| | Food delivery | Ride-hailing |
+| --- | --- | --- |
+| **What surges** | Mostly the **delivery fee** (food price is the restaurant's) | The **whole trip fare** |
+| **Elasticity** | Softer — people will wait for dinner, or pick a closer restaurant | Sharper — a rider *is* the product |
+| **Extra lever** | Can also re-rank discovery toward **closer/faster** restaurants and enable **batching** (§12) to stretch rider supply | Fewer substitutes — price is the main lever |
+
+### How it ties into the rest of the system
+
+- **Dispatch (§12):** surge raises rider **supply** (more go online) and batching raises rider **throughput** — two ways to close the same gap.
+- **Peaks / scaling (§17):** surge is listed as a demand-shaping tool for lunch/dinner/rain spikes — it **sheds/spreads demand** so autoscaling and Kafka buffering aren't the only defenses.
+- **Consistency (§22):** the surge multiplier is an **eventually-consistent, cached** value (fine if a cell's number is a minute stale), but the **fee charged is snapshotted onto the order** at checkout (strong) so it's fixed once you pay.
+
+> 💡 **Why per-cell and not one city-wide number?** Demand/supply imbalance is hyperlocal — one rainy suburb can be starved of riders while downtown is fine. A single city multiplier would over-charge calm areas and under-price the hot spot, failing to move riders where they're actually needed.
+
+> ⚠️ **Pitfall:** never let surge change **after** the customer commits. Show it before payment and freeze it on the order; a fee that jumps post-checkout is both a trust and a correctness bug.
+
+---
+
+## 24. Design Patterns (that can be used)
 
 > Full detail with class design in the [HLD & LLD companion](food-ordering-hld-lld.md) §B4.
 
-| Pattern | Where | Why |
+These design patterns sound academic, but each is just a **named solution to a problem you already met** in this doc:
+
+| Pattern | Where | Why — in plain words |
 | --- | --- | --- |
-| **Saga / Orchestration** | Order → pay → accept → dispatch → deliver, with compensation (refund) | Distributed transaction |
-| **State** | Order lifecycle (multi-actor) | Guard transitions |
-| **Strategy** | Dispatch (greedy/batch), pricing/surge, ETA | Swap algorithms |
-| **Chain of Responsibility** | Order validation (open → available → serviceable → price) | Composable checks |
-| **Observer / Pub-Sub** | Kafka events → dispatch, notification, analytics | Decouple |
-| **Ports & Adapters** | Payment, maps/routing, geo-index, push | Swap providers |
-| **Outbox** | Reliable order/payment events | No dual-write loss |
-| **Idempotency Key** | Order + payment creation | No duplicate orders/charges |
-| **Decorator / Chain** | Price composition (base + surge + tax − discount) | Stack pricing rules |
-| **Publish-Subscribe + WebSocket** | Live rider tracking | Fan-out location |
-| **Circuit Breaker** | Payment/maps calls | Resilience |
-| **CQRS** | Discovery (ES read model) vs order (RDBMS write) | Optimized reads |
-
-### The patterns in plain words
-
-These design patterns sound academic, but each is just a **named solution to a problem you already met** in this doc. Here are the headline ones translated:
-
-| Pattern | In plain words (Swiggy context) |
-| --- | --- |
-| **Saga / Orchestration** | A multi-step process (pay → accept → dispatch → deliver) where, if a later step fails, you **undo** earlier ones (refund). |
-| **State** | The order can only move through legal stages (§11). The "you can't skip to Delivered" rule. |
-| **Strategy** | Swappable algorithms — greedy *or* batch dispatch, normal *or* surge pricing — chosen at runtime. |
-| **Observer / Pub-Sub** | Publish "order placed" once to Kafka; every interested consumer reacts independently. |
-| **Outbox** | The "never charge without an order" safety net (§15) — write the event in the same transaction as the data. |
-| **Idempotency Key** | The "one tap = one order" tag (§10) that ignores duplicate requests. |
-| **CQRS** | Keep a **separate fast read copy** (Elasticsearch for search) apart from the **write copy** (orders in SQL). Reading and writing have different needs. |
-| **Circuit Breaker** | If the payment/maps provider is down, **stop calling it** and fail fast, so one failing dependency doesn't drag everything down. |
+| **Saga / Orchestration** | Order → pay → accept → dispatch → deliver, with compensation (refund) | A multi-step process where, if a later step fails, you **undo** earlier ones (refund) |
+| **State** | Order lifecycle (multi-actor) | The order can only move through legal stages (§11) — the "you can't skip to Delivered" rule |
+| **Strategy** | Dispatch (greedy/batch), pricing/surge, ETA | Swappable algorithms — greedy *or* batch dispatch, normal *or* surge pricing — chosen at runtime |
+| **Chain of Responsibility** | Order validation (open → available → serviceable → price) | Composable checks, each one able to reject before the next runs |
+| **Observer / Pub-Sub** | Kafka events → dispatch, notification, analytics | Publish "order placed" once; every interested consumer reacts independently |
+| **Ports & Adapters** | Payment, maps/routing, geo-index, push | Swap providers (Razorpay → Stripe, Google Maps → OSRM) without touching core logic |
+| **Outbox** | Reliable order/payment events | The "never charge without an order" safety net (§15) — write the event in the same transaction as the data |
+| **Idempotency Key** | Order + payment creation | The "one tap = one order" tag (§10) that ignores duplicate requests |
+| **Decorator / Chain** | Price composition (base + surge + tax − discount) | Stack pricing rules, each layer adding to the one beneath |
+| **Publish-Subscribe + WebSocket** | Live rider tracking | Fan-out location updates to every customer watching that order |
+| **Circuit Breaker** | Payment/maps calls | If the payment/maps provider is down, **stop calling it** and fail fast, so one failing dependency doesn't drag everything down |
+| **CQRS** | Discovery (ES read model) vs order (RDBMS write) | Keep a **separate fast read copy** apart from the **write copy** — reading and writing have different needs |
 
 ```java
 // Example: Strategy — swap the dispatch algorithm without touching the rest
@@ -1383,13 +1527,13 @@ DispatchStrategy strategy = isPeakHour() ? new BatchOptimizer() : new NearestIdl
 Rider r = strategy.pick(order, candidates);   // caller doesn't care which one it is
 ```
 
-#### Q: Do I need to name-drop every pattern in an interview?
+### Do you need to name-drop every pattern in an interview?
 
 No — patterns are a **vocabulary**, not a checklist. Use one when it genuinely clarifies ("I'd use the **Saga** pattern so a failed payment cleanly refunds"). Naming a pattern you can't justify hurts more than helps. Understanding the *problem each solves* (as above) is what matters.
 
 ---
 
-## 23. Final Takeaways
+## 25. Final Takeaways
 
 - **Three-sided marketplace** — customer, restaurant, rider; each an actor in the order state machine.
 - **Order core = e-commerce core** — cart, order service, state machine, payments, idempotency, notifications are the **same as Flipkart**.
@@ -1397,10 +1541,14 @@ No — patterns are a **vocabulary**, not a checklist. Use one when it genuinely
 - **Discovery = geospatial** — geohash/S2/Redis GEO/Elasticsearch; filter by open + serviceable + riders; cache per cell; eventually consistent.
 - **Dispatch = real-time matching** — geo-candidate riders, score, offer/accept loop with fallback, batching, atomic rider claim; run while food cooks.
 - **Live tracking = ephemeral firehose** — Redis + Kafka + WebSocket; 75k pings/sec must stay off the transactional DB.
-- **Consistency split** — strong for orders/payments, eventual for discovery/tracking.
+- **Consistency split** — CP for orders/payments, AP/eventual for discovery/tracking/ratings; re-validate stale data at checkout (§22).
 - **State machine is multi-actor** — restaurant, rider, system all drive transitions; Order Service owns it; audit every transition.
+- **No order stays stuck** — accept-deadline timers + auto-cancel saga resolve a silent restaurant to refund; suppress it from discovery (§11).
+- **Surge is a per-cell demand lever** — a delivery-fee multiplier that rebalances riders during peaks/rain and is frozen onto the order at checkout (§23).
 - **Geo-shard by city** — a food marketplace is inherently local.
 - **Headline SLA metric** — order-to-delivery time vs promised ETA.
+
+> The order core is solved by **the boring, correct e-commerce toolkit** (idempotency, transactions, outbox, saga); the food-delivery magic is **pushing hyperlocal, real-time, disposable data (geo + location) into stores shaped for it** and keeping it *off* the transactional path.
 
 ### Related notes
 

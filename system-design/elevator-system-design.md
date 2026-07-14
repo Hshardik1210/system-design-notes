@@ -1,5 +1,7 @@
 # Elevator System — Low-Level Design (OOD)
 
+> **Core challenge:** **Send the right car, then move it efficiently without starving anyone.** Two decisions drive everything below: *which* car answers a hall call (**dispatch**), and in *what order* one car serves its stops (**SCAN/LOOK**) — all while keeping each car's state transitions legal and thread-safe.
+
 > A classic **OOD/LLD** problem: model a bank of elevators serving floor requests efficiently. Interviewers grade your **class model, the scheduling/dispatch strategy, and state handling**.
 
 > **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
@@ -8,17 +10,35 @@
 
 ## Contents
 
-- [1. Requirements](#1-requirements)
-- [2. Core Entities](#2-core-entities)
-- [3. Class Design](#3-class-design)
-- [4. Scheduling / Dispatch](#4-scheduling--dispatch)
-- [5. Design Patterns (that can be used)](#5-design-patterns-that-can-be-used)
-- [6. Interview Cheat Sheet](#6-interview-cheat-sheet)
-- [7. Final Takeaways](#7-final-takeaways)
+- [1. Problem Statement](#1-problem-statement)
+- [2. Requirements](#2-requirements)
+- [3. Core Entities](#3-core-entities)
+- [4. Class Design](#4-class-design)
+- [5. Scheduling / Dispatch](#5-scheduling--dispatch)
+- [6. Extensibility](#6-extensibility)
+- [7. Concurrency / Thread-safety](#7-concurrency--thread-safety)
+- [8. Design Patterns (that can be used)](#8-design-patterns-that-can-be-used)
+- [9. Interview Cheat Sheet](#9-interview-cheat-sheet)
+- [10. Final Takeaways](#10-final-takeaways)
 
 ---
 
-## 1. Requirements
+## 1. Problem Statement
+
+Model the control system for a **bank of elevators** in a building. People press buttons; the software decides which car goes where and drives each car up and down safely.
+
+Concretely, the system must:
+
+- Accept **hall calls** (someone on a floor presses ▲/▼) and **car calls** (someone inside presses a destination).
+- **Dispatch** the best car to each hall call.
+- **Move** each car so it serves all its stops with minimal wasted travel — and **no rider waits forever**.
+- Open/close doors and keep every car in a **legal state** (e.g. never move with the doors open).
+
+> ⚠️ **The requirement that shapes everything:** riders must not **starve**. A naive "serve the nearest request first" scheduler can leave the top floor waiting indefinitely during a busy morning — avoiding that is the whole reason for SCAN/LOOK (§5).
+
+---
+
+## 2. Requirements
 
 **Functional**
 - Multiple elevators, multiple floors.
@@ -42,6 +62,8 @@ Floor 7 wall:   [▲] [▼]     ← hall call: "a car please, I'm going down"   
 Inside car #2:  [1][2]...[12]...[20]  ← car call: "take ME to 12"        (internal)
 ```
 
+> 💡 **Jargon to nail early:** **hall call** = wall button (external, must be *dispatched* to a car); **car call** = in-car button (internal, the car is already chosen). Keeping these two straight is half the problem.
+
 So the system has two jobs, and it's worth naming them separately:
 
 | Job | Trigger | Question it answers |
@@ -57,14 +79,14 @@ So the system has two jobs, and it's worth naming them separately:
 
 No — this trips people up constantly. They are two layers:
 
-- **Dispatch** = *choosing the car* (a fleet-level decision, one per hall call). → §4 cost function.
-- **SCAN/LOOK** = *how one chosen car orders its own stops* (a single-car decision). → §4 movement.
+- **Dispatch** = *choosing the car* (a fleet-level decision, one per hall call). → §5 cost function.
+- **SCAN/LOOK** = *how one chosen car orders its own stops* (a single-car decision). → §5 movement.
 
 A hall call first goes through dispatch ("car #2, you take it"), then car #2 folds that floor into its own SCAN route.
 
 ---
 
-## 2. Core Entities
+## 3. Core Entities
 
 | Entity | Role |
 | --- | --- |
@@ -104,7 +126,7 @@ Because from a *car's* point of view they're the same thing once assigned: **"a 
 
 ---
 
-## 3. Class Design
+## 4. Class Design
 
 The full class model is spelled out in the annotated walkthrough below.
 
@@ -118,7 +140,7 @@ First the small value types — an `enum` is just a fixed set of named constants
 // Which way a car is travelling. IDLE = parked, no pending stops.
 enum Direction { UP, DOWN, IDLE }
 
-// The lifecycle status of one car (its "state machine" — see §5 State pattern).
+// The lifecycle status of one car (its "state machine" — see §8 State pattern).
 enum ElevatorState { MOVING, STOPPED, DOORS_OPEN, MAINTENANCE }
 ```
 
@@ -166,11 +188,14 @@ class Elevator {
 
     void openDoors() { state = ElevatorState.DOORS_OPEN; /* ...then close after a delay */ }
 
-    void step() { /* one simulation tick — see the SCAN version in §4 */ }
+    // How many stops I still owe (both directions). Used by the dispatch cost fn (§5).
+    int pendingStops() { return upStops.size() + downStops.size(); }
+
+    void step() { /* one simulation tick — see the SCAN version in §5 */ }
 }
 ```
 
-The dispatch **strategy** is an interface so the car-picking brain can be swapped (§5 Strategy pattern):
+The dispatch **strategy** is an interface so the car-picking brain can be swapped (§8 Strategy pattern):
 
 ```java
 interface DispatchStrategy {
@@ -185,7 +210,7 @@ class NearestCarStrategy implements DispatchStrategy {
             .min(Comparator.comparingInt(e -> cost(e, hallCall)))  // smallest cost wins
             .orElseThrow();
     }
-    // (cost function detailed in §4)
+    // (cost function detailed in §5)
     int cost(Elevator e, Request hallCall) { /* distance + direction match + load */ return 0; }
 }
 ```
@@ -218,7 +243,7 @@ class ElevatorSystem {
 
 ---
 
-## 4. Scheduling / Dispatch
+## 5. Scheduling / Dispatch
 
 The interesting algorithmic part.
 
@@ -242,7 +267,7 @@ FCFS also **starves** people: if new low-floor requests keep coming, a request f
 
 > **LOOK vs SCAN (tiny distinction):** pure **SCAN** rides to the physical top/bottom even if no one's there (like an old disk-arm). **LOOK** — what real elevators and our code do — only goes as far as the *last actual stop*, then reverses. LOOK is SCAN that "looks ahead" and doesn't waste the trip.
 
-Here's `step()` implementing LOOK, using the two sorted sets from §3:
+Here's `step()` implementing LOOK, using the two sorted sets from §4:
 
 ```java
 void step() {
@@ -282,6 +307,39 @@ step, step, step, step → arrive 5 → doors open → upStops {10}
 step ... → arrive 10 → doors open → upStops {}  → direction IDLE
 Served 5 BEFORE 10 automatically, even though 10 was pressed first. That's SCAN/LOOK.
 ```
+
+### A full `step()` walkthrough — from IDLE, tick by tick
+
+That was one stop each way. Here's the whole loop from a **parked (IDLE)** car, showing the LOOK **reversal** at the top of the sweep. Car starts parked at **floor 5**; three requests arrive: **9**, **7**, then **2**.
+
+```
+addStop(9) → 9 > 5 → upStops {9},   direction IDLE→UP
+addStop(7) → 7 > 5 → upStops {7,9}  (auto-sorted ascending)
+addStop(2) → 2 < 5 → downStops {2}
+```
+
+Now each `step()` tick (LOOK = keep going up, serve stops, reverse only when nothing remains ahead):
+
+```
+tick  floor  dir    what happens                                upStops  downStops
+ 0      5    UP     start of sweep                               {7,9}    {2}
+ 1      6    UP     move up (not a stop)                         {7,9}    {2}
+ 2      7    UP     arrive 7 → doors open, remove 7              {9}      {2}
+ 3      7    UP     doors close (finish the stop)                {9}      {2}
+ 4      8    UP     move up                                      {9}      {2}
+ 5      9    UP     arrive 9 → doors open, remove 9              {}       {2}
+ 6      9   UP→DOWN nothing above (up{}), work below → REVERSE   {}       {2}
+ 7      8    DOWN   move down                                    {}       {2}
+ …      …    DOWN   …                                            {}       {2}
+11      2    DOWN   arrive 2 → doors open, remove 2              {}       {}
+12      2    DOWN→IDLE nothing left either way → park            {}       {}
+```
+
+Key moments: **tick 6** is the LOOK reversal (ran out of up-stops, so flip to DOWN because `downStops` isn't empty); **tick 12** is going IDLE once both sets are empty. Notice 7 was served before 9 even though 9 was requested first — the sorted set + directional sweep handle ordering for free.
+
+#### Q: Why not just always serve the nearest request (SSTF)?
+
+**SSTF (shortest-seek-time-first)** always jumps to the closest pending stop. It sounds efficient, but it **starves** far-away requests: while the car lingers around floor 5, a steady trickle of nearby calls (4, 6, 5…) keeps being "nearest," so a lone call at floor 20 can wait forever. **SCAN/LOOK** avoids this by committing to a *direction* and serving everything on the way before reversing — so every floor is guaranteed service within one full sweep (a bounded worst-case wait). SSTF optimizes the *next move*; SCAN optimizes *fairness across the whole trip*. That's exactly why real elevators (and OS disk-arm schedulers) use SCAN, not SSTF.
 
 ### How the BANK decides which car (dispatch cost function)
 
@@ -336,39 +394,140 @@ In simple designs, **no** — the floor is added to that car's stop list and it'
 #### Q: How do direction and state transitions actually flip?
 
 - **Direction** flips inside `step()` via the LOOK rule: run out of stops ahead → reverse if work remains behind, else go `IDLE`.
-- **State** is a separate machine (§5): `STOPPED → MOVING` when a stop is added, `MOVING → DOORS_OPEN` on arrival, `DOORS_OPEN → STOPPED/MOVING` after the door timer. `MAINTENANCE` is a manual override that takes the car out of dispatch entirely (the dispatcher skips cars not in service).
+- **State** is a separate machine (§8): `STOPPED → MOVING` when a stop is added, `MOVING → DOORS_OPEN` on arrival, `DOORS_OPEN → STOPPED/MOVING` after the door timer. `MAINTENANCE` is a manual override that takes the car out of dispatch entirely (the dispatcher skips cars not in service).
+
+### Database & storage choices
+
+The controller's live state — car positions, directions, the `upStops`/`downStops` sets from §4 — **must** stay in-memory. Dispatch and the SCAN loop run every tick; a real-time control loop that had to wait on a DB round-trip to decide "which floor next" would make every ride feel laggy, and a network blip has no business stalling a moving car. Persistence only enters for what happens *after* the fact:
+
+- **Audit/analytics** (which car served which hall call, wait times, door-open durations, maintenance events) → an **append-only log** or a **time-series store**, written asynchronously off to the side, never read back into the control loop.
+
+The controller keeps mutating its in-memory state on every tick; a background writer drains events to whatever store analytics needs. See [Databases — Deep Dive](../concepts/databases-deep-dive.md).
 
 ---
 
-## 5. Design Patterns (that can be used)
+## 6. Extensibility
 
-| Pattern | Where | Why |
+The dispatch brain is a `DispatchStrategy` (§4), so new fleet behavior is a **new class** — the elevators and the per-car SCAN loop never change. Three strategies cover the common asks:
+
+| Strategy | Optimizes for | When to use |
 | --- | --- | --- |
-| **Strategy** | `DispatchStrategy` (nearest-car/energy/zoned), movement policy | Swap scheduling algorithms |
-| **State** | `ElevatorState` transitions (MOVING↔STOPPED↔DOORS_OPEN) | Guard legal transitions |
-| **Command** | Requests as command objects queued to elevators | Uniform handling, queueing |
-| **Observer** | Displays/buttons react to elevator state changes | Decouple UI from logic |
-| **Singleton** | `ElevatorSystem` controller | One coordinator |
-| **Factory** | Create elevator/request types | Extensible |
-| **Mediator** | System coordinates elevators ↔ requests | Central dispatch logic |
+| **NearestCarStrategy** | shortest wait | default / rush hour — send the closest suitable car |
+| **ZonedStrategy** | throughput in tall buildings | split floors into zones (1–10, 11–20); each car owns a zone so cars don't all pile onto the same floors |
+| **EnergySavingStrategy** | least movement / power | off-peak / overnight — favor already-moving cars, keep idle cars parked |
 
-> **Interview lead:** Strategy (dispatch + SCAN movement), State (elevator lifecycle), Command (requests), Observer (displays), Singleton (system).
+`NearestCarStrategy` is the cost-function version from §5. The other two are drop-in siblings:
 
-### The patterns as building parts
+```java
+// Assign by zone: e.g. floors 0–9 → zone 0, 10–19 → zone 1. Each car owns a home zone.
+class ZonedStrategy implements DispatchStrategy {
+    private final int zoneSize;
+    ZonedStrategy(int zoneSize) { this.zoneSize = zoneSize; }
+
+    public Elevator selectElevator(List<Elevator> cars, Request hallCall) {
+        int zone = hallCall.floor / zoneSize;                  // which zone the call falls in
+        return cars.stream()
+            .filter(e -> e.homeZone == zone)                   // only cars that own this zone
+            .min(Comparator.comparingInt(e -> Math.abs(e.currentFloor - hallCall.floor)))
+            .orElseGet(() -> cars.get(0));                     // fallback if the zone's car is busy
+    }
+}
+```
+
+```java
+// Overnight: don't wake a parked car if a moving one can absorb the call cheaply.
+class EnergySavingStrategy implements DispatchStrategy {
+    public Elevator selectElevator(List<Elevator> cars, Request hallCall) {
+        return cars.stream()
+            .min(Comparator
+                .comparingInt((Elevator e) -> e.direction == Direction.IDLE ? 1 : 0)  // prefer already-moving
+                .thenComparingInt(e -> Math.abs(e.currentFloor - hallCall.floor)))     // then closest
+            .orElseThrow();
+    }
+}
+```
+
+Swap the brain at runtime — one line, no elevator code touched:
+
+```java
+system.dispatcher = new NearestCarStrategy();     // 9am rush: minimize wait
+system.dispatcher = new ZonedStrategy(10);        // busy tower: split the load
+system.dispatcher = new EnergySavingStrategy();   // 2am: minimize movement
+```
+
+> 💡 **dispatch** is the fleet-level "which car" decision — the *only* thing these strategies change. The per-car SCAN/LOOK movement (§5) is untouched, which is why swapping strategies is safe and cheap.
+
+#### Q: What are "destination-dispatch" elevators — the ones where you pick your floor in the lobby?
+
+A modern variant: instead of ▲/▼ buttons, you enter your **destination on a keypad in the lobby** and it tells you which car to board (often the in-car panel has no floor buttons at all). Because the system knows your destination *before* you board, it can **group riders heading to nearby floors into the same car**, cutting the number of stops each trip makes. In our model this means the hall call already carries a *target floor*, so dispatch can batch calls by destination rather than just by up/down direction. It shines in high-rises at peak; the trade-offs are a less familiar UX and the need to route people to the right car up front.
+
+---
+
+## 7. Concurrency / Thread-safety
+
+Fifty people on twenty floors mash buttons at the same instant. Each press becomes a `Request` on some thread, but a car's `upStops`/`downStops` are **shared mutable state** — two threads adding stops at once can corrupt a `TreeSet` or drop a stop. Two mechanisms keep it safe:
+
+**1. Guard each car's stop mutation.** `addStop` and the `step()` that mutates the same sets run under the car's **own lock**, so a car serializes its own updates without blocking the other cars:
+
+```java
+class Elevator {
+    private final Object lock = new Object();
+
+    void addStop(int floor) {
+        synchronized (lock) { /* enqueue into upStops/downStops */ }   // one writer at a time, per car
+    }
+    void step() {
+        synchronized (lock) { /* advance one tick; mutate the same sets */ }  // can't race with addStop
+    }
+}
+```
+
+**2. Funnel requests through one queue.** Rather than let arbitrary threads reach into cars, `ElevatorSystem` accepts requests into a **thread-safe queue** and a single control loop drains it — turning a storm of concurrent presses into an ordered stream:
+
+```java
+class ElevatorSystem {
+    private final BlockingQueue<Request> inbox = new LinkedBlockingQueue<>();
+
+    void submit(Request r) { inbox.add(r); }          // any thread may enqueue (non-blocking)
+
+    void controlLoop() {                               // ONE thread owns dispatch + ticks
+        while (true) {
+            Request r = inbox.poll();
+            if (r != null) {
+                if (!r.internal)                        // hall call → dispatcher picks the car
+                    dispatcher.selectElevator(elevators, r).addStop(r.floor);
+                else                                    // car call → the car is already known
+                    elevators.get(r.carId).addStop(r.floor);   // (car call carries its carId)
+            }
+            elevators.forEach(Elevator::step);          // advance the whole world one tick
+        }
+    }
+}
+```
+
+> ⚠️ **Why a hall-call assignment is committed, not re-evaluated every tick:** once the dispatcher picks car B for floor 7, that stop is folded into B's route and **stays there**. If we re-ran dispatch every tick, a call could **flip-flop** between cars — the floor-7 light would flicker and no car would reliably arrive. Committing the assignment guarantees exactly one car owns each call. (Fancier systems do *bounded* re-optimization; see the reassignment note in §5.)
+
+> 💡 **Contention is naturally low.** Unlike seat-booking, elevators rarely have true write conflicts on the *same* car — presses spread across floors and cars. A per-car lock plus one control loop is plenty; you don't need a global lock or a database in the hot path.
+
+---
+
+## 8. Design Patterns (that can be used)
 
 Patterns sound abstract; here's each one as a thing in the tower, and the *smell* that tells you to reach for it:
 
-| Pattern | In the elevator | The "smell" it fixes |
+| Pattern | Where / in the elevator | Why — the "smell" it fixes |
 | --- | --- | --- |
-| **Strategy** | The swappable dispatch brain (`DispatchStrategy`) | You have several *interchangeable algorithms* (nearest-car vs energy vs zoned) and want to switch without `if/else` sprawl |
-| **State** | `ElevatorState` transitions | An object *behaves differently* depending on its status, and some transitions are illegal |
-| **Command** | Each button press as a `Request` object | You want to *queue, log, or replay* actions uniformly |
-| **Observer** | Floor displays / chimes reacting to a car | Several UI things must *react to a change* without the car knowing about them |
+| **Strategy** | The swappable dispatch brain (`DispatchStrategy`: nearest-car/energy/zoned), movement policy | Several *interchangeable algorithms* — swap scheduling without `if/else` sprawl |
+| **State** | `ElevatorState` transitions (MOVING↔STOPPED↔DOORS_OPEN) | An object *behaves differently* depending on its status, and some transitions are illegal — guard legal ones |
+| **Command** | Each button press as a `Request` object queued to elevators | You want to *queue, log, or replay* actions uniformly |
+| **Observer** | Floor displays / chimes reacting to a car's state changes | Several UI things must *react to a change* without the car knowing about them |
 | **Singleton** | The one `ElevatorSystem` controller | There must be *exactly one* coordinator |
-| **Factory** | Building elevators/requests | Object *creation* varies (express car vs normal) and you want it in one place |
+| **Factory** | Building elevator/request types | Object *creation* varies (express car vs normal) and you want it in one place |
 | **Mediator** | `ElevatorSystem` sitting between cars and requests | Many objects would otherwise talk *directly* to each other; route through one hub |
 
-**Strategy** is the star — it's literally why §3 made dispatch an interface. Swapping the brain is a one-liner:
+> **Interview lead:** Strategy (dispatch + SCAN movement), State (elevator lifecycle), Command (requests), Observer (displays), Singleton (system).
+
+**Strategy** is the star — it's literally why §4 made dispatch an interface. Swapping the brain is a one-liner:
 
 ```java
 ElevatorSystem system = new ElevatorSystem();
@@ -399,6 +558,109 @@ STOPPED ──addStop──► MOVING ──arrive──► DOORS_OPEN ──tim
    └───────────────────► MAINTENANCE ◄──────────────────────────┘   (manual, leaves dispatch)
 ```
 
+#### The State pattern done properly (not just an enum + guard)
+
+The enum-plus-guard above works, but the **full State pattern** promotes each status into its **own class** — exactly like the vending machine's `IdleState`/`HasMoneyState`/`DispensingState`. The payoff: the "what's legal right now, and what happens next" logic lives in **one place per state**, so `Elevator` holds *no* `if (state == ...)` branching at all. Every state implements the same interface:
+
+```java
+interface ElevatorState {
+    void addStop(Elevator e, int floor);   // fold a new stop into this car
+    void step(Elevator e);                 // advance one clock tick
+}
+```
+
+```java
+// PARKED: no pending stops. A new stop wakes the car up and picks a direction.
+class IdleState implements ElevatorState {
+    public void addStop(Elevator e, int floor) {
+        if (floor == e.currentFloor) return;                 // already here → ignore
+        e.enqueue(floor);                                    // into upStops or downStops
+        e.direction = (floor > e.currentFloor) ? Direction.UP : Direction.DOWN;
+        e.setState(e.moving);                                // IDLE → MOVING
+    }
+    public void step(Elevator e) { /* parked: nothing to do until a request arrives */ }
+}
+```
+
+```java
+// MOVING: sweeping in one direction (SCAN/LOOK). Arriving at a stop opens the doors.
+class MovingState implements ElevatorState {
+    public void addStop(Elevator e, int floor) { e.enqueue(floor); }   // just fold into the route
+
+    public void step(Elevator e) {
+        Integer next = e.nextStopInDirection();              // ceiling/floor of the sorted set
+        if (next == null) {                                  // LOOK: nothing ahead
+            if (e.hasWorkBehind()) e.reverse();              // flip direction and keep serving
+            else                   e.setState(e.idle);       // MOVING → IDLE (all done)
+            return;
+        }
+        e.currentFloor += (e.direction == Direction.UP) ? 1 : -1;      // step one floor
+        if (e.currentFloor == next) {                        // arrived at a stop
+            e.removeStop(next);
+            e.setState(e.doorsOpen);                         // MOVING → DOORS_OPEN
+        }
+    }
+}
+```
+
+```java
+// DOORS_OPEN: busy letting people in/out. Ignores movement; a stop for THIS floor is a no-op.
+class DoorsOpenState implements ElevatorState {
+    public void addStop(Elevator e, int floor) {
+        if (floor != e.currentFloor) e.enqueue(floor);       // stops for other floors just queue
+    }
+    public void step(Elevator e) {                           // one tick later the door timer elapses
+        if (e.hasAnyStops()) e.setState(e.moving);           // DOORS_OPEN → MOVING
+        else                 e.setState(e.idle);             // DOORS_OPEN → IDLE
+    }
+}
+```
+
+The `Elevator` becomes a thin **context** that just delegates — no `switch` on state anywhere:
+
+```java
+class Elevator {
+    final ElevatorState idle      = new IdleState();
+    final ElevatorState moving    = new MovingState();
+    final ElevatorState doorsOpen = new DoorsOpenState();
+    private ElevatorState state = idle;                      // START parked
+
+    int currentFloor = 0;
+    Direction direction = Direction.IDLE;
+    TreeSet<Integer> upStops   = new TreeSet<>();
+    TreeSet<Integer> downStops = new TreeSet<>(Comparator.reverseOrder());
+
+    // public actions delegate to the current state:
+    void addStop(int floor) { state.addStop(this, floor); }
+    void step()             { state.step(this); }
+
+    // helpers the states call back into:
+    void setState(ElevatorState s) { this.state = s; }
+    void enqueue(int floor)        { if (floor > currentFloor) upStops.add(floor); else downStops.add(floor); }
+    Integer nextStopInDirection()  { return direction == Direction.UP ? upStops.ceiling(currentFloor)
+                                                                       : downStops.floor(currentFloor); }
+    boolean hasWorkBehind()        { return direction == Direction.UP ? !downStops.isEmpty() : !upStops.isEmpty(); }
+    boolean hasAnyStops()          { return !upStops.isEmpty() || !downStops.isEmpty(); }
+    void reverse()                 { direction = (direction == Direction.UP) ? Direction.DOWN : Direction.UP; }
+    void removeStop(int f)         { upStops.remove(f); downStops.remove(f); }
+}
+```
+
+A narrated run — car idle at floor 5, calls for 7 then 2 arrive:
+
+```
+state=IDLE, floor=5
+ addStop(7)   IdleState  → enqueue 7 (up), dir=UP, state=MOVING          up{7}  down{}
+ addStop(2)   MovingState→ enqueue 2 (down)                              up{7}  down{2}
+ step ×2      MovingState→ floor 6, then arrive 7 → removeStop, DOORS_OPEN
+ step         DoorsOpen  → still work (2 pending) → state=MOVING
+ step         MovingState→ nothing above (up{}), work behind → reverse, dir=DOWN
+ step ×5      floor 6→…→2, arrive 2 → removeStop, state=DOORS_OPEN
+ step         DoorsOpen  → no stops left → state=IDLE
+```
+
+> 💡 Same shape as the [vending machine](vending-machine-system-design.md): **data lives on the context, behavior lives in the state classes, and each state owns its own transitions.** The MAINTENANCE case slots in as one more state that removes the car from dispatch.
+
 **Observer** decouples the displays: the car just announces "I'm at floor 7" and anything subscribed reacts.
 
 ```java
@@ -413,7 +675,7 @@ Yes — you can make the per-car movement policy pluggable too (SCAN today, a di
 
 ---
 
-## 6. Interview Cheat Sheet
+## 9. Interview Cheat Sheet
 
 > **"How does an elevator decide where to go?"**
 > "Per car, use **SCAN/LOOK**: keep moving in the current direction serving all stops, then reverse — efficient and starvation-free. Maintain sorted up/down stop sets."
@@ -424,9 +686,19 @@ Yes — you can make the per-car movement policy pluggable too (SCAN today, a di
 > **"How do you model state?"**
 > "A **State** machine per elevator (MOVING → STOPPED → DOORS_OPEN, plus MAINTENANCE) with a direction (UP/DOWN/IDLE); requests are **Command** objects; displays are **Observers**."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What to do |
+| --- | --- |
+| **Express elevator** (skips 2–9, serves 10–20) | Model as a car with a *restricted valid-stop set*; dispatch never assigns it hall calls outside its range — a special case of **ZonedStrategy** (§6). |
+| **Fire / emergency mode** | A global override: cancel all pending stops, send every car to the ground floor (or a refuge floor), open doors, and drop out of dispatch. A top-priority state transition that trumps normal scheduling. |
+| **Two cars tie on cost** | Break the tie **deterministically** — lowest `id`, or fewer `pendingStops()` — so a call never flip-flops between cars every tick (§7). |
+| **Hall call vs car call asymmetry** | Hall calls go through the **dispatcher** (a car must be chosen); car calls skip it (you're already in a car). Same `Request` class, different entry path (§4). |
+| **Capacity / weight limit** | A full car is treated as **unavailable** for new hall calls (dispatch skips it) and won't stop for more pickups until someone exits — add a `load`/`weight` term to the cost function. |
+
 ---
 
-## 7. Final Takeaways
+## 10. Final Takeaways
 
 - **Two request types**: external hall calls (floor+direction) and internal car calls (target).
 - **SCAN/LOOK** for per-car movement (serve in one direction, then reverse) — no starvation.

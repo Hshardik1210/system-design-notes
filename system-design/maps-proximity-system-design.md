@@ -19,10 +19,13 @@
 - [9. Data Model](#9-data-model)
 - [10. Sequences](#10-sequences)
 - [11. Consistency & Edge Cases](#11-consistency--edge-cases)
-- [12. Design Patterns (that can be used)](#12-design-patterns-that-can-be-used)
-- [13. Scaling & Failure](#13-scaling--failure)
-- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
-- [15. Final Takeaways](#15-final-takeaways)
+- [12. Scaling & Failure](#12-scaling--failure)
+- [13. Interview Cheat Sheet](#13-interview-cheat-sheet)
+- [14. API Design](#14-api-design)
+- [15. Consistency & CAP Tradeoffs](#15-consistency--cap-tradeoffs)
+- [16. How to Drive the Interview (framework)](#16-how-to-drive-the-interview-framework)
+- [17. Design Patterns (that can be used)](#17-design-patterns-that-can-be-used)
+- [18. Final Takeaways](#18-final-takeaways)
 
 ---
 
@@ -52,13 +55,26 @@ Two flavors of "things," and they behave very differently:
 
 ## 2. Requirements
 
+> 💡 **Start here.** Clarify scope out loud — say up front whether you're building **(A) proximity**, **(B) routing**, or both, since they need completely different machinery.
+
 **Functional**
 - Given `(lat, lng, radius)`, return nearby entities (places/users/drivers) ranked by distance (+ filters).
 - Add/update entity locations (static places or moving objects).
 - (Maps) Directions + ETA between two points with live traffic.
 
-**Non-functional**
-- **Low latency** proximity queries; **huge scale** (billions of points, high QPS); handle **skew** (dense cities); **freshness** for moving objects.
+### Non-Functional (NFRs)
+
+| NFR | Target / Note |
+| --- | --- |
+| **Latency** | Proximity query p99 < ~100ms; driver ping ingest must be near-instant. |
+| **Scale** | Billions of static points; millions of live movers; **very high read QPS** (every app-open / map pan). |
+| **Freshness** | Live positions may be **seconds stale** (fine); place metadata edits should show up quickly. |
+| **Availability** | AP for the read/serve path — a slightly old dot beats an error. |
+| **Skew** | Handle dense cities (Manhattan) without overloading a single cell/shard. |
+
+### Out of scope (state assumptions)
+
+- Turn-by-turn voice nav, satellite tiles/rendering, offline maps, indoor maps, Street View (mention, then defer).
 
 ---
 
@@ -72,6 +88,33 @@ Road graph (routing): ~100M's of nodes/edges → precomputed shortcuts, held in 
 ```
 
 > Proximity read path must be **in-memory / cache**; moving-object writes are a **firehose** (Redis + stream); routing is precompute-heavy.
+
+### Show the method (back-of-envelope)
+
+> Numbers are illustrative — the point is to **derive** them out loud, not to be exact.
+
+```
+Assume:
+  DAU                       ~ 100M
+  Live drivers (ride-hail)  ~ 1M online, ping every 4s
+
+Driver-ping firehose (WRITES):
+  1M drivers / 4s          = 250k location writes/sec     → Redis GEO overwrite, NEVER the SQL DB
+  Rush hour (~2x)          ~ 500k writes/sec
+
+Proximity QPS (READS):
+  100M DAU × ~5 map-opens/searches per day
+  100M × 5 / 86,400s       ~ 5,800 reads/sec (avg)
+  Commute peak (~10x)      ~ 60k reads/sec                → in-memory geo index + hot-cell cache
+
+Road-graph memory (ROUTING):
+  ~100M intersections (nodes) + ~250M road segments (edges)
+  node ~16 B (id+lat/lng), edge ~24 B (to+dist+time)
+  100M×16B + 250M×24B      ~ 1.6 GB + 6 GB ≈ 8 GB base graph
+  + CH shortcuts (~1–2× edges)  → ~15–20 GB → fits in RAM on a big box, or shard by region
+```
+
+**Takeaways that drive design:** writes are dominated by the **ping firehose** (Redis, not RDBMS); reads are dominated by **proximity QPS** (in-memory index + cache); routing cost is **memory + offline precompute**, not per-request CPU.
 
 ---
 
@@ -206,8 +249,6 @@ S2      : sphere-correct; integer range queries;      squares, Hilbert-curve ids
 H3      : equal-distance neighbors;                   hexagons, great for dispatch/coverage
 ```
 
-### Common confusions (Q&A)
-
 #### Q: Geohash vs quadtree vs S2 vs H3 — which do I pick?
 
 They all do the same core job (map a point → a cell so "nearby" is a lookup). Pick by pain point:
@@ -220,6 +261,24 @@ They all do the same core job (map a point → a cell so "nearby" is a lookup). 
 | Even, equidistant neighbors (ride dispatch, coverage) | **H3** | Hexagons neighbor each other uniformly |
 
 In an interview: "I'd use a geospatial index like geohash/S2; geohash if I want simple prefix lookups, quadtree if density is very skewed, S2/H3 for a production system at scale."
+
+#### Q: H3 (hexagons) vs S2 (squares) vs geohash — hexes or squares, and when?
+
+The tie-breaker between the two production systems is the **cell shape**, and it maps onto two different jobs:
+
+| Cell shape | Neighbors | Best at | Real user |
+| --- | --- | --- | --- |
+| **Hexagon (H3)** | **6, all equidistant** | expanding a search **evenly ring-by-ring**; per-cell aggregates (supply/demand, surge, coverage) | **Uber dispatch** |
+| **Square (S2)** | 8 at **two** distances (4 sides + 4 diagonals) | fast **range queries over a region** (`id BETWEEN a AND b` on the Hilbert curve) | **Google Places / maps tiles** |
+| **String (geohash)** | 8, prefix-based | dead-simple prefix lookups in **any** DB | quick prototypes, `LIKE` queries |
+
+> 💡 **Why Uber picked hexagons:** with squares, a diagonal neighbor is ~1.4× farther than a side neighbor, so a "ring" of neighbors mixes distances and **biases** any per-cell average. Hex cells have **6 neighbors all the same distance away**, so "grow the search outward" and "average wait time per cell" are unbiased and uniform.
+
+**Worked example — Uber matching a rider to the nearest driver:** start in the rider's H3 cell, then walk outward one **ring** at a time (ring 1 = 6 cells, ring 2 = 12, …). Because every cell in a ring is the same distance out, the first driver found is genuinely among the closest, and surge/supply computed per cell is fair. Do the same with square cells and the diagonal corners reach ~40% farther than the sides — the "nearest" you find is skewed toward the diagonals.
+
+**Worked example — Google Places answering "all cafés in this map viewport":** the viewport is a **rectangle**, and S2's 64-bit Hilbert-curve ids make that a couple of integer **range scans** (`WHERE s2cell BETWEEN a AND b`). Hexagons don't tile a rectangle cleanly, so they're a poor fit for "everything inside this box" — which is exactly what a maps/search product needs. Different job, different shape.
+
+> ⚠️ **Pitfall:** don't fixate on hex-vs-square in an interview. All three answer the same core question (point → cell). Pick H3 when the workload is *dispatch/coverage* (even outward growth), S2 when it's *region/viewport range queries*, geohash when you just want a prefix in a plain DB.
 
 #### Q: The boundary problem — what if a close place sits in the *next* tile?
 
@@ -248,9 +307,7 @@ List<Place> candidates(double lat, double lng) {
 
 Searching 9 tiles instead of 1 guarantees you don't miss a close point hugging a border. (S2/H3 have neighbor lookups built in; H3's hexagons make "neighbors" especially tidy — 6 equal ones.)
 
-#### Q: How do I choose the cell size (precision)?
-
-Match the cell size to the **search radius** so the circle spans just **a few** cells — not one giant cell (too many candidates) and not thousands of tiny cells (too many lookups).
+Choosing the cell size (precision) is the practical knob: match the cell size to the **search radius** so the circle spans just **a few** cells — not one giant cell (too many candidates) and not thousands of tiny cells (too many lookups).
 
 ```
 radius ~5 km   → geohash length 5  (~5 km tiles)
@@ -305,6 +362,16 @@ List<Place> searchNearby(double lat, double lng, double radiusKm, int topN) {
 
 Why `haversine`? It's the formula for distance between two points **on a sphere** (the Earth is round), so it's more correct than flat-plane distance over long spans.
 
+> 💡 **Haversine, for beginners.** It computes the **great-circle distance** — the straight "as the crow flies" path across the *curved* surface of the Earth (like a string pulled taut over a globe). The formula:
+>
+> ```
+> a = sin²(Δφ/2) + cos φ₁ · cos φ₂ · sin²(Δλ/2)
+> c = 2 · atan2(√a, √(1−a))
+> d = R · c                    (R ≈ 6371 km = Earth's radius)
+> ```
+>
+> where **φ = latitude, λ = longitude** (in radians) and **Δ = the difference** between the two points. **Intuition:** over a few km, flat-plane Pythagoras (`√(Δx²+Δy²)`) is basically fine; over hundreds of km the Earth's curvature matters and haversine is the honest measure. In an interview you don't recite the formula — you say *"exact distance uses haversine (great-circle), because the Earth is a sphere."*
+
 ### Ranking by more than distance
 
 Yelp doesn't just show the *nearest* restaurant — a mediocre place 50m away shouldn't beat a beloved one 200m away. Real "nearby" ranks by a **blend of distance and relevance** (rating, popularity, whether it's open):
@@ -320,19 +387,16 @@ double score(Place p, double distanceKm) {
 
 The geo-index still does the heavy lifting (find the candidates); ranking is just how you *order* the short survivor list. This is why "nearby places" often layer a **search engine like Elasticsearch** (geo-filter + relevance scoring) on top of the raw geo-index.
 
-### Common confusions (Q&A)
+Two edge cases on the candidate count are worth planning for. If a cell and its neighbors return *thousands* of candidates (busy downtown), two levers help: use a **finer cell size** so each tile holds fewer places (a quadtree does this automatically by splitting crowded areas), and **cap + paginate** — return the top 20, remember where you stopped, fetch more only if the user scrolls. You never need to distance-check 5,000 places to show a screen of 20. If instead the cell and neighbors return *too few* (middle of nowhere, big radius), flip it: use **coarser (bigger) cells** so a large radius doesn't force you to query hundreds of tiny tiles — match cell size to radius as above.
 
-#### Q: What if my cell/neighbors return *thousands* of candidates (busy downtown)?
+For the hot read path, the geo-index usually lives **in memory / a cache** (e.g. Redis GEO, or an in-process quadtree) rather than being queried from the database on every search, because proximity QPS is enormous (every app-open, every map pan). The transactional DB is the source of truth, but you don't hit it per keystroke — you **cache hot cells** (§12).
 
-Two levers: (1) use a **finer cell size** so each tile holds fewer places (a quadtree does this automatically by splitting crowded areas), and (2) **cap + paginate** — return the top 20, remember where you stopped, fetch more only if the user scrolls. You never need to distance-check 5,000 places to show a screen of 20.
+### Two close cousins: reverse geocoding & place autocomplete
 
-#### Q: What if my cell/neighbors return *too few* (middle of nowhere, big radius)?
+Two features ride on top of the same geo-index and come up as follow-ups:
 
-Flip it: use **coarser (bigger) cells** so a large radius doesn't force you to query hundreds of tiny tiles. Match cell size to radius (see §5 precision Q&A).
-
-#### Q: Do I query the database on every search, or is this in memory?
-
-For the hot read path, the geo-index usually lives **in memory / a cache** (e.g. Redis GEO, or an in-process quadtree), because proximity QPS is enormous (every app-open, every map pan). The transactional DB is the source of truth, but you don't hit it per keystroke — you **cache hot cells** (§13).
+- **Reverse geocoding** — turn a raw `(lat, lng)` into a human address ("12 MG Road, Bengaluru"). It's a **nearest-neighbour lookup** against an indexed set of address points / road segments: snap the coordinate to the closest known feature, exactly the "narrow to a cell, then measure" pattern. (The forward direction — address → coordinate — is plain geocoding.)
+- **Place autocomplete** — as the user types "piz…", suggest "Pizza Hut, Koramangala." This is a **prefix/typeahead search biased by location** (rank suggestions near the user first). It's really a text-search problem layered on geo-filtering, so it's usually served by a search engine (Elasticsearch) or a dedicated typeahead service — see [Typeahead / Autocomplete](typeahead-autocomplete-system-design.md).
 
 ---
 
@@ -384,9 +448,20 @@ With CH shortcuts:   A → (hop across ~dozens of precomputed shortcuts)   → B
 
 The shortcuts let the query reason at the level of long-haul highways instead of every intermediate side street — the long stretches are collapsed into single precomputed edges.
 
-#### Q: How does the ETA change with traffic?
+#### Q: What exactly is a "shortcut edge"?
 
-The **edge weights are live.** A separate **traffic pipeline** collects GPS "probe" pings from millions of phones/cars, estimates the current speed on each road segment, and continuously updates that edge's travel-time weight.
+A **shortcut edge** is a *fake, precomputed* edge that stands in for a whole chain of real roads. Suppose the fastest way through a minor junction `B` is always `A → B → C`. Contraction Hierarchies **"contract"** (hide) `B` and add a direct edge `A → C` whose weight = `weight(A→B) + weight(B→C)`. Now a query can hop `A → C` in **one** step instead of visiting `B`.
+
+```
+Real graph:      A ── B ── C ── D ── E     (must visit every node)
+After contract:  A ─────────────────► E    (one shortcut edge, weight = sum of the chain)
+```
+
+> 💡 **Analogy:** it's the **express train that skips the local stops.** You contract nodes bottom-up (least-important first), which builds a *hierarchy*: side streets at the bottom, highway-level shortcuts at the top. A query rides shortcuts down/up the hierarchy and touches a few dozen edges, not millions.
+
+> ⚠️ **Pitfall:** shortcuts encode the graph's **structure**, so they must be rebuilt when roads change (new construction). **Live traffic** only changes edge *weights*, which is handled separately (customizable CH / overlay weights) so you don't re-contract the whole planet every minute.
+
+The ETA changes with traffic because the **edge weights are live.** A separate **traffic pipeline** collects GPS "probe" pings from millions of phones/cars, estimates the current speed on each road segment, and continuously updates that edge's travel-time weight.
 
 ```java
 // A GPS-probe pipeline turns raw location pings into live edge speeds
@@ -403,6 +478,11 @@ double eta(List<Edge> path) {
 ```
 
 So when a jam forms, those edges get "heavier," the router naturally prefers a detour, and it **re-routes mid-trip** as weights change. Production ETAs also blend in **ML from historical patterns** (this road is always slow at 6 PM).
+
+### Snap-to-road & rerouting (brief)
+
+- **Snap-to-road** — raw GPS is noisy and lands *beside* the road (in a building, on the wrong lane). Before routing or map-matching, **snap** each point to the nearest road **edge** (the `snapToNearestEdge` call above). It's the same nearest-neighbour geo-lookup as reverse geocoding, but the candidates are road segments, not addresses. It's what makes the blue dot glide along the road instead of jittering across rooftops.
+- **Rerouting mid-trip** — the client periodically reports position; if the driver leaves the planned path (missed a turn) **or** live edge weights change enough that another route is now faster, the router recomputes from the **current** location to the same destination. Because CH answers in milliseconds, rerouting is cheap enough to run continuously.
 
 ---
 
@@ -445,9 +525,7 @@ List<String> driversNear(double lat, double lng) {
 
 Because it's a **firehose**: 1M drivers pinging every ~4 seconds = **250k+ writes/sec**, and 99.99% of that data is instantly stale (you overwrite it 4 seconds later). A transactional DB would melt, and you'd be paying to durably store positions nobody will ever read. Instead: **latest position in Redis** (overwrite, in-memory, fast), and **stream the raw pings to Kafka** (downsampled) only if you need history/analytics later.
 
-#### Q: Isn't the position slightly out of date then?
-
-Yes — and that's **fine**. A driver's dot being 2 seconds stale doesn't hurt anyone; by the time you tap, they've barely moved. This is **eventual consistency by choice**: we trade perfect freshness for enormous scale. (Set a TTL so a driver who goes offline disappears from the index automatically.)
+That does mean the position is always slightly out of date — and that's **fine**. A driver's dot being 2 seconds stale doesn't hurt anyone; by the time you tap, they've barely moved. This is **eventual consistency by choice**: we trade perfect freshness for enormous scale. (Set a TTL so a driver who goes offline disappears from the index automatically.)
 
 ---
 
@@ -472,6 +550,19 @@ CREATE TABLE edge_traffic ( edge_id BIGINT PRIMARY KEY, current_speed DOUBLE PRE
 ```
 
 > **Stores to consider:** places (+ geo index: PostGIS/ES/S2), Redis GEO for moving objects, road graph (nodes/edges) + CH shortcuts, traffic time-series, search index.
+
+### Database & storage choices (which DB, and why at scale)
+
+This system is really two storage problems glued together — "where is everything, right now" (proximity) and "how do I get from A to B" (routing) — and each demands a different store. Deciding question: *"is this position looked up by coordinate, or traversed edge-by-edge as a graph?"*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Place metadata (name, category, rating) | **PostGIS / RDBMS** | Places rarely move; need joins/filters (category, rating) alongside geo predicates (`ST_DWithin`); GIST index makes geo range queries fast | A plain KV store can't filter "cafes rated 4+ within 2km" in one query — you'd fetch everything and filter in app code |
+| Nearby-search index (geo cells) | **Geospatial index** — geohash/S2/H3, in Redis or a specialized index | Turns "who's near this point" into an O(1) cell lookup + a handful of neighbor cells, not a scan (§5) | A B-tree on raw `(lat,lng)` clusters by latitude only — two points on the same latitude but opposite sides of the planet sit next to each other in the index, so it can't answer "nearby" cheaply |
+| Moving objects (driver/friend pings) | **Redis GEO / time-series** | 250k+ writes/sec of positions that go stale within seconds — an in-memory overwrite-in-place index is the only thing that keeps up; TTL auto-expires offline drivers | Writing every ping to the transactional DB is a firehose that drowns it for data nobody reads after 4 seconds (§8) |
+| Road graph (nodes, edges) + routing shortcuts | **Graph/adjacency store + precomputed contraction hierarchies** | Routing is edge-traversal, not row lookup; CH shortcuts collapse millions of intersections into a handful of hops so continental routes answer in ms | An RDBMS table of edges *can* store the graph, but running live Dijkstra/A* over it per request at continental scale takes seconds — the win is entirely in offline precomputation, not the storage engine |
+
+**Why not a plain `(lat,lng)` B-tree index, and why routing precomputes instead of querying live:** proximity search is only cheap if nearby points are *stored* near each other — that's what a geo-cell (geohash/S2/H3) buys you and a lat/lng B-tree doesn't, since a B-tree only clusters by one dimension at a time and a range on both `lat` and `lng` still returns a big rectangle you'd have to distance-filter (§5). The proximity read path lives in-memory/cache because it's hit on every app-open and map pan; PostGIS/ES hold the durable copy, and hot cells get cached in front of it, sharded by **geo region** with neighbor-shard fan-out at region boundaries — the same "always check the neighbors" pattern as cell boundaries, one level up. Routing takes the opposite approach to scale: instead of adding read replicas, it **precomputes offline** — contraction hierarchies collapse the graph so a live query only hops across a handful of shortcuts, because a country-sized road graph is too large to traverse node-by-node inside a request's latency budget. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ### How a place is actually stored and looked up
 
@@ -501,13 +592,9 @@ String shardFor(double lat, double lng) {
 }
 ```
 
-#### Q: What about a query right on a shard boundary (near a border)?
+A query right on a shard boundary (near a border) is the same idea as the cell **boundary problem** (§5), one level up: a search near the edge of a region might have relevant points on the *neighboring* shard. You handle it the same way — the query fans out to the **neighboring region shards** too, then merges results. Boundaries are a recurring theme in geo systems: cells have edges, shards have edges, and you always cover the neighbors.
 
-Same idea as the cell **boundary problem** (§5), one level up: a search near the edge of a region might have relevant points on the *neighboring* shard. You handle it the same way — the query fans out to the **neighboring region shards** too, then merges results. Boundaries are a recurring theme in geo systems: cells have edges, shards have edges, and you always cover the neighbors.
-
-#### Q: Isn't one region (a megacity) way busier than another (a desert)?
-
-Yes — that's **skew**, and it's why fixed grids struggle. Hot regions get **finer splitting** (a quadtree-style subdivision, or more shards for that area) and **caching of hot cells**, while empty regions stay coarse. You size shards by *load*, not by equal map area.
+And one region (a megacity) is inevitably way busier than another (a desert) — that's **skew**, and it's why fixed grids struggle. Hot regions get **finer splitting** (a quadtree-style subdivision, or more shards for that area) and **caching of hot cells**, while empty regions stay coarse. You size shards by *load*, not by equal map area.
 
 ---
 
@@ -544,7 +631,146 @@ Client → RoutingSvc: (A, B)
 
 ---
 
-## 12. Design Patterns (that can be used)
+## 12. Scaling & Failure
+
+- **Shard by geo region** — a query is local → natural partitioning + locality.
+- **Redis GEO / in-memory index** for moving objects; **PostGIS/ES/S2** for static places; **cache hot cells**.
+- **Skew:** dense cities → finer cells (quadtree) + pagination.
+- **Routing:** precompute (CH) + region partitioning; don't run live Dijkstra continent-wide.
+- **Location pings** never hit the transactional DB (firehose → Redis + stream).
+- **Traffic pipeline** updates edge weights near-real-time from GPS probes.
+
+---
+
+## 13. Interview Cheat Sheet
+
+> **"How do you find things near me efficiently?"**
+> "A **geospatial index** — geohash/quadtree/S2/H3 (or Redis GEO/PostGIS). Map the point to a cell, gather candidates from that cell **+ neighbor cells** (covering the radius + boundaries), then **exact-distance filter (haversine)** and sort. It avoids scanning all points; a plain lat/lng B-tree returns a big rectangle you'd still have to filter."
+
+> **"Dense city hotspots?"**
+> "Adaptive cells (**quadtree** splits where dense) or finer geohash precision + pagination, so a single cell isn't overloaded; coarser cells for large radii."
+
+> **"How does routing/ETA work?"**
+> "Model roads as a weighted graph; use **A\*** with **precomputation (contraction hierarchies)** — real maps don't run raw Dijkstra live. **ETA = traffic-adjusted edge weights** (from a GPS-probe pipeline), often ML-tuned from historical data; re-route on traffic changes."
+
+> **"Moving objects (drivers)?"**
+> "Latest position in **Redis GEO**, updated per ping; serve 'nearby' from memory; stream pings to Kafka; never persist every ping to the DB."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What to do |
+| --- | --- |
+| **A close place sits across a cell boundary** | Search my cell **+ neighbors** (8 for squares, 6 for H3 hexes) before distance-filtering — never just my own cell. |
+| **Dense downtown cell returns 5,000 candidates** | **Finer cells** (quadtree splits crowded areas) + **cap/paginate** — never distance-check all 5k for a 20-row screen. |
+| **Driver ping firehose (250k+/s)** | **Redis GEO overwrite** + **Kafka** stream for history; never the transactional DB. |
+| **Driver goes offline / app killed** | **TTL** on the Redis GEO entry auto-expires the dot — no stale drivers linger. |
+| **Continental route in one request** | **Precomputed CH shortcuts**, not live Dijkstra continent-wide. |
+| **Traffic jam forms mid-trip** | GPS-probe pipeline raises edge weights → router **reroutes** to a detour. |
+| **Query on a shard / region boundary** | Fan out to **neighbor region shards** and merge — same "check the neighbors" rule, one level up. |
+| **Antimeridian / near the poles** | Use **S2/H3** (sphere-correct) rather than naive flat lat/lng math that breaks at ±180°. |
+| **Noisy GPS lands beside the road** | **Snap-to-road** to the nearest edge before routing / drawing the trail. |
+
+---
+
+## 14. API Design
+
+> Proximity is a **GET with geo query params**; the driver ping is a tiny **high-frequency POST** you treat as fire-and-forget.
+
+```
+GET  /v1/nearby?lat=12.97&lng=77.59&radius=2000&type=restaurant&openNow=true&limit=20&cursor=..
+     → 200 { results:[ {id, name, lat, lng, distanceM, rating, openNow}, ... ], nextCursor }
+
+POST /v1/location                         (driver/user ping — high frequency)
+     body: { entityId, lat, lng, heading, speed, ts }
+     → 202 Accepted                       (overwrites latest position in Redis GEO; no body needed)
+
+GET  /v1/directions?from=12.97,77.59&to=12.93,77.62&mode=drive&departAt=now
+     → 200 { routes:[ {distanceM, durationS, trafficDelayS, polyline, steps:[...] } ] }
+
+GET  /v1/geocode/reverse?lat=12.97&lng=77.59      → nearest address for a coordinate
+GET  /v1/places/autocomplete?q=piz&lat=12.97&lng=77.59  → location-biased suggestions (see Typeahead)
+```
+
+### `GET /v1/nearby` — proximity search
+
+| Param | Meaning |
+| --- | --- |
+| `lat`, `lng` | center point of the search |
+| `radius` | search radius in **metres** |
+| `type` / `filters` | category (`restaurant`, `atm`, …), plus filters like `openNow`, `minRating` |
+| `limit`, `cursor` | page size + opaque cursor for the next page (dense cities return many results) |
+
+```json
+// 200 OK
+{
+  "results": [
+    { "id": "p_912", "name": "Pizza Place", "lat": 12.971, "lng": 77.594, "distanceM": 210, "rating": 4.4, "openNow": true },
+    { "id": "p_338", "name": "Corner Cafe", "lat": 12.968, "lng": 77.588, "distanceM": 450, "rating": 4.1, "openNow": true }
+  ],
+  "nextCursor": "eyJvZmZzZXQiOjIwfQ=="
+}
+```
+
+### `POST /v1/location` — driver/user ping
+
+> ⚠️ This is the **firehose** endpoint (§8). It just **overwrites** the entity's latest position in Redis GEO and (optionally) streams the raw ping to Kafka — it must **not** write a row to the transactional DB per ping. Return **`202 Accepted`** and don't make the caller wait.
+
+### `GET /v1/directions` — routing / ETA
+
+```json
+// 200 OK
+{
+  "routes": [
+    {
+      "distanceM": 5400,
+      "durationS": 960,            // 16 min, traffic-adjusted
+      "trafficDelayS": 180,        // 3 min of that is current congestion
+      "polyline": "yzw{Fbb...",    // encoded path for the map
+      "steps": [
+        { "instruction": "Head north on MG Rd", "distanceM": 800, "durationS": 120 }
+      ]
+    }
+  ]
+}
+```
+
+> `distanceM` is fixed by the path; **`durationS` is dynamic** — it's the sum of *traffic-adjusted* edge weights (§7), so the same route returns a different ETA at rush hour.
+
+---
+
+## 15. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you pick consistency vs availability?" Geo systems are **mostly AP** — a slightly stale dot beats an error — but **place metadata** writes want CP.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Driver / friend live position** | **AP** — Redis overwrite, **last-write-wins** | The newest ping is the only truth; a 2-second-old dot is harmless, and losing an error to stay available is the right trade (§8). |
+| **Place metadata write** (add/edit a business, hours, category) | **CP** — strong, in the RDBMS | A business's address/hours must be correct and not diverge across replicas; low write volume, so consistency is cheap. |
+| **Traffic edge weights** | **Eventual** | Speeds are aggregated from probes and converge; being a few seconds behind reality is expected and fine. |
+| **Proximity read (nearby search)** | **AP** — cache / replica | Served from hot-cell cache / in-memory index; brief staleness (a place just opened) is acceptable. |
+
+> One-liner: **"Live positions and reads are AP (last-write-wins, eventually consistent); place-metadata writes are CP. Trade freshness for availability everywhere movement is involved."**
+
+---
+
+## 16. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. **Spend ~70% on the geospatial index** (problem A) unless the interviewer explicitly steers you to routing (problem B).
+
+1. **Clarify requirements + NFRs** — which sub-problem: proximity, routing, or both? — §2
+2. **Estimate scale** — separate the **ping firehose** (writes) from **proximity QPS** (reads) — §3
+3. **Define APIs** — `nearby`, `location`, `directions` — §14
+4. **Architecture + data model** — §4, §9
+5. **Deep dive: the geospatial index** (cells → neighbors → boundary → density → exact haversine) — §5, §6
+6. **Moving objects** — Redis GEO overwrite + TTL, firehose off the DB — §8
+7. **(If steered) routing** — graph + A\* + **CH precomputation** + traffic-adjusted weights — §7
+8. **Consistency, scale, edge cases** — §11, §12, §15
+
+> 🎤 **Lead with the core split:** "(A) 'nearby' is a **geo-index lookup**, (B) routing is **graph pathfinding** — I'll spend most of my time on the geo index unless you'd like the routing deep-dive." That framing alone signals you understand the problem.
+
+---
+
+## 17. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -559,34 +785,7 @@ Client → RoutingSvc: (A, B)
 
 ---
 
-## 13. Scaling & Failure
-
-- **Shard by geo region** — a query is local → natural partitioning + locality.
-- **Redis GEO / in-memory index** for moving objects; **PostGIS/ES/S2** for static places; **cache hot cells**.
-- **Skew:** dense cities → finer cells (quadtree) + pagination.
-- **Routing:** precompute (CH) + region partitioning; don't run live Dijkstra continent-wide.
-- **Location pings** never hit the transactional DB (firehose → Redis + stream).
-- **Traffic pipeline** updates edge weights near-real-time from GPS probes.
-
----
-
-## 14. Interview Cheat Sheet
-
-> **"How do you find things near me efficiently?"**
-> "A **geospatial index** — geohash/quadtree/S2/H3 (or Redis GEO/PostGIS). Map the point to a cell, gather candidates from that cell **+ neighbor cells** (covering the radius + boundaries), then **exact-distance filter (haversine)** and sort. It avoids scanning all points; a plain lat/lng B-tree returns a big rectangle you'd still have to filter."
-
-> **"Dense city hotspots?"**
-> "Adaptive cells (**quadtree** splits where dense) or finer geohash precision + pagination, so a single cell isn't overloaded; coarser cells for large radii."
-
-> **"How does routing/ETA work?"**
-> "Model roads as a weighted graph; use **A\*** with **precomputation (contraction hierarchies)** — real maps don't run raw Dijkstra live. **ETA = traffic-adjusted edge weights** (from a GPS-probe pipeline), often ML-tuned from historical data; re-route on traffic changes."
-
-> **"Moving objects (drivers)?"**
-> "Latest position in **Redis GEO**, updated per ping; serve 'nearby' from memory; stream pings to Kafka; never persist every ping to the DB."
-
----
-
-## 15. Final Takeaways
+## 18. Final Takeaways
 
 - Proximity = **geospatial index** (geohash/quadtree/S2/H3, Redis GEO/PostGIS): **cell + neighbor cells → exact-distance filter**.
 - Plain lat/lng B-tree is poor; geo-cells cluster nearby points; pick precision by radius.

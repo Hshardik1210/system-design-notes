@@ -15,20 +15,25 @@
 - [3. Core Concepts & Vocabulary](#3-core-concepts--vocabulary)
 - [4. Partitions — The Heart of Kafka](#4-partitions--the-heart-of-kafka)
 - [5. Producers](#5-producers)
+  - [Schema Registry & Schema Evolution](#schema-registry--schema-evolution)
 - [6. Consumers & Consumer Groups](#6-consumers--consumer-groups)
 - [7. Offsets & Committing](#7-offsets--committing)
 - [8. Delivery Semantics](#8-delivery-semantics)
+  - [Kafka Transactions & Exactly-Once (EOS)](#kafka-transactions--exactly-once-eos)
 - [9. Replication & Durability](#9-replication--durability)
 - [10. How to Decide Partition Count](#10-how-to-decide-partition-count)
 - [11. Scaling Consumers & Concurrency](#11-scaling-consumers--concurrency)
 - [12. Consumer Lag — What It Is & How to Handle It](#12-consumer-lag--what-it-is--how-to-handle-it)
 - [13. Rebalancing](#13-rebalancing)
 - [14. Retention, Compaction & Cleanup](#14-retention-compaction--cleanup)
+  - [Security (SASL, SSL, ACLs)](#security-sasl-ssl-acls)
 - [15. Key Configs Cheat Sheet](#15-key-configs-cheat-sheet)
 - [16. Kafka vs Other Queues](#16-kafka-vs-other-queues)
 - [17. Failure Scenarios & Gotchas](#17-failure-scenarios--gotchas)
 - [18. Interview Cheat Sheet](#18-interview-cheat-sheet)
 - [19. Final Takeaways](#19-final-takeaways)
+
+> 💡 **Beginner reading path (first ~30 min):** read §1 → §2 → §3 → §4 → §6. That's the whole mental model — log, partitions, consumer groups — and covers ~80% of what Kafka *is*. Come back for §10–§13 (sizing, scaling, lag, rebalancing) when you hit real operational questions.
 
 ---
 
@@ -324,6 +329,20 @@ enable.idempotence = true
 
 Without it, a producer retry after a network blip can write the **same message twice**. The idempotent producer tags messages with a sequence number so the broker de-dups retries. **Turn this on** — it's default in modern Kafka and costs almost nothing.
 
+### How the partitioner picks a partition
+
+The producer's **partitioner** decides which partition each record lands in. There are three behaviors, and only one of them preserves ordering:
+
+| Case | Behavior | Ordering |
+| --- | --- | --- |
+| **Key present** (e.g. `user_id`) | `hash(key) % numPartitions` → same key always → same partition | ✅ Ordered per key |
+| **No key — sticky partitioner** (modern default) | Fills one partition's batch, then "sticks" to another → good batching | ❌ No per-entity order |
+| **No key — round-robin** (older default) | Rotates partition every record → tiny batches | ❌ No per-entity order |
+
+> 💡 **tip:** The **sticky partitioner** (default since Kafka 2.4) beats old round-robin for null-key records because it fills bigger batches per partition → better throughput and compression. You rarely need a custom partitioner; reach for one only for special skew control (e.g. salting a hot key).
+
+> ⚠️ **pitfall:** Ordering only holds **within one partition**. Two failure modes silently break it: (1) sending related events with **no key** (they scatter across partitions), and (2) `max.in.flight.requests.per.connection > 1` **without** `enable.idempotence=true` — a retried batch can be reordered ahead of a later one. Idempotence pins in-flight ordering, so keep it on.
+
 ### Producer flow
 
 ```
@@ -375,6 +394,28 @@ Counter-intuitively, a *tiny* wait usually makes the whole system **faster and c
 
 ---
 
+## Schema Registry & Schema Evolution
+
+Kafka itself only stores **bytes** — it doesn't know or care what's inside a message. That's fine until producers and consumers disagree about the shape of those bytes.
+
+**Why JSON-only breaks at scale.** With plain JSON, nothing stops a producer from renaming `user_id` → `userId`, dropping a field, or changing a type. Consumers deployed *before* that change now crash or silently mis-parse. Because Kafka **retains** old messages, a single topic can hold many message versions at once, so version skew between producers and consumers is the norm, not the exception.
+
+**The fix: a Schema Registry + a binary format.** Producers serialize with **Avro** or **Protobuf** and register the schema; the message carries a tiny **schema ID** instead of field names. Consumers fetch the matching schema by ID to deserialize. The registry also **enforces compatibility rules** so an incompatible schema is rejected *at publish time* instead of breaking consumers in production.
+
+| Compatibility mode | Rule | Safe change |
+| --- | --- | --- |
+| **BACKWARD** (common) | New schema can read **old** data | Add a field **with a default**; remove an optional field |
+| **FORWARD** | Old schema can read **new** data | Add an optional field; keep old required ones |
+| **FULL** | Both directions | Only additive changes with defaults |
+
+> 💡 **tip:** Default to **BACKWARD** compatibility and **always give new fields a default**. That lets you deploy producers and consumers independently (rolling deploys) without a lockstep release.
+
+#### Q: JSON already works — why add Avro/Protobuf and a registry?
+
+Two reasons. **Size/speed:** Avro/Protobuf are compact binary (no repeated field names on every message) → less network and disk. **Safety:** the registry rejects a breaking schema change *before* it ships, turning "3am consumer crash in prod" into "CI fails on your PR." JSON gives you neither — it's convenient for low-stakes, single-team topics but fragile once many teams share a topic.
+
+---
+
 ## 6. Consumers & Consumer Groups
 
 This is where scaling lives — read carefully.
@@ -410,6 +451,8 @@ Add a 5th consumer:
 2. **Therefore: max useful consumers in a group = number of partitions.** Extra consumers sit idle.
 
 > This is *the* reason partition count matters so much: **partitions cap your consumer parallelism**. You cannot process a topic with more than `partition_count` consumers in one group.
+
+> 💡 **tip:** **Max useful consumers in a group = partition count.** If you scale out pods and some sit idle (no partitions assigned), that's the signal you've hit the ceiling — add partitions or speed up each consumer instead of adding more pods.
 
 ### Multiple groups = fan-out (pub/sub)
 
@@ -570,6 +613,29 @@ Because Kafka's exactly-once only covers **Kafka-in to Kafka-out** (read from a 
 #### Q: So what should I actually build?
 
 At-least-once delivery **+ idempotent consumers**. It's simpler, robust, and the standard answer in interviews. Reserve true exactly-once (transactions / Kafka Streams) for pure Kafka-to-Kafka stream processing.
+
+---
+
+## Kafka Transactions & Exactly-Once (EOS)
+
+§8 mentioned exactly-once; here's the precise boundary of what it covers.
+
+Kafka **transactions** let a producer write to multiple partitions/topics **and** commit its consumer offsets **atomically** — all of it lands, or none of it does. Combined with the idempotent producer, this gives **Exactly-Once Semantics (EOS)** for one specific pattern:
+
+```
+EOS covers this loop:   read from topic A → process → write to topic B  (+ commit offset)
+                        all in ONE transaction → no dup writes, no lost offsets
+```
+
+Turn it on with `transactional.id` on the producer + `isolation.level=read_committed` on the consumer (so it never reads uncommitted/aborted messages). **Kafka Streams** does all of this for you with a single `processing.guarantee=exactly_once_v2`.
+
+> ⚠️ **pitfall:** EOS is **Kafka-to-Kafka only**. The moment your consumer touches an **external** side effect — a DB row, a payment API, an email — that action is **not** inside the Kafka transaction. Crash after charging the card but before the offset commits, and a restart charges again.
+
+So for the common "consume → hit a database/API" pipeline, EOS does **not** save you: you still need **idempotent processing** (dedup by a business key). See [Idempotency](idempotency.md).
+
+#### Q: If I write to Postgres from my consumer, can transactions make it exactly-once?
+
+No — not with Kafka transactions alone. Kafka can't enroll your Postgres write in its transaction. The robust pattern is **at-least-once + idempotent writes** (unique key / upsert), or the **transactional outbox** ([Outbox & Saga](outbox-and-saga.md)) to bridge the DB and Kafka atomically on the *producer* side.
 
 ---
 
@@ -875,7 +941,7 @@ Total group lag = sum of lag across all its partitions.
 | **Offset lag** | Number of messages behind (5,000) |
 | **Time lag / oldest-message age** | How *old* the oldest unprocessed message is |
 
-> 5,000 lag that clears in 2 seconds is fine. 5,000 lag where the oldest message is **30 minutes old** is an incident. **Alert on oldest-message age**, not just count.
+> ⚠️ **pitfall:** 5,000 lag that clears in 2 seconds is fine; 5,000 lag where the oldest message is **30 minutes old** is an incident. Alerting on **count alone** is misleading — **alert on oldest-message age**.
 
 ### Why lag happens
 
@@ -1076,6 +1142,18 @@ When the topic represents **the latest state of something**, not a history of ev
 
 ---
 
+## Security (SASL, SSL, ACLs)
+
+On a shared, multi-tenant cluster, "anyone who can reach a broker can read/write any topic" is a non-starter. Kafka secures three things:
+
+- **Encryption in transit — SSL/TLS.** Encrypts the wire so traffic can't be sniffed; can also authenticate clients via mutual TLS (mTLS).
+- **Authentication — SASL.** *Who are you?* Common mechanisms: `SASL/SCRAM` (username/password), `SASL/GSSAPI` (Kerberos), `SASL/OAUTHBEARER` (OAuth tokens).
+- **Authorization — ACLs.** *What are you allowed to do?* Per-principal rules like "app `orders-svc` may **Write** topic `orders`, **Read** group `order-processors`," and nothing else.
+
+> 💡 **tip:** On a shared cluster, default-deny with ACLs and give each service its own principal scoped to just the topics/groups it needs. That way one team's misbehaving client can't read another team's PII topic or accidentally consume from the wrong group.
+
+---
+
 ## 15. Key Configs Cheat Sheet
 
 ### Producer
@@ -1124,6 +1202,8 @@ When the topic represents **the latest state of something**, not a history of ev
 
 > **When to pick Kafka:** high throughput, multiple independent consumers, event replay, stream processing, ordering per key. **When not to:** you just need a simple managed task queue with low volume → SQS/RabbitMQ is less operational overhead.
 
+> ⚠️ **pitfall:** Kafka is the **wrong** choice when you don't need throughput, replay, per-key ordering, or fan-out. For a low-volume task queue, its brokers, partitions, and retention are pure operational overhead — don't reach for it by default just because it's popular.
+
 ### Kafka vs message brokers vs managed queues
 
 Three tools people often lump together as "queues":
@@ -1151,6 +1231,14 @@ When you have **low volume** and just need a **simple task queue** with minimal 
 ---
 
 ## 17. Failure Scenarios & Gotchas
+
+### Common Mistakes (the ones everyone hits)
+
+Before the full table, the three that bite teams most often — each has a one-line fix:
+
+- **Poison message** — one always-failing record blocks its whole partition (everything behind it is stuck, in order). → Retry N times, then **DLQ** it.
+- **Hot partition** — one heavy key (a giant tenant, a viral item) overloads its single partition while others idle. → Better key, **salt** the hot key, or split it out.
+- **Rebalance storm** — restarts/timeouts trigger constant stop-the-world reassignments → repeated lag spikes. → **Static membership** (`group.instance.id`) + **cooperative rebalancing**.
 
 | Scenario | What happens / fix |
 | --- | --- |

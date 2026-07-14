@@ -14,12 +14,18 @@
 - [4. API Gateway](#4-api-gateway)
 - [5. Key Differences](#5-key-differences)
 - [6. How They Fit Together](#6-how-they-fit-together)
+- [Common Mistakes](#common-mistakes)
+- [API Gateway vs Service Mesh](#api-gateway-vs-service-mesh)
+- [CDN vs Reverse Proxy vs API Gateway](#cdn-vs-reverse-proxy-vs-api-gateway)
+- [Edge Features Worth Knowing](#edge-features-worth-knowing)
 - [7. Interview Cheat Sheet](#7-interview-cheat-sheet)
 - [8. Final Takeaways](#8-final-takeaways)
 
 ---
 
 ## 1. Big Picture (one line each)
+
+Two everyday pictures make this whole page click. When an **employee's browser → corporate (forward) proxy → internet**, the proxy sits on the *client's* side and speaks for the employee (hiding them, logging/blocking what they reach). When a **user → nginx (reverse) proxy → app servers**, the proxy sits on the *server's* side and speaks for the backend (hiding it, spreading load, terminating TLS).
 
 | Component | Role |
 | --- | --- |
@@ -373,6 +379,66 @@ Different granularity. The **gateway** routes by **what's being requested** (`/a
 
 ---
 
+## Common Mistakes
+
+> ⚠️ **Two layers doing the *same* routing.** If your gateway already routes by path (`/api/orders` → Order service) and your load balancer *also* tries to make service-level routing decisions, you get two places that must agree — and they drift. Let the **gateway route by service** and the **load balancer route by instance** (see §6). Don't duplicate the same decision in both.
+
+> ⚠️ **Terminating TLS at the gateway and forgetting to re-encrypt inward.** It's tempting to decrypt HTTPS once at the edge and forward plain HTTP to the backends. That's fine *inside* a trusted network, but if traffic crosses zones (different VPCs, a shared cluster, anything an attacker could sniff), you've created a plaintext hole behind your own front door. Re-encrypt gateway→backend (TLS or **mTLS**) whenever the internal hop isn't fully trusted.
+
+> ⚠️ **Business logic creeping into the gateway.** The gateway is for *cross-cutting* concerns (auth, rate limiting, routing, shaping). The moment it starts computing prices, applying discounts, or knowing your order state machine, it becomes a second place to deploy for every feature change — a distributed monolith with a fancy name. Keep domain logic in the services; keep the gateway thin.
+
+> 💡 **Rule of thumb:** if a change to one feature forces you to redeploy the gateway, logic has leaked into it.
+
+---
+
+## API Gateway vs Service Mesh
+
+Both move and secure traffic, but they handle **different directions** of it:
+
+- **API gateway** handles **north-south** traffic — requests coming *in from outside* (clients → your system) and responses going back out. It's a single **edge** entry point: auth, rate limiting, routing, aggregation.
+- **Service mesh** handles **east-west** traffic — service-to-service calls *inside* your system (Order → Payment → Inventory). It runs as a **sidecar** proxy (e.g. **Envoy**) next to *every* service instance, transparently adding mTLS, retries, timeouts, and observability to internal calls.
+
+| | API Gateway | Service Mesh |
+| --- | --- | --- |
+| Traffic direction | **North-south** (client ↔ system) | **East-west** (service ↔ service) |
+| Deployment | One **edge** box | A **sidecar** next to every service |
+| Typical tech | Kong, AWS API Gateway, Zuul | Istio/**Envoy**, Linkerd |
+| Main jobs | Auth, rate limit, routing, aggregation | mTLS, retries, timeouts, traffic shifting, tracing |
+| Who sees it | External clients | Only internal services |
+
+> 💡 They're **complementary, not competitors.** A common setup: a gateway at the edge for external traffic, a mesh inside for service-to-service traffic. Small systems often need neither a mesh nor even a separate gateway.
+
+---
+
+## CDN vs Reverse Proxy vs API Gateway
+
+These three sit "in front of your servers" and get conflated constantly. One row each:
+
+| | Primary job | Lives where | Cares about |
+| --- | --- | --- | --- |
+| **CDN** | Serve cached **static/edge content** close to users | Globally distributed edge PoPs | Latency & offload (images, JS, video) |
+| **Reverse proxy** | **Route + balance** traffic to backend instances | In front of your servers (one region) | Load balancing, TLS termination, hiding backends |
+| **API gateway** | **Manage API traffic** (auth, limits, shaping) | At the edge of your API | Per-request policy for dynamic APIs |
+
+> 💡 A request for a product image may hit the **CDN** and never touch your servers; a request for `/api/checkout` skips the CDN, passes the **API gateway** (auth + rate limit), then a **reverse proxy** picks a healthy instance. Same URL bar, three different front doors depending on *what* is being fetched.
+
+---
+
+## Edge Features Worth Knowing
+
+A few gateway/edge capabilities that come up constantly:
+
+- **WAF (Web Application Firewall) at the edge** — inspects incoming requests for attack patterns (SQL injection, XSS, malicious payloads) and blocks them *before* they reach the gateway logic or backends. It's a security filter bolted onto the front door, distinct from auth (which asks "who are you?") — the WAF asks "does this request look malicious?".
+- **Canary / blue-green routing** — the gateway can split traffic by rule: send 1% of users to the new version (**canary**) and roll back instantly if error rates spike, or keep two identical environments and flip all traffic from **blue** (old) to **green** (new) at once. Because routing lives in one place, this needs no client changes.
+- **mTLS gateway → services** — beyond terminating client TLS at the edge, the gateway re-establishes a *mutually* authenticated TLS connection to each backend, so both ends prove their identity. This is how you avoid the "plaintext behind the front door" pitfall on untrusted internal hops.
+- **Request/response caching: gateway vs CDN** — a **CDN** caches mostly static, cacheable-by-URL content at global edge locations near users; a **gateway** can cache dynamic API responses (e.g. a hot `GET /api/products`) closer to your services, keyed by path + params + auth scope. Rough split: CDN for *static & geographic*, gateway for *dynamic & policy-aware*.
+
+#### Q: What's the BFF (Backend-for-Frontend) pattern?
+
+**Backend-for-Frontend** is a dedicated gateway/aggregation layer *per client type* — one for the mobile app, one for the web app, maybe one for a partner API. Each BFF calls the underlying services and stitches together exactly the shape *that* frontend needs (mobile wants a lean payload; web can take more). It's the aggregation idea from §4 taken one step further: instead of one generic gateway response, each frontend gets a tailored one, so client teams aren't blocked by a shared, lowest-common-denominator API.
+
+---
+
 ## 7. Interview Cheat Sheet
 
 > **"Difference between forward proxy, reverse proxy, API gateway?"**
@@ -394,3 +460,15 @@ API Gateway   → manages APIs (entry point, decision maker)
 ```
 
 - **API Gateway = Reverse Proxy + brains** 🧠 (often replaces a separate reverse proxy).
+
+**API-gateway feature checklist** (what "the brains" actually cover — reach for these in a design discussion):
+
+- ✅ **Auth** — validate JWT/OAuth, reject unauthenticated requests at the edge.
+- ✅ **Rate limiting** — cap per-client calls so one caller can't overload backends.
+- ✅ **Routing** — map path/host to the right service (`/api/orders` → Order service).
+- ✅ **Request/response transformation** — reshape payloads/headers to what each side expects.
+- ✅ **Aggregation / BFF** — fan out to several services and stitch one response (tailored per frontend).
+- ✅ **WAF** — filter malicious request patterns before they reach your logic.
+- ✅ **Canary / blue-green** — shift a slice of traffic to a new version, roll back fast.
+
+> 💡 In an interview, naming this checklist (and noting the gateway does them *once, at the edge*, so services stay thin) signals you understand *why* the pattern exists, not just what it is.

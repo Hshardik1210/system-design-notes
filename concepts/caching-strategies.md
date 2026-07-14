@@ -14,7 +14,9 @@
 - [4. Eviction Policies](#4-eviction-policies)
 - [5. Invalidation (the hard part)](#5-invalidation-the-hard-part)
 - [6. Cache Problems & Fixes](#6-cache-problems--fixes)
+- [Cache Warming (Pre-population)](#cache-warming-pre-population)
 - [7. Consistency Note](#7-consistency-note)
+- [When NOT to Cache](#when-not-to-cache)
 - [8. Interview Cheat Sheet](#8-interview-cheat-sheet)
 - [9. Final Takeaways](#9-final-takeaways)
 
@@ -37,6 +39,26 @@
 | Application | local in-process cache (Caffeine, Guava) |
 | Distributed | **Redis / Memcached** |
 | Database | query cache, buffer pool |
+
+### The cache hierarchy (multi-level)
+
+These layers aren't alternatives — real systems stack them. A request falls through each level until something answers, and each level shields the one below it:
+
+```
+browser cache        ← per-user; avoids the network entirely (0 ms)
+   ↓ miss
+CDN / edge           ← shared static assets, close to the user (images, JS, video)
+   ↓ miss
+local / in-process   ← per-app-server RAM (Caffeine/Guava); nanoseconds, no network
+   ↓ miss
+Redis (distributed)  ← shared across all app servers; ~1 ms over the network
+   ↓ miss
+database             ← source of truth; slowest, must be protected
+```
+
+Each hop up the stack is faster but smaller and less shared; each hop down is slower but more authoritative. The higher a hit lands, the less load reaches the DB.
+
+> 💡 **CDN vs Redis — different jobs, not competitors.** A **CDN** caches *static, public, byte-identical* content (images, video, JS/CSS) at edge locations physically **close to the user** to cut network distance. **Redis** caches *dynamic, private, application* data (a user's cart, a computed feed) **close to your servers** to cut DB load. CDN optimizes geography; Redis optimizes recomputation. You typically use both.
 
 ### What a cache really is
 
@@ -206,6 +228,16 @@ For **write-heavy bursts** where speed matters more than durability of the last 
 
 Not necessarily — write-through keeps the cache **consistent**, but it caches *everything you write*, including data nobody ever reads back. That wastes cache space. If most written data is rarely read, write-**around** is better (don't pollute the cache with write-once data; let reads pull in only what's actually needed).
 
+#### Q: Which write strategy do I actually pick?
+
+A quick decision guide — match the strategy to what the data *is*:
+
+- **Write-around / delete-on-write** — the **default** for most app data (profiles, listings, config). Update the DB, drop the cached key, let the next read reload. Simple, safe, no cache pollution.
+- **Write-through** — when you need the cache and DB to **never disagree** *and* the written data is read back soon (session state, a hot record updated then immediately re-read). You pay a second synchronous write for consistency.
+- **Write-back** — only for **write-heavy, loss-tolerant** data where throughput beats durability (counters, metrics, "last seen"). Never for money or anything you can't recompute.
+
+> 💡 **The default pattern (use this unless you have a reason not to):** **cache-aside reads + TTL + delete-on-write**, plus **single-flight** on hot keys. Reads populate lazily and stay resilient if Redis blinks; the TTL bounds staleness as a safety net; deleting (not updating) the key on write avoids race conditions (§5); and single-flight (§6.1) stops a hot key's expiry from stampeding the DB. Reach for write-through/write-back only when this default doesn't fit.
+
 ---
 
 ## 4. Eviction Policies
@@ -228,6 +260,8 @@ The cache is full and a new item needs to go in. Something has to be removed. **
 
 - **Eviction policy** answers: *when I'm out of room, WHICH item do I remove?*
 - **TTL** answers: *how long is any item allowed to live before it's considered stale?*
+
+> 💡 **One-liner to keep them straight:** eviction is triggered by **pressure** (the cache is full); expiry is triggered by **time** (the clock ran out). An item can be evicted long before its TTL, and an item can expire with tons of free space left. You usually want both on.
 
 **LRU (Least Recently Used)** — the default — evicts whatever you **touched longest ago**, betting that "recently used = likely to be used again":
 
@@ -269,6 +303,8 @@ Ways to keep cache from serving stale data:
 - **Versioned keys** — embed a version in the key (`user:123:v2`); bump version instead of deleting.
 
 > **Common pattern:** on update, **delete** the key (don't update it) → next read repopulates via cache-aside. Avoids race conditions between concurrent writers.
+
+> ⚠️ **Order matters: DB first, then cache.** Always write the source of truth **before** invalidating the cache. If you delete the cache *first*, a concurrent read can miss, reload the **old** DB value, and re-cache it — right before your DB write lands — leaving a stale entry that no one will fix until the TTL. Update the DB, *then* delete the key.
 
 ### Keeping the copy honest
 
@@ -433,9 +469,9 @@ cache.set(key, v == null ? NULL_SENTINEL : v, ttl)
 
 ---
 
-### Telling the "many misses" problems apart
+### Stampede vs avalanche vs penetration (the disambiguation)
 
-These cache failures all look similar (a sudden spike of DB load) but have **different causes and fixes**:
+These three cache failures all look similar (a sudden spike of DB load) but have **different causes and fixes** — mixing them up means applying the wrong fix:
 
 | Problem | What happens | Root cause |
 | --- | --- | --- |
@@ -444,6 +480,8 @@ These cache failures all look similar (a sudden spike of DB load) but have **dif
 | **Penetration** | requests for keys that don't exist anywhere always reach the DB | requests for keys absent from cache *and* DB |
 | **Hot key** | one key receives a disproportionate share of all traffic | one key gets a disproportionate share of traffic |
 | **Big key** | one cached value is huge; reading it blocks other operations | a single cached value is huge |
+
+> ⚠️ **Common mistakes to avoid here:** (1) Reaching for a **single-flight lock** during an **avalanche** — a lock only helps when many requests want the *same* key (stampede); an avalanche is *many different* keys, so the fix is **jittered TTLs**, not a lock. (2) Trying to fix **penetration** by caching harder — the key doesn't exist in the DB, so there's nothing to cache; you must cache the *absence* (null sentinel) or reject unknown keys with a **bloom filter**. (3) Calling any DB-load spike a "stampede" — always ask first: *one key or many? does the data even exist?*
 
 #### Q: Stampede vs avalanche — what's the real difference?
 
@@ -489,6 +527,22 @@ Same *concept* (one key gets outsized traffic), different *pain*. Here the conce
 
 ---
 
+## Cache Warming (Pre-population)
+
+Everything above populates the cache **lazily** — the first request for each key is a miss (cache-aside, §2). **Cache warming** flips that: you actively load hot data into the cache *before* real traffic arrives, so users never pay the cold-miss penalty.
+
+**When it matters:**
+
+- **After a deploy or restart** — a fresh cache (or a flushed local cache) is empty. Without warming, the first wave of traffic all misses at once — effectively a self-inflicted **avalanche** (§6.3). A rolling restart makes this worse: each restarted node starts cold.
+- **Before a known traffic spike** — a flash sale, ticket on-sale, or product launch where you *know in advance* which keys will be hot. Pre-load them so the first million users hit warm cache instead of stampeding the DB.
+- **For a stable, predictable hot set** — the top-N products, trending items, homepage data. A scheduled job refreshes them on a cadence so they're always warm.
+
+**How:** run a startup/scheduled job that reads the known-hot keys straight into the cache (or replay recent access logs to rebuild the working set).
+
+> 💡 **Warm only what you'll actually use.** Warming the *whole* dataset wastes memory and time, and most of it gets evicted before it's read. Warm the **predictably hot** keys (top products, the on-sale show) — for everything else, lazy loading is fine. Pair warming with **jittered TTLs** so the pre-loaded keys don't all expire together later and trigger the very avalanche you were avoiding.
+
+---
+
 ## 7. Consistency Note
 
 A cache makes the system **eventually consistent** by nature:
@@ -519,6 +573,20 @@ boolean booked = db.reserveSeatTransactionally(show42, seatId);  // DB locks + d
 #### Q: Doesn't invalidation (§5) make the cache strongly consistent?
 
 It gets you *closer*, but not truly strong. Even with delete-on-write there's a tiny window between "DB updated" and "cache entry deleted/reloaded" where a reader can see the old value — and event-driven invalidation adds propagation delay. For display data that's totally fine. For correctness-critical decisions, don't rely on "the cache is probably fresh"; route the decision through the source of truth.
+
+---
+
+## When NOT to Cache
+
+Caching is not free — it adds a moving part, a staleness window, and invalidation work. Sometimes the right answer is **don't cache this**. Skip the cache when:
+
+- **The value decides money or inventory.** Balances, payment authorizations, "is the last seat still free?" — the *decision* must read the source of truth transactionally (§7). You may cache a *display* copy, but never let a cached value authorize a spend or a reservation.
+- **The data is highly personalized / per-request.** If almost every request produces a unique result (a per-user search ranked by live context, a one-off computed report), the cache barely ever gets a second hit for the same key — you carry all the cost and get almost no reuse.
+- **The hit ratio would be low.** Rarely-repeated keys (long-tail lookups, mostly-unique queries) mean nearly every request misses anyway. You pay the extra hop *and* the DB load, and just add complexity for no speedup.
+- **The data changes faster than you read it.** If a value is updated more often than it's served, you spend more effort invalidating than you save on reads — and readers mostly see stale data regardless.
+- **The source is already fast enough.** A single indexed primary-key lookup on a healthy DB is often sub-millisecond. Adding Redis in front can *increase* p99 latency (extra network hop + occasional miss). Measure before adding a layer.
+
+> ⚠️ **Caching is not a default "make it faster" button.** Every cache you add is a second copy you now have to keep honest. If the hit ratio is low, the data is correctness-critical, or the DB is already fast, a cache adds latency, bugs, and staleness for little gain. **First fix the query/index; cache only what's measurably read-heavy and reuse-friendly.**
 
 ---
 

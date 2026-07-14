@@ -21,10 +21,13 @@
 - [11. API Design](#11-api-design)
 - [12. Sequences](#12-sequences)
 - [13. Edge Cases](#13-edge-cases)
-- [14. Design Patterns (that can be used)](#14-design-patterns-that-can-be-used)
-- [15. Scaling & Failure](#15-scaling--failure)
-- [16. Interview Cheat Sheet](#16-interview-cheat-sheet)
-- [17. Final Takeaways](#17-final-takeaways)
+- [14. Scaling & Failure](#14-scaling--failure)
+- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
+- [16. Replies & Conversation Threading](#16-replies--conversation-threading)
+- [17. Consistency & CAP Tradeoffs](#17-consistency--cap-tradeoffs)
+- [18. How to Drive the Interview (framework)](#18-how-to-drive-the-interview-framework)
+- [19. Design Patterns (that can be used)](#19-design-patterns-that-can-be-used)
+- [20. Final Takeaways](#20-final-takeaways)
 
 ---
 
@@ -50,9 +53,9 @@ The entire system is basically answering one question, fast, for hundreds of mil
 
 **Why is that hard?** Because you follow maybe 300 people, each of them tweets, and you refresh the app constantly. So the app is asked "build my timeline" **way more often** than anyone actually tweets — reads dwarf writes (~100:1).
 
-#### Q: Why not just query the database every time someone opens the app?
+### Why not just query the database every time someone opens the app
 
-Because "get the latest tweets from the 300 people I follow, sorted by time" is a heavy query, and hundreds of thousands of people fire it **every second**. Running that live, per refresh, would melt any database.
+"Get the latest tweets from the 300 people I follow, sorted by time" is a heavy query, and hundreds of thousands of people fire it **every second**. Running that live, per refresh, would melt any database.
 
 The trick that drives the whole design:
 
@@ -126,9 +129,9 @@ The whole site posts 500M tweets/day.
 
 That's why fan-out needs a whole **fleet of background workers** — no single machine copies 100 billion ids/day.
 
-#### Q: Why store tweet *ids* in timelines, not the tweets themselves?
+### Why store tweet ids in timelines, not the tweets themselves
 
-Because a timeline is just a **list of pointers**, not a pile of full tweets.
+A timeline is just a **list of pointers**, not a pile of full tweets.
 
 ```
 Store the tweet ONCE:      tweet:987 = { "just landed in Tokyo", author=you, ... }  (~300 bytes)
@@ -137,7 +140,7 @@ Put only its ID everywhere: timeline:{follower} → [987, 986, 971, ...]        
 
 A viral tweet followed by millions is stored **one time**; millions of timelines just hold the 8-byte number `987`. If we copied the full text into every timeline, storage would explode by ~40×. "Hydrate" (look up the full tweet by id) happens later, at read time.
 
-#### Q: What's the "celebrity" line in the estimate about?
+### What the "celebrity" line in the estimate is about
 
 ```
 celebrity with 50,000,000 followers tweets once → 50,000,000 timeline writes for ONE tweet
@@ -176,9 +179,9 @@ Each box in the diagram is one service with one job:
 | **Search Service** | Full-text search of tweets |
 | **Kafka** | Carries "a tweet happened" events so every service can react |
 
-#### Q: Why split "write path" and "read path" into different services (CQRS)?
+### Why split "write path" and "read path" into different services (CQRS)
 
-Because posting a tweet and reading a timeline are **totally different shapes of work**:
+Posting a tweet and reading a timeline are **totally different shapes of work**:
 
 - **Writing** (posting) is rare, and it's fine if it does heavy background work (fan-out).
 - **Reading** (opening the app) is *constant* (100:1) and must feel instant.
@@ -190,9 +193,9 @@ WRITE side:  you post → Tweet Service → Kafka → Fan-out workers fill timel
 READ side:   you open app → Timeline Service → read your ready timeline           (just fetch)
 ```
 
-#### Q: Why is Kafka in the middle instead of Tweet Service calling Fan-out directly?
+### Why Kafka sits in the middle instead of Tweet Service calling Fan-out directly
 
-Because one tweet triggers **many** independent reactions: fan-out, search indexing, notifications, analytics. Instead of Tweet Service knowing and calling all of them (tight coupling, and it'd have to wait for the slow fan-out), it just drops one `TWEET_CREATED` event on Kafka and moves on. Every interested team picks it up on its own schedule. This is the **pub/sub** pattern — the poster is decoupled from all the downstream work, and gets a fast response.
+One tweet triggers **many** independent reactions: fan-out, search indexing, notifications, analytics. Instead of Tweet Service knowing and calling all of them (tight coupling, and it'd have to wait for the slow fan-out), it just drops one `TWEET_CREATED` event on Kafka and moves on. Every interested team picks it up on its own schedule. This is the **pub/sub** pattern — the poster is decoupled from all the downstream work, and gets a fast response.
 
 ---
 
@@ -246,6 +249,8 @@ List<Long> readHome(long userId) {
 
 Great reads, but notice the `for` loop: for a celebrity, `followers` is 50 million → 50M `zadd`s for one tweet. That's the write-amplification wall.
 
+> 💡 **Redis sorted set = the timeline's data structure.** `ZADD key score member` inserts a tweet id scored by its timestamp; `ZREVRANGE key 0 50` returns the newest 50 already ordered (no sort at read time); `ZREMRANGEBYRANK` trims to the newest ~800. One structure gives you "time-ordered, capped, top-N" for free — that's why it's the timeline store (full rationale in §7).
+
 #### Pull (fan-out on read) — annotated
 
 ```java
@@ -298,7 +303,7 @@ List<Tweet> readHome(long userId) {
 
 You skip the 50M-write explosion (celebrities aren't pushed) **and** keep reads fast (you only pull a *few* celebrities, not all 300 followees).
 
-#### Q: Push vs pull vs hybrid — when does each win?
+### Push vs pull vs hybrid — when does each win
 
 | | Best when | Falls apart when |
 | --- | --- | --- |
@@ -306,9 +311,11 @@ You skip the 50M-write explosion (celebrities aren't pushed) **and** keep reads 
 | **Pull** | Author has huge/rare readership; writes must be cheap | Reads are frequent (merging on every refresh is slow) |
 | **Hybrid** | Real life: most users small, a few are huge | (essentially the production answer) |
 
-#### Q: What exactly makes someone a "celebrity" here?
+### What exactly makes someone a "celebrity" here
 
-A **threshold on follower count** (say 100k). Above it, we stop pushing their tweets and pull them at read time instead. It's not fame — it's purely "does fanning this person out cost too much?" An account can cross the line both ways, and we flip its mode when it does (see §13 Edge Cases).
+It's a **threshold on follower count** (say 100k). Above it, we stop pushing their tweets and pull them at read time instead. It's not fame — it's purely "does fanning this person out cost too much?" An account can cross the line both ways, and we flip its mode when it does (see §13 Edge Cases).
+
+> ⚠️ **The threshold is a tuning knob, not a law.** Too low → you pull for too many accounts and reads get slow; too high → fan-out for a near-celebrity blasts millions of writes and starves the pipeline. Tune it against your **actual fan-out cost vs read cost** (and it can be dynamic — e.g. lower the bar during peak hours, or treat sudden viral follower spikes specially). ~100k is an illustrative starting point, not a magic number.
 
 #### Q: Isn't pulling celebrities also slow?
 
@@ -368,17 +375,42 @@ void fanOutWorker(Tweet t) {
 - **`zadd` into a sorted set** = "put this tweet id into their timeline, positioned by timestamp so newest sorts first."
 - **`zremrangeByRank(..., 0, -801)`** = "keep only the newest ~800; drop the rest." Timelines are **capped** — nobody scrolls back 10,000 tweets from cache; deeper history falls back to pull.
 
-#### Q: Why cap each timeline at ~800 instead of keeping everything?
+### Why cap each timeline at ~800 instead of keeping everything
 
-Because a cache full of every tweet ever, per user, is enormous and pointless — people read the top of the feed. Capping keeps Redis small and writes cheap (trimming is O(log n)). If someone scrolls way back, we **pull** older tweets from the authors' user-timelines on demand.
+A cache full of every tweet ever, per user, is enormous and pointless — people read the top of the feed. Capping keeps Redis small and writes cheap (trimming is O(log n)). If someone scrolls way back, we **pull** older tweets from the authors' user-timelines on demand.
 
-#### Q: What is "backpressure" and why does a big non-celebrity account need it?
+### What "backpressure" is, and why a big non-celebrity account needs it
 
 Say someone has 90,000 followers — under the celebrity line, so we *do* push, but that's still 90,000 writes for one tweet. If a worker blasts all 90,000 at once, it can hog Redis and starve everyone else's fan-out. **Backpressure** = we queue/throttle that job (spread it over time, limited concurrency) so it drains steadily without freezing the pipeline. It's a fairness valve.
 
-#### Q: What does "partition fan-out work by follower shard" mean?
+### What "partition fan-out work by follower shard" means
 
 Followers' timelines live on different Redis shards (machines). Instead of one worker touching 50 shards randomly, we **group the writes by which shard they land on** and let workers hit shards in parallel/batched. Fewer round-trips, better parallelism.
+
+### Notification fan-out — a *separate* fan-out from the timeline
+
+Timeline fan-out copies a tweet id into your **followers'** feeds. **Notification** fan-out is a different fan-out with a different audience and trigger: it pings the **specific people involved in an interaction** — the author you replied to, the person you mentioned, whoever's tweet you liked/retweeted. Same `TWEET_CREATED` (and `LIKE`/`FOLLOW`) events on Kafka, but a **separate consumer group** and a different target list.
+
+| | Timeline fan-out | Notification fan-out |
+| --- | --- | --- |
+| **Trigger** | Any tweet posted | Reply, mention, like, retweet, new follow |
+| **Audience** | All of the author's *followers* | The few users *directly involved* (parent author, @mentions) |
+| **Volume** | Huge (write amplification) | Tiny per event (usually 1–handful) |
+| **Store** | `timeline:{userId}` sorted set | `notifs:{userId}` sorted set + push token |
+| **Celebrity twist** | Skip push, pull at read (§5) | A *mega-liked* tweet is the hot key — **aggregate** ("Alice and 2M others liked…") instead of 2M rows |
+
+```java
+@KafkaListener(topics = {"REPLY_CREATED", "MENTION", "LIKE", "FOLLOW"}, groupId = "notifications")
+void notifyWorker(InteractionEvent e) {
+    List<Long> targets = e.directlyInvolvedUsers();   // parent author + @mentions — NOT all followers
+    for (long uid : targets) {
+        redis.zadd("notifs:" + uid, e.time, e.id);    // notification inbox (its own sorted set)
+        push.deliverIfOnline(uid, e);                 // APNs/FCM push if device registered
+    }
+}
+```
+
+> ⚠️ **Don't reuse the timeline fan-out for notifications.** A celebrity's tweet getting **2M likes** would generate 2M notification writes to the *celebrity's* inbox — the hot key flips to the *recipient*. **Aggregate** high-volume interactions ("Alice and 1.2M others liked your tweet") instead of one row per like.
 
 ---
 
@@ -426,13 +458,13 @@ List<Tweet> getHome(long userId, String cursor) {
 }
 ```
 
-#### Q: What does "hydrate" mean, and why not just store full tweets in the timeline?
+### What "hydrate" means, and why not just store full tweets in the timeline
 
 **Hydrate** = swap each lightweight id for its full tweet content, right before showing it. We don't store full tweets in every timeline because a viral tweet followed by 10M people would then be copied 10M times. Instead it's stored **once** in `tweet:987`, and 10M timelines just hold the number `987`. On read, everyone hydrates from the same shared cache. Massive storage savings + you always get the *latest* like/retweet counts (they live on the one shared copy).
 
-#### Q: Why a Redis "sorted set" specifically?
+### Why a Redis "sorted set" specifically
 
-Because a timeline needs two things: **ordered by time** and **easy to trim to the newest N**. A sorted set stores each id with a **score** (we use the tweet's timestamp), so:
+A timeline needs two things: **ordered by time** and **easy to trim to the newest N**. A sorted set stores each id with a **score** (we use the tweet's timestamp), so:
 - `ZREVRANGE 0 50` → the 50 newest, already in order (no sorting at read time).
 - `ZREMRANGEBYRANK` → drop the oldest to keep it capped.
 
@@ -447,9 +479,9 @@ Page 1:  ZREVRANGE ... → newest 20, remember the last one's (score,id) = the c
 Page 2:  "give me 20 with score < cursor"  → continues cleanly, no dupes/gaps
 ```
 
-#### Q: What happens on a cache miss (timeline not in Redis)?
+### What happens on a cache miss (timeline not in Redis)
 
-Rebuild it by **pulling** — read the recent tweets of everyone you follow from their user-timelines, merge, and repopulate the cache. Slower for that one request, but correct, and it self-heals. (This is the read-path's safety net; see §15.)
+Rebuild it by **pulling** — read the recent tweets of everyone you follow from their user-timelines, merge, and repopulate the cache. Slower for that one request, but correct, and it self-heals. (This is the read-path's safety net; see §14.)
 
 ---
 
@@ -498,11 +530,11 @@ List<Tweet> rankedHome(long userId) {
 }
 ```
 
-#### Q: In an interview, do I need to know the ML model?
+### Do you need to know the ML model internals for an interview
 
-No. Say "treat the model as a **black box**" and focus on the **pipeline**: gather **candidates → score them → sort → cache**. The systems-design interest is *where* ranking runs and how you keep it fast (precompute/cache features, recompute periodically), not the neural net internals.
+No — say "treat the model as a **black box**" and focus on the **pipeline**: gather **candidates → score them → sort → cache**. The systems-design interest is *where* ranking runs and how you keep it fast (precompute/cache features, recompute periodically), not the neural net internals.
 
-#### Q: When does ranking run — on write or on read?
+### When ranking runs — on write or on read
 
 Usually a mix: candidate lists are precomputed (via fan-out), and **scoring** happens either periodically in the background or at read time using **cached features** (so you're not recomputing expensive signals per refresh). Chronological needs no scoring step at all — that's why it's the simple baseline.
 
@@ -555,17 +587,30 @@ List<String> topTrends(String region) {
 }
 ```
 
-#### Q: Why not just `SELECT hashtag, COUNT(*) ... GROUP BY hashtag` on demand?
+### Why not just `SELECT hashtag, COUNT(*) ... GROUP BY hashtag` on demand
 
-Because that counts *all history* and reruns on every request — far too slow at this scale, and it wouldn't capture "right now." Trending cares about a **moving window** ("last hour"), so we **pre-aggregate as a stream** into rolling counters and just read the precomputed top-k. (Same philosophy as timelines: precompute, don't compute-on-read.)
+That counts *all history* and reruns on every request — far too slow at this scale, and it wouldn't capture "right now." Trending cares about a **moving window** ("last hour"), so we **pre-aggregate as a stream** into rolling counters and just read the precomputed top-k. (Same philosophy as timelines: precompute, don't compute-on-read.)
 
-#### Q: What's "time decay"?
+### What "time decay" is
 
 Without it, a hashtag that trended hard yesterday could stay on top forever. Time decay gradually **shrinks old counts** (or uses a sliding window that drops old events) so trending reflects *current* momentum, not yesterday's.
 
 ---
 
 ## 10. Data Model (all tables)
+
+### Database & storage choices (which DB, and why at scale)
+
+No single database is best for every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question for tweets is *"is this the durable record, or a derived, disposable ranking of it?"* Tweets themselves need durability; timelines need raw speed.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Tweets, users, follows, likes, retweets (**source of truth**) | **RDBMS** (or Manhattan-style wide-column at Twitter's real scale) — sharded by **Snowflake tweet id** / by `author_id` | Tweets are written once, sharded by id keep an author's own tweets on one shard (`idx_tweets_author`) for the pull path, and moderate per-shard write volume keeps a relational engine viable; a distributed KV store like Manhattan is the real-world upgrade once write throughput outgrows single-shard RDBMS capacity, trading some query flexibility for horizontal write scale. | Storing tweets only in Redis loses durability the moment a node evicts/restarts — Redis is a cache, not a system of record; tweets must survive a restart even if every timeline cache is lost. |
+| Precomputed home/user timelines | **Redis** (sorted sets, `timeline:{userId}`) | Timelines are read hundreds of thousands of times/sec and are pure derived data (rebuildable from `tweets` + `follows`) — `ZADD`/`ZREVRANGE` gives "top 20, newest first" with zero query cost, which is exactly what fan-out-on-write precomputes (§12). | Re-querying `tweets` joined against `follows` on every home-timeline open can't sustain Twitter's read QPS — that's precisely the join a materialized, precomputed Redis structure exists to avoid. |
+| Search, trending, hashtags | **Elasticsearch** | Full-text tweet search and trending needs an inverted index + real-time aggregation, not row scans. | The tweet store has no relevance ranking or fast term aggregation; ES is the dedicated search/trending read model. |
+| Media (images/video) | **Blob store + CDN** | `media_ref` is a pointer; bytes belong in object storage served from the edge. | Bloats the tweet store and kills replication/backup speed if bytes lived inline. |
+
+**Why timelines live in Redis and not the tweet DB:** the whole design (§4–§7) hinges on **fan-out on write** — pushing a new tweet's id into every follower's timeline at write time so reads are just a list fetch. That precomputed list *is* the derived read model, and it has to live somewhere sub-ms and cheap to overwrite/rebuild — that's Redis's job, not the durable store's. We shard tweets by **Snowflake id** (time-sortable, minted independently by many machines with no central counter — §10) and shard/partition Redis timelines by follower/user so fan-out work can be **batched per shard** (§7) instead of scattering writes randomly. Celebrities are the hot-key case: instead of fanning out a push to millions of followers' sorted sets, their tweets are skipped at write time and **pulled** at read time (hybrid), which keeps hot authors from melting the fan-out workers. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 CREATE TABLE users ( user_id BIGINT PRIMARY KEY, handle VARCHAR(50) UNIQUE, name TEXT,
@@ -596,6 +641,8 @@ CREATE TABLE hashtags ( tag VARCHAR(100), tweet_id BIGINT, created_at TIMESTAMP,
 --   celeb:{id}:recent = recent tweet ids of a celebrity (pulled at read)
 ```
 
+> 💡 **`tweet_id` is a Snowflake id** — a 64-bit `timestamp + machineId + sequence`. Two payoffs: many machines mint ids with **no central counter** (no bottleneck at thousands of tweets/sec), and ids are **time-sortable**, so "bigger id = newer tweet" is what makes sorted-set ordering and cursor pagination work. (Deep dive in the Q below.)
+
 > **Tables to consider:** users, tweets, follows, likes, retweets, hashtags, notifications, media_refs, precomputed timelines (Redis), search index (ES), trending (stream/cache). Media → blob/CDN.
 
 ### Reading the schema
@@ -617,7 +664,7 @@ An auto-increment id needs **one central counter** — a bottleneck when thousan
 - Many machines mint ids **independently** (no central counter).
 - Ids are **time-sortable** — a bigger id means a newer tweet. That's why timelines can sort by id and why cursor pagination works.
 
-#### Q: Why two indexes — `idx_tweets_author` and `idx_follows_followee`?
+### Why two indexes — `idx_tweets_author` and `idx_follows_followee`
 
 They power the two hot lookups:
 
@@ -631,9 +678,9 @@ CREATE INDEX idx_follows_followee ON follows(followee_id);
 
 Note `follows` is indexed **both ways** conceptually: by `follower_id` (the primary key → "who do I follow?", used on read/pull) and by `followee_id` (→ "who follows me?", used by fan-out on write). Feeds ask both directions constantly.
 
-#### Q: Why isn't the timeline a SQL table?
+### Why the timeline isn't a SQL table
 
-Because it's a **hot, capped, time-ordered list read hundreds of thousands of times per second**. Redis sorted sets do exactly that in memory with `ZADD`/`ZREVRANGE`. Timelines are **derived data** (rebuildable from `tweets` + `follows`), so it's safe to keep them in a fast cache rather than the durable DB.
+It's a **hot, capped, time-ordered list read hundreds of thousands of times per second**. Redis sorted sets do exactly that in memory with `ZADD`/`ZREVRANGE`. Timelines are **derived data** (rebuildable from `tweets` + `follows`), so it's safe to keep them in a fast cache rather than the durable DB.
 
 ---
 
@@ -645,8 +692,39 @@ GET  /v1/home?cursor=       # home timeline (hybrid assembled + ranked)
 GET  /v1/users/{id}/tweets  # user timeline
 POST /v1/users/{id}/follow  · DELETE /v1/users/{id}/follow
 POST /v1/tweets/{id}/like   · POST /v1/tweets/{id}/retweet · POST /v1/tweets/{id}/reply
+POST /v1/users/{id}/mute    · POST /v1/users/{id}/block
+GET  /v1/tweets/{id}/thread # conversation (parent + replies)
 GET  /v1/search?q=          · GET /v1/trending?region=
 ```
+
+### Button → call (what the UI actually fires)
+
+| User action (button) | API call | Read/Write | Notes |
+| --- | --- | --- | --- |
+| Open app / pull-to-refresh | `GET /v1/home?cursor=` | Read | Hybrid-assembled + ranked; the 100:1 hot path |
+| Tap a profile | `GET /v1/users/{id}/tweets` | Read | User timeline (`idx_tweets_author`) |
+| Compose → Post | `POST /v1/tweets` | Write | Returns `tweetId` fast; fan-out is async (§6) |
+| Tap a tweet to expand | `GET /v1/tweets/{id}/thread` | Read | Parent chain + replies (§16) |
+| Like / Retweet | `POST /v1/tweets/{id}/like` · `/retweet` | Write | Counter update; retweet is an edge, not a copy |
+| Reply | `POST /v1/tweets/{id}/reply` | Write | New tweet with `reply_to` set (§16) |
+| Follow / Unfollow | `POST`/`DELETE /v1/users/{id}/follow` | Write | Edge in `follows`; drives fan-out |
+| Mute / Block | `POST /v1/users/{id}/mute` · `/block` | Write | Filtered on read, not on write (see below) |
+| Search / See trending | `GET /v1/search?q=` · `GET /v1/trending?region=` | Read | Elasticsearch + windowed counts (§9) |
+
+### Mute / block filtering on the timeline
+
+Muting or blocking someone does **not** scrub their tweets out of your (or millions of others') cached timelines — that would be a fan-out-sized rewrite (same "don't touch millions of timelines" rule as §13). Instead we keep a small **per-user mute/block set** (cached in Redis, e.g. `muted:{userId}`) and **filter on read**, right after hydrate:
+
+```java
+List<Tweet> applyMuteBlock(long userId, List<Tweet> tweets) {
+    Set<Long> hidden = relationships.mutedAndBlocked(userId);   // small, cached per viewer
+    return tweets.stream()
+                 .filter(t -> !hidden.contains(t.authorId))     // drop muted/blocked authors
+                 .toList();
+}
+```
+
+> 💡 Block is bidirectional (neither sees the other) and also gates the write path — a blocked user can't reply/follow — but the *timeline hiding* is still a cheap read-time filter, not a timeline rewrite.
 
 ---
 
@@ -706,28 +784,13 @@ READ  = grab list + pull celebs + hydrate   (mostly just fetching precomputed st
 - **An account crosses the celebrity threshold:** flip it from **push to pull** — stop fanning out its tweets; readers pull them instead. (And vice-versa if it drops below.)
 - **Inactive users:** someone who hasn't opened the app in months doesn't need tweets pushed into a timeline they never check. **Skip fan-out to them**; rebuild via pull if they return. Across millions of dormant accounts this saves an enormous amount of write volume.
 
-#### Q: Why is "don't touch millions of timelines" a recurring theme?
+### Why "don't touch millions of timelines" is a recurring theme
 
-Because any fix that requires editing every follower's timeline is itself a fan-out-sized operation. So the design consistently prefers **lazy** fixes (filter/skip on read) and **tombstones** over eagerly rewriting millions of timelines. The read path is cheap to make a little smarter; rewriting all timelines is not.
-
----
-
-## 14. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Strategy** | Fan-out (push/pull/hybrid), ranking (chrono/ML) | Swap per user type/experiment |
-| **Producer-Consumer** | Fan-out workers consume tweet events (Kafka) | Absorb + parallelize fan-out |
-| **Observer / Pub-Sub** | Tweet event → fan-out, search index, trending, notifications | Decouple |
-| **CQRS + Materialized View** | Precomputed timelines vs write model | Fast reads |
-| **Cache-Aside** | Tweet + timeline caches | Read performance |
-| **Repository** | Data access | Testable |
-| **Facade** | Timeline service over cache + pull + hydrate + rank | Simple API |
-| **Decorator** | Tweet rendering (badges, media, quoted) | Compose display |
+Any fix that requires editing every follower's timeline is itself a fan-out-sized operation. So the design consistently prefers **lazy** fixes (filter/skip on read) and **tombstones** over eagerly rewriting millions of timelines. The read path is cheap to make a little smarter; rewriting all timelines is not.
 
 ---
 
-## 15. Scaling & Failure
+## 14. Scaling & Failure
 
 - **Fan-out** via Kafka + worker pool; celebrities skip it; inactive users skip it; batch + backpressure.
 - **Timeline cache** in Redis (ids only, capped); hydrate from a shared tweet cache; CDN for media.
@@ -753,13 +816,13 @@ Two flavors of the same person:
 - **Write-time:** a celebrity *posting* → millions of writes → solved by **not pushing** (hybrid/pull).
 - **Read-time:** a single viral tweet *being read* by millions → solved by **caching that tweet once** and serving it from cache/CDN, so all those reads hit one cached copy instead of hammering the store.
 
-#### Q: Why can we get away with "eventual consistency" everywhere?
+### Why we can get away with "eventual consistency" everywhere
 
-Because a social feed has no correctness contract like a bank. If your tweet reaches followers over a few seconds instead of instantly, nothing is *wrong* — it's just slightly delayed. That tolerance is what lets fan-out be async, timelines be a rebuildable cache, and the system stay **available** even when parts are degraded.
+A social feed has no correctness contract like a bank. If your tweet reaches followers over a few seconds instead of instantly, nothing is *wrong* — it's just slightly delayed. That tolerance is what lets fan-out be async, timelines be a rebuildable cache, and the system stay **available** even when parts are degraded.
 
 ---
 
-## 16. Interview Cheat Sheet
+## 15. Interview Cheat Sheet
 
 > **"How do you build the home timeline?"**
 > "Hybrid fan-out: async workers push tweet **ids** into followers' Redis timelines for normal authors; for celebrities, skip fan-out and **pull** their recent tweets at read time, merging with the precomputed timeline, then hydrate content from a shared cache and rank."
@@ -776,9 +839,122 @@ Because a social feed has no correctness contract like a bank. If your tweet rea
 > **"Search / trending?"**
 > "Search via Elasticsearch fed from tweet events. Trending = sliding-window term-frequency aggregation per region with time decay, cached."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Celebrity with 50M followers tweets** | **Don't push.** Above the celebrity threshold → skip fan-out; their tweet is **pulled** at read time from a per-celebrity cache and merged into each reader's feed (§5). |
+| **Timeline cache miss** (Redis shard evicted/restarted) | Rebuild by **pulling** recent tweets of everyone the user follows, merge, re-cache. Slower for that one request, self-heals; timelines are derived data (§7, §14). |
+| **Mass-follow backpressure** (90k-follower account, or a bot following millions) | It's under the celebrity line so we *do* push — but **queue/throttle** the fan-out job (bounded concurrency, spread over time) so it drains steadily without starving others (§6). |
+| **Deleted tweet still in cached timelines** | Leave the dangling **id**; don't scrub millions of timelines. On hydrate the lookup returns null (**tombstone**) → **skip it** (§13). Self-cleaning. |
+| **Account crosses the celebrity threshold** | Flip push→pull (or pull→push if it drops). Old pushed copies age out of capped timelines naturally (§5, §13). |
+| **Muted/blocked author's tweets in your feed** | **Filter on read** against a small per-viewer mute/block set — never rewrite timelines (§11). |
+
 ---
 
-## 17. Final Takeaways
+## 16. Replies & Conversation Threading
+
+> A reply is just a tweet with a **parent pointer**. A "thread" is the tree you get by following those pointers.
+
+Threading reuses the tweet table — no new store. Two fields do the work:
+
+- **`reply_to`** — the tweet this one directly answers (its **parent**). `NULL` for a top-level tweet.
+- **`conversation_id`** — the **root** tweet id of the whole thread (copied down from the parent on create). Lets you fetch a whole conversation with one indexed lookup instead of walking pointers one hop at a time.
+
+```
+tweet 100  "Deploying v2 tonight"          reply_to=NULL   conversation_id=100   ← root
+ └─ tweet 101  "nice, any downtime?"        reply_to=100    conversation_id=100
+     └─ tweet 102  "~5 min"                  reply_to=101    conversation_id=100
+ └─ tweet 103  "good luck!"                  reply_to=100    conversation_id=100
+```
+
+- **Replies fan out like any tweet** — a reply lands in the timelines of the *replier's* followers (normal fan-out), and separately pings the parent author via **notification fan-out** (§6).
+- **Reply count** on the parent (`reply_count`) is a counter bumped on reply — don't `COUNT(*)` the children on every render.
+
+### Hydrating a conversation (the read sequence)
+
+When a user taps a tweet to expand the thread, `GET /v1/tweets/{id}/thread`:
+
+```java
+Thread getThread(long tweetId) {
+    Tweet focus = tweetCache.get(tweetId);
+
+    // 1) ANCESTORS: walk parent pointers up to the root (short chain, usually a few hops)
+    List<Long> ancestorIds = new ArrayList<>();
+    for (Long p = focus.replyTo; p != null; p = tweetCache.get(p).replyTo) {
+        ancestorIds.add(p);
+    }
+
+    // 2) REPLIES: direct children, newest/most-relevant first (one indexed lookup)
+    List<Long> replyIds = replyIndex.childrenOf(tweetId, /*limit*/ 50);   // idx on (reply_to, created_at)
+
+    // 3) HYDRATE everything in ONE batched lookup, then filter deleted (tombstones) + muted authors
+    List<Long> all = concat(reverse(ancestorIds), tweetId, replyIds);
+    List<Tweet> hydrated = tweetCache.mget(all).stream()
+                                     .filter(Objects::nonNull)     // deleted parent/reply → skip
+                                     .toList();
+    return Thread.of(hydrated);
+}
+```
+
+> 💡 Store `conversation_id` on every reply so "load the whole conversation" is `WHERE conversation_id = ?` (one index scan) instead of recursively chasing `reply_to`. The parent-walk above is only for the *ancestor spine* when you deep-link into the middle of a thread.
+
+> ⚠️ **Deleted parent, surviving replies:** if the root/parent is deleted, its replies still exist. Hydrate returns null for the parent → render a "this tweet is unavailable" placeholder so the child replies still make sense, rather than dropping the whole subtree.
+
+---
+
+## 17. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you pick availability over consistency — and where can't you?"
+
+The feed side of Twitter is deliberately **AP**: seeing *something* instantly beats seeing the *absolute freshest* thing. A few interactions (money-adjacent or privacy-sensitive) want stronger guarantees.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Home timeline / feed reads** | **AP** (available + eventual) | A friend's tweet arriving a second late is fine; an error page is not. Fan-out is async by design. |
+| **Post a tweet** | **AP** (accept fast, fan out later) | Return "posted!" immediately; followers converge over the next moment. |
+| **Likes / retweet counts** | **AP** (eventually consistent counters) | A count that's off by a few for a second is invisible to users; use approximate/rolled-up counters at scale. |
+| **Follow / unfollow** | **Read-your-writes** for the actor | *You* must see your own follow take effect immediately; others can see it propagate eventually. |
+| **DMs / direct messages** (if in scope) | **Stronger / ordered** | Messages must not drop or reorder within a conversation — closer to a durable, ordered log than a best-effort feed. |
+| **Blocking** (if in scope) | **Stronger (safety-critical)** | A block must take effect reliably and promptly — a stale "not blocked" is a real harm, not a cosmetic lag. |
+
+> One-liner: **"AP for the feed and social counters; read-your-writes for your own actions; stronger, ordered consistency only for DMs and safety-critical blocks."**
+
+---
+
+## 18. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5.
+
+1. **Clarify requirements** (functional + NFRs; call out read-heavy ~100:1 and "eventual is fine") — §2
+2. **Estimate scale** (write amplification: 1 tweet → N follower writes; celebrity 50M) — §3
+3. **Define APIs** (post, home, user timeline, follow, thread) — §11
+4. **High-level architecture + data model** (CQRS write/read split, Kafka in the middle) — §4, §10
+5. **Deep dive: the hard part → feed fan-out** — §5–§7
+6. **Ranking, search, trending** — §8, §9
+7. **Edge cases + scale/failure** (celebrity, cache miss, deletes, backpressure) — §13, §14
+8. **Summarize tradeoffs** — §17, §15
+
+> 🎤 **Spend ~60% of the interview on fan-out.** The interviewer is testing whether you reach for **push vs pull vs hybrid** and handle the **celebrity / hot-key** problem. State the crux early ("pure push dies on celebrities, pure pull is slow on every read → hybrid"), then justify the celebrity threshold, backpressure, and capped timelines. Everything else (search, trending, ranking) is supporting detail.
+
+---
+
+## 19. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Strategy** | Fan-out (push/pull/hybrid), ranking (chrono/ML) | Swap per user type/experiment |
+| **Producer-Consumer** | Fan-out workers consume tweet events (Kafka) | Absorb + parallelize fan-out |
+| **Observer / Pub-Sub** | Tweet event → fan-out, search index, trending, notifications | Decouple |
+| **CQRS + Materialized View** | Precomputed timelines vs write model | Fast reads |
+| **Cache-Aside** | Tweet + timeline caches | Read performance |
+| **Repository** | Data access | Testable |
+| **Facade** | Timeline service over cache + pull + hydrate + rank | Simple API |
+| **Decorator** | Tweet rendering (badges, media, quoted) | Compose display |
+
+---
+
+## 20. Final Takeaways
 
 - **Read-heavy** → precompute timelines (CQRS); the core decision is **fan-out push vs pull → hybrid**.
 - **Hybrid** (push for normal, pull for celebrities/inactive) solves write amplification / hot-key.

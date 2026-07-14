@@ -20,10 +20,12 @@
 - [10. API Design](#10-api-design)
 - [11. Sequences](#11-sequences)
 - [12. Consistency & Edge Cases](#12-consistency--edge-cases)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Scaling & Failure](#14-scaling--failure)
-- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
-- [16. Final Takeaways](#16-final-takeaways)
+- [13. Scaling & Failure](#13-scaling--failure)
+- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
+- [15. Consistency & CAP Tradeoffs](#15-consistency--cap-tradeoffs)
+- [16. How to Drive the Interview (framework)](#16-how-to-drive-the-interview-framework)
+- [17. Design Patterns (that can be used)](#17-design-patterns-that-can-be-used)
+- [18. Final Takeaways](#18-final-takeaways)
 
 ---
 
@@ -57,28 +59,64 @@ The same subreddit ranked list is served to every visitor, so Reddit **precomput
 
 ## 2. Requirements
 
+> 💡 **Start here in the interview.** Clarify scope out loud and pin down that this is a **read-heavy, eventually-consistent** system — that single framing justifies almost every later decision (precompute + cache, async vote aggregation, shared hot lists).
+
 **Functional**
 - Create/join **subreddits**; create **posts** (text/link/image); **nested comments**.
 - **Upvote/downvote** posts and comments; score-based ranking.
 - Feeds: subreddit feed + personalized **home feed** (subscribed subs); sorts: hot/new/top/best.
 - Search; moderation; awards.
 
-**Non-functional**
-- **Read-heavy** (reads ≫ writes, ~100:1) → cache + precomputed feeds.
-- **Eventual consistency** fine (vote counts, feed freshness lag OK).
-- Scale to billions of votes/posts/comments.
+### Non-Functional (NFRs)
+
+| NFR | Target / Note |
+| --- | --- |
+| **Consistency** | **Eventual** for vote counts, scores, feed freshness (a few seconds of lag is fine). **Strong** only for "one vote per user per target" (the vote-write dedup). |
+| **Availability** | High — reads should almost never fail; serve stale cached feeds/counts rather than error. |
+| **Latency** | Feed read < 200ms (served from cache); vote/post writes feel instant (ack before aggregation). |
+| **Scale** | **Read-heavy**, reads ≫ writes (~100:1); billions of posts/comments/votes; huge subs (10M+ subscribers). |
+| **Durability** | Posts/comments/votes (source of truth) must never be lost; precomputed feeds are rebuildable and may be lossy. |
+
+### Out of scope (state assumptions)
+
+- Chat/DMs, ads & monetization, live video, awards economy, recommendation ML beyond ranking, spam-ML pipeline internals (mention, then defer).
 
 ---
 
 ## 3. Capacity Estimation
 
+> Numbers are illustrative — the point is to **show the method**, not be exact. Do the read/write/storage split out loud; each number should point at a design decision.
+
 ```
-DAU ~ 50M · reads:writes ~ 100:1
-Feed reads (peak) ~ 100k+/sec → MUST be cached/precomputed (never rebuilt per request)
-Votes ~ very high write volume → aggregate ASYNC; approximate cached counts
-Posts/comments grow forever → partition by time/subreddit + archive cold
-Storage: comments dominate (deep threads); shard by post_id
+Assume:
+  Daily active users (DAU)   ~ 50M
+  Feed opens per user/day    ~ 20      → 1B feed reads/day
+  Posts per user/day         ~ 0.02    → 1M posts/day
+  Comments per user/day      ~ 0.2     → 10M comments/day
+  Votes per user/day         ~ 10      → 500M votes/day
+
+Read QPS (feeds — the dominant path):
+  1B / 86,400s              ~ 11.5k reads/sec average
+  Peak (5–10x diurnal)      ~ 60k–120k reads/sec
+  → MUST be served from precomputed/cached feeds, never rebuilt per request
+
+Vote WRITE QPS (the firehose):
+  500M / 86,400s            ~ 5,800 votes/sec average
+  Peak (viral post / event) ~ 30k–60k votes/sec on hot targets
+  → aggregate ASYNC (Kafka → counter workers); NEVER recount on read
+
+Post / comment write QPS:
+  (1M + 10M) / 86,400s      ~ 130 writes/sec average (tiny vs reads)
+  → the write ledger is cheap; the hard part is the READ fan-out + vote volume
+
+Storage (rough, 5-year horizon):
+  Post row      ~ 1 KB  → 1M/day * 365 * 5 * 1KB   ~ 1.8 TB
+  Comment row   ~ 0.5KB → 10M/day * 365 * 5 * 0.5KB ~ 9 TB   (comments dominate)
+  Vote row      ~ 40 B  → 500M/day * 365 * 5 * 40B  ~ 36 TB  (largest by count)
+  → partition posts/comments by subreddit/time, shard votes by target, archive cold
 ```
+
+**Takeaways that drive design:** read-heavy (~100:1) → **precompute + cache feeds**; the vote firehose (tens of thousands/sec on hot targets) → **async delta aggregation**, never a read-time recount; **comments and votes dominate storage** → partition/shard by `subreddit`/`time`/`post_id`/`target` and archive cold content.
 
 ---
 
@@ -113,14 +151,15 @@ Rather than one giant program, each service has one job, and they communicate th
 
 **Kafka = the shared event log.** When something happens ("a vote was cast", "a post was created"), the service that did it **publishes an event** to Kafka and immediately moves on. Other services (aggregators, ranking jobs, search indexers) consume those events **later, at their own pace.** Nobody waits on anybody.
 
-#### Q: What is CQRS and why split "read" from "write"?
+> 💡 **Why Kafka here:** it's a durable, replayable log that **decouples the write from the downstream work**. The vote firehose (§3) is absorbed by consumers reading at their own pace, and if the aggregator falls behind or crashes, events aren't lost — it just catches up. (See [Apache Kafka](../concepts/kafka.md).)
 
-CQRS = **Command Query Responsibility Segregation** — a fancy way of saying **"the path for changing data is separate from the path for reading data."**
+### CQRS: why the read path looks nothing like the write path
 
-- **Write path (Command):** you cast a vote / make a post. Goes to the "source of truth" databases. Careful, correct, but not built for millions of readers.
-- **Read path (Query):** you scroll your feed. Served from **precomputed, cached lists** (Redis), never by re-querying and re-ranking the raw tables.
+CQRS = **Command Query Responsibility Segregation** — a fancy way of saying **"the path for changing data is separate from the path for reading data."** The **write path (Command)** is what runs when you cast a vote or make a post: it goes to the "source of truth" databases, careful and correct, but not built for millions of readers. The **read path (Query)** is what runs when you scroll your feed: it's served from **precomputed, cached lists** (Redis), never by re-querying and re-ranking the raw tables.
 
-The write side stores the raw source-of-truth data; the read side serves precomputed results built from it. Reads never touch the write-side tables directly. The ranking job rebuilds the read-side lists on a schedule — see §6.
+> 💡 **CQRS in one line:** the read model is a *rebuildable projection* of the write model. Because reads never touch the write tables, you can scale, shape, and cache them independently — and a lost cache is just rebuilt from the source of truth.
+
+In other words, the write side stores the raw source-of-truth data; the read side serves precomputed results built from it. Reads never touch the write-side tables directly. The ranking job rebuilds the read-side lists on a schedule — see §6.
 
 ---
 
@@ -172,16 +211,13 @@ List<PostId> buildHomeFeed(long userId) {
 }
 ```
 
+> 💡 **Why a Redis sorted set backs `feed:sub:{id}:hot`:** a **sorted set** keeps members automatically ordered by a score (here `hot_rank`), so "give me the top 100 posts" is a single O(log N) range read (`ZREVRANGE`) instead of sorting the whole subreddit per request. The ranking job just re-scores members; readers always see a pre-ordered list.
+
 #### Q: Isn't a huge subreddit (30M subs) the same "celebrity problem" as Twitter?
 
 **No — and that's the whole point.** On Twitter, a celebrity's tweet must fan out to each follower's *personal* timeline (millions of writes) because every timeline is different. On Reddit, `r/soccer`'s hot list is **one shared list**; growing from 3M to 30M subscribers doesn't add any extra ranking work — it's still computed **once**. More subscribers just means more *readers of the same cached list* (and reads are cheap). Write-amplification vanishes.
 
-#### Q: Why "hybrid"? Which part is push and which is pull?
-
-- **Push-ish:** each subreddit's hot list is **precomputed** (pushed into Redis by a background job) — so it's ready before you ask.
-- **Pull-ish:** your **home feed** is **merged on read** from those cached lists (then cached briefly).
-
-You get fast reads (the heavy ranking is already done per sub) without the insane per-user write fan-out. Best of both.
+So which part of this is "push" and which is "pull"? It's **push-ish** on the way in: each subreddit's hot list is **precomputed** (pushed into Redis by a background job), so it's ready before anyone asks. It's **pull-ish** on the way out: your **home feed** is **merged on read** from those cached lists (then cached briefly). You get fast reads (the heavy ranking is already done per sub) without the insane per-user write fan-out — best of both.
 
 ---
 
@@ -209,6 +245,8 @@ hot = log10(max(|ups − downs|, 1)) × sign(ups − downs) + (epoch_seconds −
 | **Best (comments)** | **Wilson score** lower bound — fair for items with few votes |
 
 - **Wilson score** (for comments): the lower bound of a confidence interval on the upvote ratio → a comment with 5/5 upvotes doesn't outrank 900/1000 (accounts for sample size). Better than raw `ups − downs` or ratio.
+
+> 💡 **Wilson score = "confidence-adjusted approval."** Raw ratio over-trusts tiny samples (5/5 = "100%"); raw `ups − downs` over-trusts high-traffic items. Wilson asks *"what's the pessimistic-but-fair approval given this many votes?"* — humble when data is thin, confident when it's plenty. That's why it's the "Best" comment sort.
 
 ### Decoding the "hot" formula
 
@@ -255,18 +293,9 @@ double hot(long ups, long downs, Instant createdAt) {
 
 - **Why additive (not multiplied)?** Because time is just *added on*, a post's hot score only ever goes **up** as time passes (ignoring vote changes) — it never needs re-sorting relative to older posts. This makes the sorted list **stable and cache-friendly** (§5).
 
-#### Q: "Top" vs "Hot" vs "Best" — when do I use which?
-
-| Sort | Plain meaning |
-| --- | --- |
-| **Hot** | popular *right now* (votes + freshness) |
-| **New** | newest first, ignore votes |
-| **Top** | most votes in a time window (day/week/all) |
-| **Best** (comments) | high approval, *adjusted for how few votes it has* (5/5 from 3 people shouldn't beat 4.6/5 from 10,000) |
-
 #### Q: What is the "Wilson score" for comments, in plain terms?
 
-Raw ratio is misleading with few votes. A comment with **5 upvotes, 0 downvotes** is "100% liked" — but that's only 5 people. A comment with **900 up, 100 down** ("90%") is clearly more trustworthy. The **Wilson score** asks: *"given this sample size, what's the pessimistic-but-fair estimate of the true approval?"* Few votes → it stays humble (pulls the score down); many votes → it trusts the ratio.
+Raw ratio is misleading with few votes. A comment with **5 upvotes, 0 downvotes** is "100% liked" — but that's only 5 people. A comment with **900 up, 100 down** ("90%") is clearly more trustworthy. The **Wilson score** asks: *"given this sample size, what's the pessimistic-but-fair estimate of the true approval?"* Few votes → it stays humble (pulls the score down); many votes → it trusts the ratio. This is also what makes "Best" different from "Top": Best is approval *adjusted for how few votes it has* — a comment with 5/5 shouldn't beat one at 4.6/5 from 10,000 voters, and the raw ratio alone can't tell the difference.
 
 ```java
 // Wilson lower bound — "confidence-adjusted upvote ratio". Higher = better.
@@ -353,17 +382,29 @@ long displayScore(long targetId) {
 }
 ```
 
-#### Q: "Adjust by delta" — why not just recompute the total?
-
-Because recomputing means counting millions of rows again. **Delta = only the change caused by THIS vote.** A new upvote is `+1`; flipping your upvote to a downvote is `-2` (you remove one up *and* add one down). We only ever *nudge* the running counter by the delta, never re-tally all votes.
+Notice the aggregator never recomputes the total from scratch — recomputing would mean counting millions of rows again. **Delta = only the change caused by THIS vote.** A new upvote is `+1`; flipping your upvote to a downvote is `-2` (you remove one up *and* add one down). We only ever *nudge* the running counter by the delta, never re-tally all votes. And nothing stops a determined user from clicking upvote repeatedly, because they can't — the `PRIMARY KEY (user_id, target_type, target_id)` is **one row per (person, thing)**; voting again just **overwrites that one row** (an upsert), it never inserts a second. So your influence on any post is capped at exactly one vote, whatever you click.
 
 #### Q: Isn't the displayed count now slightly wrong / delayed?
 
 Yes — and **that's acceptable here** (it's not money). The background worker might be a few seconds behind, so a count could read 4,981 when it's "really" 4,987. Nobody cares if a Reddit score is off by a handful for a moment (**eventual consistency**). Reddit even *deliberately* fuzzes displayed counts (**vote fuzzing**) to confuse manipulation bots — so exactness was never the goal. Contrast this with ad-click *billing*, which must reconcile to the exact number.
 
-#### Q: What stops me from upvoting the same post 1000 times?
+### Moderation & anti-brigading
 
-The `PRIMARY KEY (user_id, target_type, target_id)` — **one row per (person, thing).** Voting again just **overwrites your one row** (an upsert), it never inserts a second. So your influence on any post is capped at exactly one vote, whatever you click.
+**Brigading** = a coordinated mob (or a bot farm) piling votes onto a target to artificially rocket it up or bury it. Because ranking is driven by vote counts, manipulation directly attacks the product. Defenses layer up, cheapest first:
+
+| Layer | Defense | What it stops |
+| --- | --- | --- |
+| **Write gate** | Rate-limit votes per user/IP; account-age/karma minimums; CAPTCHA on suspicious sessions | Trivial bot spam and fresh throwaway accounts |
+| **Signal obfuscation** | **Vote fuzzing** — displayed counts are slightly randomized | Bots can't tell if their votes "landed," breaking their feedback loop |
+| **Detection (async)** | Anomaly jobs on the `VOTE_CAST` stream — velocity spikes, correlated voter clusters, off-site referral bursts | Organized brigades and vote rings |
+| **Moderation actions** | Remove/lock/quarantine content; shadow-remove; **tombstone** deleted nodes (`[deleted]`, keep tree — §8) | Rule-breaking content while preserving thread structure |
+| **Ranking dampening** | Discount suspicious votes from `hot_rank`; "controversial" sort surfaces high up+down churn | Manipulated posts silently sinking without alerting the attacker |
+
+Moderation runs **off the hot path**: the Moderation Service consumes Kafka events and writes to a `moderation` table (§9), so it never slows down votes or reads. Because vote aggregation is already async, throwing out flagged votes is just *another consumer* adjusting the same counters by a negative delta.
+
+#### Q: How does vote fuzzing actually deter brigading without ruining the real counts?
+
+Fuzzing adds small, deterministic-per-viewer noise to the **displayed** count while the **true** count is kept internally for ranking. A manipulation bot upvotes and then re-reads the score to check whether its vote "worked" — with fuzzing, the number it sees jitters, so it can't confirm its influence or calibrate how many more sock-puppets to throw in. The real ranking still uses the true (or anomaly-filtered) totals, so honest users see roughly-correct scores and the sort order stays sane. It works precisely *because* exactness was never a requirement here (§7) — we already accept approximate counts, so hiding the exact number costs us nothing but costs the attacker their feedback loop. It's a deterrent, not a wall: it pairs with rate limits and anomaly detection, which do the actual removal.
 
 ---
 
@@ -376,6 +417,8 @@ Comments form a **tree** (replies to replies, arbitrarily deep). Storage options
 | **Adjacency list** (`parent_id`) | Each row points to its parent | Simple; fetching a subtree needs recursion/CTE (N queries or a recursive query) |
 | **Materialized path** (`path='1/5/9'`) ✅ | Store the full path from root | Fetch a whole subtree by **prefix match** (`WHERE path LIKE '1/5/%'`); easy ordering; path can get long |
 | **Closure table** | Row per ancestor-descendant pair | Flexible ancestor/descendant queries; more storage/writes |
+
+> ⚠️ **Materialized-path pitfall:** the `path` string grows with depth and **moving a comment means rewriting every descendant's `path`** — fine for Reddit (comments rarely move) but a real cost if your tree is frequently re-parented. Also index the `path` (and cap displayed depth) or deep-thread prefix scans get slow.
 
 - **Load pattern:** fetch top-level comments + a few levels ranked by **best**; **lazy-load** deeper threads ("load more replies") — never load a 10k-comment tree at once.
 - **Rank siblings** by best/top/new (Wilson for best).
@@ -443,7 +486,7 @@ List<Comment> loadSubtree(long postId, String rootPath) {
 }
 ```
 
-#### Q: Why "lazy-load" — why not just fetch the whole tree?
+### Why "lazy-load" instead of fetching the whole tree
 
 A popular post can have **50,000 comments** nested 20 levels deep. Loading and rendering all of it would be huge and slow, and you'd never read most of it. So Reddit loads only the **top-level comments + a couple levels**, each collapsed with a **"load more replies (137)"** button. You fetch deeper branches **only when a user clicks**, instead of loading the entire tree upfront.
 
@@ -461,14 +504,26 @@ List<Comment> loadMore(long postId, String parentPath) {  // parentPath = "1/5"
 }
 ```
 
-#### Q: How are sibling comments ordered, and what happens when one is deleted?
+### Ordering siblings, and what happens on delete
 
-- **Siblings** (comments at the same level) are ranked by **best** (Wilson score, §6), or top/new if you switch sorts.
-- **Deleting** a comment that has replies uses a **tombstone**: the body becomes `[deleted]` but the **row (and its `path`) stays**, so the replies underneath don't become orphans and the tree structure survives.
+**Siblings** (comments at the same level) are ranked by **best** (Wilson score, §6), or top/new if you switch sorts. **Deleting** a comment that has replies uses a **tombstone**: the body becomes `[deleted]` but the **row (and its `path`) stays**, so the replies underneath don't become orphans and the tree structure survives.
 
 ---
 
 ## 9. Data Model (all tables)
+
+### Database & storage choices (which DB, and why at scale)
+
+No single database is best for every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question is *"does this need transactional correctness (votes, one-per-user), or is it a hot, disposable ranking of that data (feeds, scores)?"*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Users, subreddits, posts, votes (**source of truth**) | **RDBMS**, sharded/partitioned by `subreddit_id` or time | `votes` PK `(user, target_type, target_id)` gives "one vote per user per target" for free via a unique constraint — an eventually-consistent store would need hand-rolled dedup. Posts partitioned by subreddit or time keep hot communities' data together and let cold content be archived cheaply. | A NoSQL store loses the atomic uniqueness guarantee on votes and the transactional counter updates (§7) that make re-voting a safe delta, not a race. |
+| Comment trees at extreme depth/scale | **Cassandra** (optional beyond RDBMS ceiling) | Deep threads (millions of comments per hot post) are write-heavy and append-mostly — Cassandra's LSM engine and wide-column model absorb that volume once a single sharded RDBMS can't, while the materialized `path` column keeps subtree reads (`WHERE path LIKE 'prefix%'`) working the same way. | Reaching for Cassandra by default gives up the relational `votes`/comment referential checks for scale you may not need yet — only adopt it once comment write throughput, not correctness, is the bottleneck. |
+| Precomputed hot/new feeds, cached vote scores | **Redis** (sorted sets) | `feed:sub:{id}:hot` as a sorted set keeps posts pre-ordered by `hot_rank`, so "top 100" is one range read instead of a per-request sort over the whole subreddit — computed **once per subreddit**, shared by everyone (§13), not per-user. | Recomputing `hot_rank` from `votes`/`posts` on every page load doesn't scale to Reddit's read volume; the feed is a rebuildable read model, safe to keep in a lossy cache. |
+| Search | **Elasticsearch** | Full-text search over posts/comments needs an inverted index. | RDBMS text scans don't rank or tokenize well across millions of posts. |
+
+**Why RDBMS wins for the vote/post ledger, and how it scales:** votes and posts need exact-once semantics (no double vote, correct delta on re-vote) that only a transactional store gives cheaply — and per-post write volume, even on a viral post, is a bounded stream an aggregator can absorb asynchronously (§11) rather than needing raw NoSQL write throughput. We partition posts/comments **by subreddit or time** (comments additionally shard by `post_id` since deep threads dominate storage) so a hot subreddit's data stays co-located and cold subreddits archive independently; votes shard by target so aggregation workers process one post/comment's vote stream on one shard. The read/write split is stark: writes (votes) go through Kafka to an async aggregator, while reads never touch the RDBMS at all — they hit the cached `feed:sub:{id}:hot` / `score:{id}` in Redis, rebuilt from the RDBMS if ever lost. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 CREATE TABLE users ( user_id BIGINT PRIMARY KEY, username VARCHAR(50) UNIQUE, karma BIGINT DEFAULT 0, created_at TIMESTAMP );
@@ -528,22 +583,9 @@ Yes — it's **deliberate denormalization.** In a "pure" design you'd derive the
 
 > Trade-off: the stored `score` can briefly disagree with a fresh recount of `votes` (eventual consistency) — acceptable, since exact vote counts don't matter here.
 
-#### Q: What are those `CREATE INDEX` lines actually doing?
+The `CREATE INDEX` lines earlier are what make those precomputed columns actually pay off on read. `CREATE INDEX idx_posts_sub_hot ON posts(subreddit_id, hot_rank DESC)` keeps rows pre-sorted so the DB can jump straight to them instead of scanning everything — it keeps each subreddit's posts **pre-sorted by `hot_rank`**, so "give me r/soccer's hottest posts" is an instant top-N read, not a sort-the-whole-sub operation. The `idx_comments_post_path` index does the same for the "fetch subtree by path prefix" query in §8.
 
-```sql
-CREATE INDEX idx_posts_sub_hot ON posts(subreddit_id, hot_rank DESC);
-```
-
-An index keeps rows pre-sorted so the DB can jump straight to them instead of scanning everything. This one keeps each subreddit's posts **pre-sorted by `hot_rank`**, so "give me r/soccer's hottest posts" is an instant top-N read, not a sort-the-whole-sub operation. The `idx_comments_post_path` index does the same for the "fetch subtree by path prefix" query in §8.
-
-#### Q: Why is some data in SQL but feeds/scores live in Redis?
-
-Different tools for different jobs:
-
-- **SQL (source of truth):** durable, correct, the real record of posts/comments/votes.
-- **Redis (fast serving layer):** the precomputed feeds (`feed:sub:{id}:hot` as a **sorted set**) and cached `score:{id}`. It's a fast serving layer (§4) — rebuilt from SQL if lost, so it can be fast and slightly lossy.
-
-A Redis **sorted set** is perfect for a hot list: it keeps ids automatically ordered by a score (the `hot_rank`), so "top 100 posts" is a single fast range read.
+And why is some data in SQL while feeds/scores live in Redis? Different tools for different jobs. **SQL (source of truth)** is durable, correct, the real record of posts/comments/votes. **Redis (fast serving layer)** holds the precomputed feeds (`feed:sub:{id}:hot` as a **sorted set**) and cached `score:{id}` — a fast serving layer (§4) rebuilt from SQL if lost, so it can be fast and slightly lossy. A Redis **sorted set** is perfect for a hot list: it keeps ids automatically ordered by a score (the `hot_rank`), so "top 100 posts" is a single fast range read.
 
 ---
 
@@ -559,6 +601,21 @@ GET  /v1/comments/{id}/replies?cursor=            # "load more replies" (lazy)
 POST /v1/vote                 { targetType, targetId, value }
 POST /v1/subreddits/{id}/subscribe
 ```
+
+### From button to backend
+
+Tie each user action to the endpoint it hits and what happens behind it — note that the read paths are pure cache hits and the writes return **before** aggregation finishes:
+
+| User action (button) | API call | What the backend does |
+| --- | --- | --- |
+| Open home feed | `GET /v1/home?sort=hot` | Read cached `feed:home:{userId}`; on miss, merge subscribed subs' cached hot lists (§5) — no ranking on the request |
+| Open a subreddit | `GET /v1/r/{sub}/posts?sort=hot` | Range-read the `feed:sub:{id}:hot` sorted set (§5) — no per-request sort |
+| Open a post's comments | `GET /v1/posts/{id}/comments?sort=best` | Fetch shallow comments by `path` prefix, ranked by Wilson (§8); deep threads collapsed |
+| Click "load more replies" | `GET /v1/comments/{id}/replies` | Lazy subtree fetch by `path LIKE 'prefix/%'` (§8) |
+| Submit a post | `POST /v1/r/{sub}/posts` | Insert into `posts` (source of truth) → emit `POST_CREATED` to Kafka → ranking/search pick it up async |
+| Add a comment | `POST /v1/posts/{id}/comments` | Insert with materialized `path` → emit `COMMENT_CREATED`; comment counter bumped async |
+| Click ▲ / ▼ (vote) | `POST /v1/vote` | Upsert one `votes` row (dedup) → emit `VOTE_CAST` with the **delta** → return immediately; counters/hot_rank update async (§7) |
+| Join a subreddit | `POST /v1/subreddits/{id}/subscribe` | Insert into `subscriptions`; changes which subs the home-feed merge reads (§5) |
 
 ---
 
@@ -597,22 +654,7 @@ User → FeedSvc:
 
 ---
 
-## 13. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Strategy** | Ranking (hot/top/best/new), feed generation (push/pull/hybrid) | Swap algorithms |
-| **Composite** | Nested comment tree | Uniform tree ops |
-| **Observer / Pub-Sub** | Vote/post/comment events → counters, feeds, search | Decouple write from aggregation |
-| **CQRS + Materialized View** | Precomputed feeds/counters vs write model | Fast reads, avoid recompute |
-| **Producer-Consumer** | Async vote aggregation via Kafka | Absorb the vote firehose |
-| **Repository** | Data access | Testable |
-| **Decorator** | Post rendering (awards, flair, NSFW) | Compose display |
-| **Facade** | Feed service over sub lists + rank + cache | Simple API |
-
----
-
-## 14. Scaling & Failure
+## 13. Scaling & Failure
 
 - **Read path** = cache/precomputed feeds (Redis); DB rarely hit for feed reads.
 - **Vote firehose** → Kafka → async counter aggregation; approximate cached counts.
@@ -632,16 +674,7 @@ Caching = **keep the answer close and pre-made so you don't redo work.** In this
 | `feed:home:{userId}` | your merged home feed (short TTL) | re-merging your subs on every scroll |
 | `score:{targetId}` | a post/comment's current score | counting millions of `votes` rows |
 
-Most reads hit a pre-made cached result instantly; the database (the expensive recompute) only runs on a schedule in the background.
-
-#### Q: If feeds are cached, how do new posts/votes ever show up?
-
-Two mechanisms refresh the pre-made answers:
-
-1. **TTL (time-to-live):** the home feed cache expires after a few minutes, so it gets rebuilt periodically with fresh data. A little staleness is fine.
-2. **Background ranking jobs:** every interval, a job recomputes each sub's `hot_rank` from the latest counters and **overwrites** `feed:sub:{id}:hot`. So new/rising posts flow into the cached lists on the next cycle.
-
-You accept that a brand-new post or a just-cast vote might take a few seconds to a minute to appear — **eventual consistency**, the deliberate trade for a read path that scales.
+Most reads hit a pre-made cached result instantly; the database (the expensive recompute) only runs on a schedule in the background. So how do new posts and votes ever show up if feeds are cached? Two mechanisms refresh the pre-made answers. **TTL (time-to-live):** the home feed cache expires after a few minutes, so it gets rebuilt periodically with fresh data — a little staleness is fine. **Background ranking jobs:** every interval, a job recomputes each sub's `hot_rank` from the latest counters and **overwrites** `feed:sub:{id}:hot`, so new/rising posts flow into the cached lists on the next cycle. You accept that a brand-new post or a just-cast vote might take a few seconds to a minute to appear — **eventual consistency**, the deliberate trade for a read path that scales.
 
 #### Q: What if a super-popular post causes a "cache miss stampede"?
 
@@ -649,7 +682,7 @@ If a hot cached value expires and 10,000 readers hit it at the same instant, the
 
 ---
 
-## 15. Interview Cheat Sheet
+## 14. Interview Cheat Sheet
 
 > **"How do you build the home feed?"**
 > "Precompute a **shared per-subreddit hot list** (computed once, not fanned out to each subscriber), then **merge** the user's subscribed subs' cached lists into a home feed and cache it (hybrid). This avoids the huge-sub write-amplification problem — a 30M-subscriber sub is ranked once."
@@ -663,9 +696,71 @@ If a hot cached value expires and 10,000 readers hit it at the same instant, the
 > **"How are nested comments stored?"**
 > "Materialized path (`'1/5/9'`) → fetch a subtree by prefix, lazy-load deeper replies, rank siblings by best (Wilson). Adjacency list is simpler but needs recursive queries."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Vote-count stampede** (viral post, 10k readers hit an expired `score:{id}`) | Reads serve the cached counter; keep hot scores warm + single-flight rebuild so the DB isn't recounted per view (§13). Counts are approximate anyway. |
+| **Celebrity post / huge-sub fan-out** (`r/soccer` at 30M subscribers) | **No per-user fan-out** — the sub's hot list is computed **once** and shared; more subscribers = more readers of the *same* cached list, not more writes (§5). |
+| **Comment tree hot path** (50k comments, 20 levels deep) | Load top-level + a couple levels by `path` prefix ranked by best; **lazy "load more replies"** on click; never fetch the whole tree (§8). |
+| **Stale hot rank** (new/rising post not showing yet) | Accept it — ranking is a periodic job + short feed TTL; a post surfaces on the next cycle (**eventual consistency**, §13). Tighten the interval if freshness matters more. |
+| **Re-vote / double-click** (user flips ▲ → ▼, or clicks twice) | `PRIMARY KEY (user, target_type, target_id)` upsert → one row per person; adjust counters by the **delta** (`+1`, `-2`, or `0`), never a recount (§7). |
+| **Brigading spike** (coordinated vote mob) | Rate limits + account-age gates + **vote fuzzing** + async anomaly detection discounting suspicious votes (§7 moderation). |
+
 ---
 
-## 16. Final Takeaways
+## 15. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Reddit's answer is mostly **AP**, with **one small CP island**.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Vote write — "one vote per user per target"** | **CP** (strong) | The `votes` PK `(user, target_type, target_id)` must atomically dedup/flip a vote. This single row is the only place correctness matters. |
+| **Vote counts / scores** | **AP** (eventual) | Aggregated async by delta; a count off by a few for a few seconds is fine (and deliberately fuzzed anyway). |
+| **`hot_rank` / feeds** | **AP** (eventual) | Precomputed periodically + cached with TTL; a slightly stale ranking is acceptable — reads must never fail. |
+| **Comment counts, karma, member counts** | **AP** (eventual) | Denormalized counters updated off the write path. |
+| **Search index** | **AP** (eventual) | Elasticsearch is a read model rebuilt from the source of truth via events. |
+
+- The **write ledger** (posts/comments/votes) is a durable, transactional source of truth; the **read models** (feeds, counters, search) are rebuildable projections that favor availability.
+- The only strong-consistency requirement is the **vote uniqueness constraint** — everything a reader sees is allowed to lag.
+
+> One-liner: **"CP on the one-vote-per-user write, AP (eventual) on every count, rank, and feed a reader sees."** Contrast BookMyShow, where the *inventory write* is CP because double-booking is unacceptable — here nothing a user reads needs to be exact.
+
+---
+
+## 16. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–7.
+
+1. **Clarify requirements** (functional + NFRs, read-heavy framing) — §2
+2. **Estimate scale** (read QPS ≫ vote write QPS; storage) — §3
+3. **Define APIs** (feeds, comments, vote) — §10
+4. **High-level architecture + data model** — §4, §9
+5. **Deep dive: the hard part** → **feed generation + ranking** — §5, §6
+6. **Deep dive: vote volume + nested comments** — §7, §8
+7. **Address consistency, scale, failure, abuse** — §12, §13, §15, §7 (moderation)
+8. **Summarize tradeoffs** — §15, §14
+
+> 🎤 **Lead with the core insight:** a subreddit's hot list is **the same for every viewer**, so unlike Twitter you compute it **once and share it** — no per-user write fan-out even for a 30M-subscriber sub. State that up front, then show how ranking, voting, and comments all hang off the "precompute once, cache, never recompute on read" idea. That framing is what separates a senior answer from "I'd just query and sort."
+
+---
+
+## 17. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Strategy** | Ranking (hot/top/best/new), feed generation (push/pull/hybrid) | Swap algorithms |
+| **Composite** | Nested comment tree | Uniform tree ops |
+| **Observer / Pub-Sub** | Vote/post/comment events → counters, feeds, search | Decouple write from aggregation |
+| **CQRS + Materialized View** | Precomputed feeds/counters vs write model | Fast reads, avoid recompute |
+| **Producer-Consumer** | Async vote aggregation via Kafka | Absorb the vote firehose |
+| **Repository** | Data access | Testable |
+| **Decorator** | Post rendering (awards, flair, NSFW) | Compose display |
+| **Facade** | Feed service over sub lists + rank + cache | Simple API |
+
+---
+
+## 18. Final Takeaways
 
 - **Read-heavy** → precomputed, cached feeds; DB rarely touched on reads (**CQRS + materialized views**).
 - **Shared per-subreddit hot lists** (computed once) + merged home feed = no huge-sub write amplification.

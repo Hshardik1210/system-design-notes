@@ -20,10 +20,13 @@
 - [10. API Design](#10-api-design)
 - [11. Sequences](#11-sequences)
 - [12. Consistency & Correctness](#12-consistency--correctness)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Scaling & Failure](#14-scaling--failure)
-- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
-- [16. Final Takeaways](#16-final-takeaways)
+- [13. Scaling & Failure](#13-scaling--failure)
+- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
+- [15. Consistency & CAP Tradeoffs](#15-consistency--cap-tradeoffs)
+- [16. Reliability & Observability](#16-reliability--observability)
+- [17. How to Drive the Interview (framework)](#17-how-to-drive-the-interview-framework)
+- [18. Design Patterns (that can be used)](#18-design-patterns-that-can-be-used)
+- [19. Final Takeaways](#19-final-takeaways)
 
 ---
 
@@ -88,6 +91,14 @@ Why this melts at scale:
 - **Scalable** — millions of scheduled jobs; **spiky** fire rate (many jobs at midnight/round hours).
 - **Timely** — fire within acceptable delay; **fault-tolerant** to node crashes; **multi-tenant** isolation.
 
+### Out of scope (mention, then defer)
+
+State these out loud so the interviewer knows you see them, then park them to stay focused on the core "fire reliably at scale."
+
+- **Job priority** — a `priority` column so urgent jobs jump ahead of the herd. Real answer: a **priority queue** (or weighted/multi-lane dispatch topics) so high-priority jobs drain first. Mention it, defer unless asked.
+- **Job dependencies / DAGs** — "run **B** only after **A** succeeds" (Airflow-style workflows). That's a **workflow orchestrator layered on top** of this scheduler: store parent→child edges, and when A's `job_run` records SUCCESS, enqueue B. The core scheduler here fires *independent* jobs; DAG scheduling is a separate concern — mention, then defer.
+- Dynamic per-tenant quotas, historical backfills, and an admin UI.
+
 ---
 
 ## 3. Capacity Estimation
@@ -99,7 +110,40 @@ Storage: jobs + job_runs (history) → partition by time; archive old runs
 Downstream: firing 10M jobs at once can overwhelm targets → rate-limit + jitter the schedule
 ```
 
+> Numbers are illustrative — the point is to **show the method** (find the burst, size the poller, size the worker pool), not to be exact.
+
+### Worked back-of-envelope
+
+```
+Assume:
+  Scheduled jobs (total)      ~ 100M rows in the jobs table
+  Avg steady fire rate        ~ 1,000 jobs/sec  (spread across the day)
+  Midnight herd               ~ 10M jobs all armed for 00:00
+
+Fire rate at the herd (the number that drives everything):
+  Naive: 10M all "due" in the same 1s tick → 10M jobs/sec spike 💥
+  With jitter over a 10-min window: 10M / 600s ~ 16,600 jobs/sec  ← design target
+  → jitter turns an impossible instantaneous spike into a steady, drainable rate
+
+Poller batch size (per tick):
+  Poll every 1s, target 16,600 jobs/sec ÷ (pollers) 
+  1 poller @ LIMIT 1,000/tick  → 1,000 jobs/sec  (too slow for the herd)
+  → run ~20 shards, each claiming a LIMIT 1,000 batch/sec ~ 20,000 jobs/sec (covers it)
+  Batch (not row-by-row) claims: one round trip pulls N rows, not N round trips
+
+Worker pool sizing (Little's Law):
+  workers ~ arrival_rate × avg_job_duration
+  16,600 jobs/sec × 0.2s/job  ~ 3,300 concurrent slots
+  → e.g. 330 workers × 10 threads; scale out by adding workers on the same queue
+
+Storage:
+  jobs row ~ 300B → 100M × 300B ~ 30 GB (fits one primary; partial index keeps it fast)
+  job_runs grows per execution → partition by time + archive/TTL old runs
+```
+
 > The classic pain is the **midnight thundering herd** (everyone schedules "daily at 00:00"). Add **jitter** to scheduled times + rate-limit dispatch so the burst doesn't melt downstream.
+
+> ⚠️ **Pitfall:** sizing the worker pool for the *average* (1,000/sec) means the midnight herd backs up for minutes. Size the **poller + queue + workers** for the post-jitter peak (~16,600/sec here), and let the queue absorb the rest — never the workers directly.
 
 ---
 
@@ -181,17 +225,9 @@ void workerLoop() {
 }
 ```
 
-#### Q: Why put a queue in the middle? Can't the scheduler just call the worker directly?
+Why not have the scheduler just call the worker directly, and skip the queue? Because a queue **decouples timing from doing** and gives three things for free. **Bursts get absorbed** — 10M jobs fire at midnight, the scheduler dumps 10M tickets on the queue, and the workers drain them at their own pace; without a queue, that spike would hammer the workers all at once. **Workers scale independently** — too much work? Add more workers reading the same queue; the scheduler doesn't change. And **retries survive** — if a worker crashes mid-job, the ticket can go back on the queue (or the lease expires — see §6) and another worker retries it.
 
-A queue **decouples timing from doing** and gives three things for free:
-
-- **Bursts get absorbed.** 10M jobs fire at midnight → the scheduler dumps 10M tickets on the queue and the workers drain them at their own pace. Without a queue, that spike would hammer the workers all at once.
-- **Workers scale independently.** Too much work? Add more workers reading the same queue. The scheduler doesn't change.
-- **Retries survive.** If a worker crashes mid-job, the ticket can go back on the queue (or the lease expires — see §6) and another worker retries it.
-
-#### Q: Isn't the scheduler a single point of failure?
-
-It would be if there were only one — so in production you run several, but you make sure they don't **both fire the same job**. Two ways (both in §6): **leader election** (only one scheduler is "active" at a time; others stand by) or **sharding** (each scheduler owns a slice of jobs, e.g. by hash of `job_id`, so their work never overlaps).
+That raises an obvious worry: isn't the scheduler itself a single point of failure? It would be if there were only one — so in production you run several, but you make sure they don't **both fire the same job**. Two ways, both covered in §6: **leader election** (only one scheduler is "active" at a time; others stand by) or **sharding** (each scheduler owns a slice of jobs, e.g. by hash of `job_id`, so their work never overlaps).
 
 ---
 
@@ -256,6 +292,16 @@ public void tick() {
 - **Poll interval = your minimum precision.** Poll every 1s → a job can fire up to ~1s late. That's usually fine.
 - **Downside:** at huge scale, hammering the DB every second is load. That's what the next options relieve.
 
+> **"If `@Scheduled` fires every second, why do I even need the `jobs` table / a scheduler service?"**
+> Because `@Scheduled` and the table solve *different* problems — the annotation doesn't replace the scheduler, it's the **heartbeat inside** it:
+> - **`@Scheduled` = *when to look*** — a fixed, compile-time pulse ("run this one method every 1s"). It knows nothing about individual jobs.
+> - **The table = *what you find*** — the dynamic, per-job "when" (`next_run`) and "what" (payload), created/edited/cancelled **at runtime**. You can't express "remind me at 3:47pm on the 20th" or 10M distinct times as annotations — those are *data*, and data lives in a table.
+> - **Annotations are static, jobs are dynamic.** An annotation is baked in at compile time and needs a redeploy to change; a row is a plain `INSERT`/`UPDATE`/`DELETE`.
+> - **HA needs the claim.** Run 3 instances for safety and *all 3* `@Scheduled` tickers fire every second. Without the table's **atomic claim** (§6), all 3 fire the *same* job → 3× the effect. The row is what lets exactly one instance win.
+> - **Durability.** Pending in-JVM timers vanish on restart; table rows survive.
+>
+> Net: `@Scheduled` is the poll loop; the table is the durable list of what to poll for. (Even Quartz with a JDBC job store still keeps jobs in **tables** for exactly these reasons — there's no escaping it.)
+
 #### 2. Time-bucketing (group jobs by the minute they fire)
 
 Instead of one giant sorted set, put each job into a **bucket labeled with its minute**. To find what's due, you only open **the current minute's bucket** — never the whole dataset.
@@ -267,6 +313,37 @@ bucket "2026-07-08 09:02" → [job E, job F]
                                  ▲
                      scheduler only reads THIS minute's bucket
 ```
+
+The **bucket key** is just the fire time rounded down to the minute; each bucket is still ordered *within* the minute (a per-minute ZSET, or a partitioned DB slice). Writing = drop the job in its minute's bucket; reading = only open the current minute (plus the previous one for stragglers):
+
+```java
+// WRITE: bucket key = fire time truncated to the minute
+String bucket = "due_jobs:" + runAt.truncatedTo(MINUTES);   // e.g. due_jobs:2026-07-08T09:00
+redis.zadd(bucket, runAt.getEpochSecond(), jobId);          // sorted within the minute
+
+// TICK: open only the current minute's bucket, not the whole dataset
+@Scheduled(fixedRate = 1000)
+public void tick() {
+    long nowSec = Instant.now().getEpochSecond();
+    // also sweep the previous minute: a tick that runs a hair late must not orphan
+    // a 09:00:59 job just because the clock rolled into the 09:01 bucket.
+    for (String bucket : List.of(prevMinuteKey(), currentMinuteKey())) {
+        for (String jobId : redis.zrangeByScore(bucket, 0, nowSec)) {
+            if (redis.zrem(bucket, jobId) == 1) enqueue(jobId);   // ZREM==1 = we won the claim
+        }
+    }
+    // once a minute is fully past, the whole key can be dropped: DEL due_jobs:<oldMinute>
+}
+```
+
+**#2 vs #3 are different axes, not rival options** — they combine:
+
+| | What it is | Question it answers |
+| --- | --- | --- |
+| **#3 ZSET** | a *data structure* (sorted set) | *what* do I store jobs in to find due ones fast? |
+| **#2 bucketing** | a *partitioning strategy* (split by time) | *one* big container or *many* small ones? |
+
+So the code above is **bucketing (#2) built on ZSETs (#3)**. You can also bucket with **no Redis at all** (a DB table partitioned by minute), or use a ZSET with **no bucketing** (one `due_jobs` set, §3). Since `ZRANGEBYSCORE` is fast either way, bucketing's real win isn't read speed — it's avoiding **one hot key** (spread load across many keys/shards) and **trivial cleanup** (`DEL` a drained minute vs. `ZREM`-ing members forever).
 
 **Downside — hot buckets:** everybody schedules "09:00:00", so that one bucket is enormous while others are empty (the *thundering herd*, see §3). Fix: spread with **jitter**.
 
@@ -287,9 +364,12 @@ for (String jobId : due) {
 ```
 
 - **Blazing fast** because it's in memory and already sorted — `ZRANGEBYSCORE 0 now` gives you exactly the due ones.
+- **`ZADD` is a *sorted, dedup* insert — not a tail append.** It slots the member into its score-ordered position (like a leaderboard), and members are **unique**: re-`ZADD`-ing the same `jobId` with a new score just **moves** it — so "reschedule this job" is a free side effect, with no duplicate. (A Redis *list* + `RPUSH` would instead append duplicates in insertion order.)
 - **Catch: Redis can lose data on crash**, so it's a fast *cache/index*, not the source of truth. Keep the **DB as durable truth** and use the ZSET as a speed layer you can rebuild from the DB.
 
 #### 4. Timing wheel (how Kafka/Netty do near-term timers)
+
+> 💡 **Jargon — "timing wheel":** think of a **clock face** with a hand that ticks slot to slot. You drop a timer in the slot the hand will reach when it's due; when the hand lands there, everything in that slot fires. Insert and fire are both O(1) — no scanning, no sorting.
 
 A **timing wheel** is a circular array of buckets — literally like a **clock face**. A pointer (the "cursor") ticks from slot to slot. When you add a timer, you drop it in the slot the cursor will reach when it's due. Each tick, the cursor fires whatever is in the slot it lands on. Insert and fire are both **O(1)** — no scanning, no sorting.
 
@@ -313,6 +393,9 @@ class TimingWheel {
 }
 ```
 
+- **A "tick" = the wheel's heartbeat** — the smallest time unit the cursor advances by (`tickMs`), like a clock's second hand. It's the resolution knob: `span = tickMs × N`; smaller tick = finer precision but more wakeups. A background thread does `tick(); sleep(tickMs − workTime)` in a loop (subtracting work time keeps it from drifting late).
+- **Wrap-around within one wheel → a `rounds` (laps) counter.** With `slot = (T/tick) % N`, a job due *beyond* the span collides with a near-term slot. Store `rounds = (T/tick) / N` alongside it; each time the cursor lands on the slot, fire only entries with `rounds == 0`, else decrement. So a job 10 ticks out on an 8-slot wheel gets `rounds=1, slot=2` and fires on the cursor's **second** pass of slot 2 (this is how **Netty's `HashedWheelTimer`** works).
+- **Fire = enqueue, never run inline.** If `tick()` executes a slow job it blocks the cursor and every later job fires late — so drop due jobs on a **queue** for a worker pool (the same "separate scheduling from execution" split as the rest of this design).
 - **The problem: a wheel only covers a short horizon** (a 60-slot, 1-per-second wheel only reaches 60s ahead). For a job 3 days out, use **hierarchical wheels** — a coarse "days" wheel, then "hours", then "minutes", then "seconds" (exactly like the hour/minute/second hands of a real clock). A far-future job sits in the coarse wheel and gets **promoted down** to a finer wheel as its time approaches.
 - Great for **in-process, near-term** timers (retries, timeouts). The durable long-horizon store is still the DB.
 
@@ -326,6 +409,20 @@ class TimingWheel {
 | Herd at round times | Any of the above **+ jitter** to flatten the spike |
 
 > **Bottom line:** the DB is always the durable truth; the fancier structures (ZSET, timing wheel) are just faster *ways to find the front of the line* layered on top.
+
+#### Q: Timing wheel vs Redis ZSET vs DB polling — when do I actually *need* each?
+
+They aren't rivals; they sit at **different scales and horizons**. Pick by *how many jobs, how far out, and how fast you need them*:
+
+| | **DB poll + index** | **Redis ZSET** | **Timing wheel** |
+| --- | --- | --- | --- |
+| Lives where | Durable disk (source of truth) | In-memory speed layer (rebuildable) | In-process, in one JVM |
+| Horizon | Any (seconds → years) | Any (bounded by memory) | **Near-term** only (retries, timeouts) |
+| Cost to find due | Indexed `SELECT` each tick (disk round trip) | `ZRANGEBYSCORE` (in-memory, sorted) | **O(1)** — cursor lands on a slot |
+| Durable on crash | ✅ yes | ❌ no (cache) | ❌ no (in-heap) |
+| Reach for it when | **Default.** Millions of jobs, per-second precision is fine | Very high fire rate / sub-second, DB poll is the bottleneck | Managing thousands of **short** in-process timers (per-request timeouts, lease sweeps) |
+
+The decision in one breath: **start with DB polling** — it's durable and simple, and covers almost every interview. **Add a Redis ZSET** only when the per-second poll itself becomes the bottleneck (it's a cache in front of the DB, not a replacement). **Reach for a timing wheel** only for lots of short-lived *in-process* timers, where a round trip per timer would be absurd — it never stores the durable schedule. So: DB = durability, ZSET = poll speed at scale, wheel = O(1) local timers. Most real schedulers are "DB poll (+ ZSET if hot)"; the wheel is an implementation detail *inside* a node, not the system's source of truth.
 
 ---
 
@@ -343,6 +440,8 @@ Multiple scheduler nodes must not fire the same job twice.
 | **Lease/heartbeat** | The claimed job has a TTL; if the worker dies, the lease expires → the job is re-claimable (no permanent stuck) |
 
 > **Reality:** distributed exactly-once is hard → aim **at-least-once + idempotent jobs**, with **atomic claim + lease expiry** so a crashed worker's job is safely retried without a duplicate within the lease.
+
+> ⚠️ **Say "exactly-once-*ish*", not "exactly-once".** True exactly-once delivery across crashing distributed nodes is effectively impossible. What you can promise is **at-least-once delivery + idempotent jobs = exactly-once _effect_** — the job may occasionally run twice, but a repeat does no extra harm. If an interviewer hears you claim literal exactly-once, that's a red flag; naming the "-ish" shows you know why.
 
 ### The "two schedulers, one job" problem
 
@@ -389,6 +488,8 @@ Each poller grabs the next *available* rows and skips any another poller has alr
 
 #### The lease (TTL) — what if the winner then dies?
 
+> 💡 **Jargon — "lease":** a claim that comes with an **expiry** (like a library book due date). You hold the job only until `lock_expiry`; keep it by "checking in" (heartbeat), or it's automatically reclaimed. A lease means a dead holder can't lock a job forever — the system self-heals without anyone noticing the crash.
+
 Winning the job isn't enough: what if scheduler-7 claims the job, hands it to a worker, and the **worker crashes mid-run**? The job is stuck in `PICKED`/`RUNNING` forever — it never finishes and never re-runs. Bad.
 
 Fix: the claim comes with a **lease — an expiry time** (`lock_expiry`). The worker must "check in" (heartbeat) to keep it. If it dies, the lease **expires**, and a sweeper makes the job claimable again.
@@ -403,6 +504,25 @@ void reclaimExpiredLeases() {
     """);
 }
 ```
+
+#### Heartbeat & lease-extension — how a *long* job keeps its claim
+
+A short lease reclaims crashed workers fast, but it fights **long-running jobs**: set the lease to 60s and a legitimate 10-minute job looks "expired" at the 60s mark — the sweeper hands it to a second worker and now it runs twice. The fix isn't a huge lease (that delays crash recovery); it's a **heartbeat**: while the job runs, the worker periodically pushes `lock_expiry` forward. A live worker keeps extending; a dead one stops, and the lease lapses on schedule.
+
+```java
+// While the job runs, extend the lease every ~1/3 of the TTL. Alive → keeps it; dead → it lapses.
+@Scheduled(fixedRate = 20_000)   // TTL is 60s → renew well before it expires
+void heartbeat(RunningJob rj) {
+    jdbc.update("""
+        UPDATE jobs SET lock_expiry = now() + interval '60 seconds'
+        WHERE  job_id = ? AND locked_by = ?     -- only if I STILL own it
+    """, rj.jobId, myId);
+}
+```
+
+The `AND locked_by = ?` guard is the safety catch: if my lease already lapsed and another worker re-claimed the job, my heartbeat updates **0 rows** — I've lost it, so I stop working rather than fighting the new owner. Rule of thumb: **lease TTL ≈ 3× the heartbeat interval**, so one missed beat (a GC pause, a blip) doesn't wrongly reclaim a healthy job, but a true crash is reclaimed within a couple of intervals.
+
+> ⚠️ **Pitfall:** don't "fix" long jobs by making the lease enormous (e.g. 1 hour). That just means a *crashed* worker's job sits stuck for an hour before recovery. Keep the TTL short and **heartbeat** instead.
 
 #### Q: If a crashed worker's job re-runs, isn't that a double-run?
 
@@ -481,9 +601,7 @@ Instant next = cronParser.next(cron, Instant.now());        // now = 2:00:47
 
 The next run is anchored to the intended slot (2:00), not to when the previous run happened to finish — so it never drifts.
 
-#### Q: The server was down for 3 hours over a 2am job — now what? (missed windows)
-
-When the scheduler comes back and sees a fire time already passed, you need a **policy** per job — there's no universally right answer:
+Say the server was down for 3 hours over a 2am job — now what? When the scheduler comes back and sees a fire time already passed, you need a **policy** per job — there's no universally right answer:
 
 | Policy | What it does | Good for |
 | --- | --- | --- |
@@ -503,13 +621,13 @@ void handleMissed(Job job, Instant downSince, Instant backAt) {
 }
 ```
 
-#### Q: Why does DST/timezone matter for cron?
-
-"Every day at 2:00 AM" is a **wall-clock** promise. On the night the clocks spring forward, 2:00 AM **doesn't exist** (it jumps 1:59 → 3:00); on the night they fall back, 2:00 AM happens **twice**. A timezone/DST-aware cron parser decides whether to skip, run once, or run twice — so "2am daily" stays sane for humans. (Storing/scheduling in UTC internally avoids most of this; the conversion happens at the wall-clock boundary.)
+DST/timezone matters for cron because "every day at 2:00 AM" is a **wall-clock** promise. On the night the clocks spring forward, 2:00 AM **doesn't exist** (it jumps 1:59 → 3:00); on the night they fall back, 2:00 AM happens **twice**. A timezone/DST-aware cron parser decides whether to skip, run once, or run twice — so "2am daily" stays sane for humans. (Storing/scheduling in UTC internally avoids most of this; the conversion happens at the wall-clock boundary.)
 
 ---
 
 ## 8. Retries, Failures & DLQ
+
+> 💡 **Jargon — "DLQ" (Dead Letter Queue):** the "**give-up shelf**." A job that keeps failing (bug, bad data, deleted target — a *poison job*) can't be retried forever, so after `maxAttempts` it's set aside here and a human is alerted to inspect/replay it. It keeps doomed jobs from clogging the live pipeline.
 
 - Exponential backoff **with jitter** (avoid a thundering herd of simultaneous retries — see Kafka note). (The `attempt++` → backoff-reschedule-or-DLQ logic is shown as annotated code in the deep dive below.)
 - **DLQ** for jobs that exhaust retries → manual inspection/replay.
@@ -539,9 +657,7 @@ void onFailure(Job job) {
 
 Waiting longer each time gives a struggling downstream service **room to recover** instead of getting pounded.
 
-#### Q: Why add jitter? Isn't a clean "1s, 2s, 4s" better?
-
-No — because failures often hit **many jobs at once** (the payment service went down → 10,000 jobs all fail at 2:00:00). With clean backoff, all 10,000 retry at *exactly* 2:00:01, then all at 2:00:03... you've built a **synchronized stampede** that knocks the service over again the instant it recovers.
+It's tempting to think a clean "1s, 2s, 4s" backoff is good enough and jitter is unnecessary polish — it isn't, because failures often hit **many jobs at once** (the payment service went down → 10,000 jobs all fail at 2:00:00). With clean backoff, all 10,000 retry at *exactly* 2:00:01, then all at 2:00:03... you've built a **synchronized stampede** that knocks the service over again the instant it recovers.
 
 ```java
 // jitter = a small random offset so retries SPREAD OUT instead of all landing together
@@ -566,9 +682,7 @@ void moveToDLQ(Job job, String reason) {
 
 After `maxAttempts`, the job moves to the DLQ and **alerts a human**, who inspects it, fixes the root cause, and can **replay** it — instead of retrying a doomed job forever.
 
-#### Q: What about a job that hangs forever (never fails, never finishes)?
-
-That's a **timeout**. A failure at least tells you it failed; a *hung* job just sits in `RUNNING` silently. Two guards cover it:
+A job that hangs forever — never fails, never finishes — is a different problem: a **timeout**. A failure at least tells you it failed; a *hung* job just sits in `RUNNING` silently. Two guards cover it:
 
 - **Timeout:** if a job runs past its allowed time, kill it and treat it as a failure (→ retry/backoff).
 - **Lease expiry (from §6):** if the whole *worker* dies (so it can't even report a timeout), the lease's TTL runs out and the job becomes re-claimable. Belt and suspenders.
@@ -576,6 +690,20 @@ That's a **timeout**. A failure at least tells you it failed; a *hung* job just 
 ---
 
 ## 9. Data Model (all tables)
+
+### Database & storage choices (which DB, and why at scale)
+
+No single store is best for every job here, so we use **polyglot persistence** — pick the store that matches each piece's access pattern. The deciding question for the job store is always *"can a competing scheduler and I both try to grab this job, and can only one of us be allowed to win?"* — that's a **transactional, single-row-atomicity** requirement, which is exactly what an RDBMS gives for free and a plain KV store doesn't.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Jobs (durable schedule + current state) | **RDBMS** (PostgreSQL/MySQL) | The whole no-double-run guarantee rests on the **atomic conditional `UPDATE jobs SET status='PICKED' WHERE status='SCHEDULED'`** (§6) — only a transactional engine with row-level locking makes that safe when several schedulers race. The **partial index** `ON jobs(next_run) WHERE status='SCHEDULED'` also needs a real query planner to stay fast at 100M+ rows. | A NoSQL store gives you a fast write, but no cross-node atomic "flip this row from A to B, and tell me if I won" — you'd have to hand-roll locking (e.g. a distributed lock per job), which is slower and more fragile than one `UPDATE`. |
+| Near-term due-time index (the hot "what's due right now" lookup) | **Redis ZSET** (score = `next_run` epoch), or an in-process **timing wheel** for sub-second horizons | `ZRANGEBYSCORE 0 now` is an in-memory, already-sorted pop of exactly the due jobs — far cheaper than hammering the RDBMS with a poll every second at huge job counts. A timing wheel gives O(1) insert/fire for very-near-term timers (retries, lease sweeps). | The RDBMS index is still fast, but every poll is a round trip to a durable, disk-backed engine; at very high fire rates that becomes the bottleneck. The ZSET is a disposable speed layer — safe to lose, because it's rebuildable from the RDBMS (§5). |
+| Dispatch to workers | **Kafka / SQS queue** | Decouples "decide it's due" from "actually run it" — absorbs the midnight thundering herd, lets workers scale independently, and survives a worker crash (message stays until acked/leased). | Calling a worker directly (RPC) couples the scheduler's timing to the worker pool's capacity, and a crash mid-call loses the job with no queue to retry from. |
+| Execution history (`job_runs`) | **Same RDBMS, separate append-only table** | Needs to grow unboundedly without slowing down the `jobs` poll — kept apart precisely so the hot due-lookup index never has to skip over millions of finished-run rows. | Storing run history on the `jobs` row itself (rather than a new row per run) would either lose history on overwrite or bloat the one table polled every second. |
+| Exhausted jobs (DLQ) | **`dead_letter_jobs` table** (same RDBMS) | Isolates poison jobs from the live `SCHEDULED` pool so they stop competing for poll attention; a human queries this table directly to inspect/replay. | Leaving a permanently-failing job as `SCHEDULED` with ever-longer backoff wastes poll cycles forever and never surfaces the problem to anyone. |
+
+**Why the RDBMS wins the durable-store fight here:** job *claims* are the correctness-critical operation, but their throughput is modest — even a "millions of jobs" system only claims at whatever rate jobs actually fire, not at read-QPS scale. That's a small enough write volume for a single RDBMS primary to handle safely, and correctness (never double-firing) matters far more than raw throughput. We scale the *read* side (the "who's due" poll) with the **partial index** and the **Redis ZSET speed layer**, and we scale *write* volume, if it ever matters, by **sharding jobs across schedulers** (by hash of `job_id`, §6) so each shard's claims hit an independent partition. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 CREATE TABLE jobs (
@@ -634,9 +762,7 @@ SELECT started_at, status, error FROM job_runs
 WHERE job_id = 42 ORDER BY started_at DESC LIMIT 10;
 ```
 
-#### Q: What is that `WHERE status = 'SCHEDULED'` doing on the index?
-
-That's a **partial index** — the single most important performance trick in the schema:
+That `WHERE status = 'SCHEDULED'` clause on the index is a **partial index** — the single most important performance trick in the schema:
 
 ```sql
 CREATE INDEX idx_jobs_due ON jobs(next_run) WHERE status = 'SCHEDULED';
@@ -644,9 +770,7 @@ CREATE INDEX idx_jobs_due ON jobs(next_run) WHERE status = 'SCHEDULED';
 
 It builds a sorted index **only over rows that are still SCHEDULED** — the only ones the poller cares about (§5). Jobs that are `DONE`, `RUNNING`, `CANCELLED` etc. aren't in this index at all, so it stays small and fast even when the table holds 100M mostly-finished rows. Finished jobs aren't indexed, so they never slow down "what's next?"
 
-#### Q: How does this table map to everything else in the doc?
-
-Almost every mechanism is just a column here:
+This table also maps cleanly onto everything else in the doc — almost every mechanism above is just a column here:
 
 | Column | Powers | Section |
 | --- | --- | --- |
@@ -701,24 +825,7 @@ Worker crash → lease TTL expires → job re-claimable → retried
 
 ---
 
-## 13. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Producer-Consumer** | Scheduler enqueues, workers consume | Decouple timing from execution |
-| **Leader Election** | Single active scheduler (ZooKeeper/etcd/Redis lock) | Avoid duplicate polling |
-| **Command** | A job = a command object (execute) | Uniform execution + queueing |
-| **Strategy** | Retry/backoff policy, missed-window policy, due-finding (poll/ZSET/wheel) | Swap policies |
-| **State** | Job lifecycle (SCHEDULED→PICKED→RUNNING→DONE/FAILED) | Guard transitions |
-| **Observer / Pub-Sub** | Job events → notifications, history, DLQ | Decouple |
-| **Template Method** | Common run skeleton (setup → execute → record → reschedule) | Reuse flow |
-| **Factory** | Create job handlers per type | Extensible job types |
-| **Lease / Lock** | Atomic claim + TTL lease | No double-run; crash recovery |
-| **Timing Wheel** | Near-term timer management | Efficient O(1) scheduling |
-
----
-
-## 14. Scaling & Failure
+## 13. Scaling & Failure
 
 - **Shard/partition jobs** across scheduler nodes (by hash) or use a **leader** + workers → no overlap.
 - **Atomic claim + lease TTL** → crashed worker's job re-runs after expiry (no stuck jobs, no double-run within lease).
@@ -727,9 +834,22 @@ Worker crash → lease TTL expires → job re-claimable → retried
 - **Clock skew** across nodes → DB/queue is the time authority; allow small delay tolerance.
 - **At-least-once + idempotent jobs** for correctness; **jitter** scheduled times to spread the herd.
 
+### If X breaks…
+
+Walk the failure of each moving part and show it **degrades, not collapses** — this is where interviewers probe whether you actually understand the design.
+
+| If this breaks… | What happens | How the design copes |
+| --- | --- | --- |
+| **Scheduler / poller node down** | That node stops finding due jobs; if it's the only one, nothing fires | Run several (leader election **or** sharding, §6). On leader death a standby takes the lock; a dead shard's slice is reassigned. Jobs are safe in the DB — nothing is lost, they just fire a little late once a node recovers. |
+| **Queue backlog (workers can't keep up)** | Enqueued jobs pile up → jobs fire on time but *run* late | Queue is designed to absorb bursts; **scale workers horizontally** on the same queue, **rate-limit** so downstream isn't crushed, alert on **queue depth / scheduler lag**. Jobs stay durable and ordered by fire time. |
+| **Clock skew across nodes** | A node thinks it's 00:00:05 while another thinks 23:59:58 → jobs fire slightly early/late or a node double-evaluates "due" | Treat the **DB/queue as the single time authority** (compare against its `now()`), run NTP, allow a small delay tolerance. The **atomic claim** still guarantees one winner even if two nodes disagree on the clock. |
+| **Worker crashes mid-lease** | Job stuck in `PICKED`/`RUNNING`, half-done, no result recorded | **Lease TTL expires** (heartbeat stops) → sweeper resets it to `SCHEDULED` → re-claimed and retried. **Idempotency** makes the partial-then-repeat safe (no double effect). |
+| **DB primary down** | No claims, no due-lookup, no durable writes — the whole core stalls | The DB is the SPOF you must protect: **primary + replicas + automatic failover**, multi-AZ. Reads can drop to a replica; writes wait for failover. Correctness never sacrificed — better to fire late than double-fire. |
+| **Redis ZSET (speed layer) lost** | The fast due-index is gone | It's a **disposable cache** — rebuild it from the DB (the durable truth). Fall back to DB polling meanwhile; slower, still correct. |
+
 ---
 
-## 15. Interview Cheat Sheet
+## 14. Interview Cheat Sheet
 
 > **"How do you find which jobs are due efficiently?"**
 > "A durable job store with an index on `(status, next_run)`; poll the current time-bucket, or keep a **Redis ZSET** scored by fire time (`ZRANGEBYSCORE 0 now`). For near-term in-process timers, a **timing wheel** is O(1) insert/expire (hierarchical for far-future)."
@@ -746,9 +866,100 @@ Worker crash → lease TTL expires → job re-claimable → retried
 > **"Failures?"**
 > "Retry with exponential backoff + jitter up to max attempts → then DLQ + alert. Lease expiry recovers crashed workers; timeouts kill runaway jobs."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Two schedulers claim the same due job** | Only one wins the **atomic `UPDATE ... WHERE status='SCHEDULED'`** (rows_affected=1); the other gets 0 rows and skips. No duplicate. |
+| **Worker crashes mid-job** | Heartbeat stops → **lease TTL expires** → sweeper resets to `SCHEDULED` → re-claimed & retried. **Idempotency** makes the repeat safe. |
+| **Legit long job outlives its lease** | Don't grow the lease — **heartbeat** to extend `lock_expiry` while running; a dead worker simply stops extending. |
+| **10M jobs armed for 00:00 (midnight herd)** | **Jitter** scheduled times to spread over a window, **queue** absorbs the burst, workers scale out, **rate-limit** downstream. |
+| **System was down over a fire time** | Per-job **missed-window policy**: skip / catch-up-once / run-all. Anchor `next_run` to **scheduled** time, not now. |
+| **Poison job fails forever** | Backoff + jitter up to `maxAttempts` → **DLQ + alert**; a human inspects/replays. Never retry a doomed job endlessly. |
+| **DB poll is the bottleneck at scale** | Time-bucket + partial index, add a **Redis ZSET** speed layer, **batch** claims, shard pollers by `hash(job_id)`. |
+| **Job hangs, never fails or finishes** | **Timeout** kills the runaway (→ retry); **lease expiry** covers the case where the whole worker dies. |
+| **Recurring job drifts later each day** | Compute next fire from the **scheduled** slot (2:00), not from actual finish (2:00:47) — no creep. |
+
+> **Layer model:** atomic claim = one winner · lease + heartbeat = crash recovery · idempotency = safe repeats · jitter = beat the herd · DLQ = give up safely.
+
 ---
 
-## 16. Final Takeaways
+## 15. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you pick consistency vs availability?" A scheduler is interesting because the answer is **different for its two halves.**
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **The atomic claim** (deciding who fires a due job) | **CP** (strong consistency) | Double-firing is the cardinal sin. The claim is a single-row conditional `UPDATE` on the RDBMS — under a partition, a node that can't reach the DB **must refuse to fire** rather than risk a duplicate. Correctness > availability here. |
+| **The dispatch queue** (handing jobs to workers) | **AP** (availability + at-least-once) | Once a job is claimed, getting it to *some* worker favors availability: the queue redelivers on doubt, so a job may be delivered twice. That's fine because jobs are **idempotent** — at-least-once + idempotency = exactly-once effect. |
+| **Status / history / metrics** (`job_runs`, dashboards) | **Eventual** | Read-side, async, retryable — a few seconds of staleness never hurts. |
+
+- The claim lives on a **single source-of-truth row**; the conditional `UPDATE` gives serializable behavior **per job** without a global lock.
+- Under a network partition, the system is **eventually consistent across nodes** but **strongly consistent at the claimed row** — and it errs toward **firing late, never twice**.
+
+> One-liner: **"Strong consistency on the claim (never double-fire, even if that means firing late); availability + idempotency on the dispatch path."**
+
+---
+
+## 16. Reliability & Observability
+
+> A scheduler fails **silently** — a job that never fires produces no error, just an absence. So the metrics below aren't nice-to-haves; they're how you even *notice* a problem.
+
+- **No single point of failure** — replicate the DB (primary + replicas + failover), multi-AZ; run **multiple schedulers** (leader/sharded) and a horizontally-scaled **worker pool**; the queue is managed/replicated.
+- **Idempotent execution** everywhere on the run path so at-least-once delivery is safe.
+- **DLQ** for jobs that exhaust retries, with alerting so poison jobs surface to a human.
+- **Graceful degradation** — if the Redis ZSET is down, fall back to DB polling (slower, still correct); if a scheduler node dies, its shard/leadership is reassigned.
+
+### Metrics & alerts that matter
+
+| Signal | What it measures | Alert when… |
+| --- | --- | --- |
+| **Scheduler lag** | `now − scheduled_fire_time` at dispatch (how late jobs fire) | p99 lag exceeds SLA → poller/queue can't keep up |
+| **Missed-fire count** | Jobs whose fire time passed but were never claimed | > 0 → a shard/leader is dead or the poll is broken (the *silent* failure) |
+| **Claim contention** | Ratio of failed claims (rows_affected=0) to attempts | Spikes → too many pollers overlapping, or a hot bucket |
+| **DLQ depth** | Jobs parked on the give-up shelf | Rising → a class of jobs is systematically failing |
+| **Lease-reclaim rate** | How often leases expire and get re-claimed | Spikes → workers crashing/GC-pausing, or lease TTL set too short |
+| **Queue depth / worker saturation** | Backlog waiting for workers | Growing unbounded → scale workers or rate-limit intake |
+
+> 💡 **The one alert people forget: missed-fire count.** Success and latency dashboards look green when a whole shard is dead, because *nothing is firing there to fail*. Track "should have fired but didn't" explicitly.
+
+---
+
+## 17. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6.
+
+1. **Clarify requirements** (functional + NFRs, one-off vs recurring, scale) — §2
+2. **Estimate scale** (steady rate vs the midnight herd, poller/worker sizing) — §3
+3. **Define APIs + data model** (the `jobs` table is the spine) — §9, §10
+4. **High-level architecture** — the "find due → enqueue → workers run" split — §4
+5. **Deep dive: the hard part** → **finding due jobs efficiently** + **no double-run** (atomic claim + lease) — §5, §6
+6. **Deep dive: recurring, retries, failures** — §7, §8
+7. **Address scale + edge cases** — herd, sharding, clock skew, failure table — §3, §13
+8. **Summarize tradeoffs** — CAP, observability — §15, §16
+
+> 🎤 **Lead with the core challenge:** state up front that "the crux is *finding due jobs at scale* and *firing each exactly once* despite crashes," then spend most of your time on §5–§6. That's what they're testing — not the CRUD API.
+
+---
+
+## 18. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Producer-Consumer** | Scheduler enqueues, workers consume | Decouple timing from execution |
+| **Leader Election** | Single active scheduler (ZooKeeper/etcd/Redis lock) | Avoid duplicate polling |
+| **Command** | A job = a command object (execute) | Uniform execution + queueing |
+| **Strategy** | Retry/backoff policy, missed-window policy, due-finding (poll/ZSET/wheel) | Swap policies |
+| **State** | Job lifecycle (SCHEDULED→PICKED→RUNNING→DONE/FAILED) | Guard transitions |
+| **Observer / Pub-Sub** | Job events → notifications, history, DLQ | Decouple |
+| **Template Method** | Common run skeleton (setup → execute → record → reschedule) | Reuse flow |
+| **Factory** | Create job handlers per type | Extensible job types |
+| **Lease / Lock** | Atomic claim + TTL lease | No double-run; crash recovery |
+| **Timing Wheel** | Near-term timer management | Efficient O(1) scheduling |
+
+---
+
+## 19. Final Takeaways
 
 - **Separate scheduling from execution** — scheduler finds due jobs + enqueues; workers run (scale independently).
 - **Find due jobs** via indexed DB poll + time-bucketing, **Redis ZSET**, or **timing wheel**.

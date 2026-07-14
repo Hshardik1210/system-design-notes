@@ -1,8 +1,8 @@
 # Notification System — HLD & LLD
 
-> Companion to **Notification System — System Design**. This doc is split into **Part A: High-Level Design (HLD)** — the big-picture architecture — and **Part B: Low-Level Design (LLD)** — concrete schema, contracts, classes, state machines, and algorithms.
+> **Core challenge:** deliver the **right message** on the **right channel** at the **right time** — **without duplicates**, **without spam**, and **without ever blocking** the source system. The hard part in *this* companion is the LLD that makes that true: **two-stage idempotent dedup**, **per-channel attempt tracking** with retry/DLQ, the **outbox** that closes the dual-write gap, and a clean **orchestrator/worker split**.
 
-> **How to read this doc:** each section gives the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand. Running example throughout: an app (think Amazon/Swiggy) that fires **order confirmations, OTPs, and promotions** across push, SMS, email, and in-app.
+> **How to read this doc:** this is the **LLD companion** to **Notification System — System Design**. It's split into **Part A: High-Level Design (HLD)** — condensed architecture, kept just deep enough to frame the LLD — and **Part B: Low-Level Design (LLD)** — concrete schema, API contracts, class design, state machines, algorithms, and sequences. **Read Part B here** for interview-grade LLD; for the full HLD rationale (requirements, estimation, component deep dives, Kafka lag, DB bottlenecks) go to the **main doc**. Each section gives the dense summary first, then a **deep dive** (annotated Java + the exact confusions — look for the `#### Q:` callouts). Running example throughout: an app (think Amazon/Swiggy) that fires **order confirmations, OTPs, and promotions** across push, SMS, email, and in-app.
 
 ---
 
@@ -36,6 +36,9 @@
 - [B11. Caching Design](#b11-caching-design)
 - [B12. Error Handling & Edge Cases](#b12-error-handling--edge-cases)
 - [B13. Cheat-Sheet Mapping (HLD ↔ LLD)](#b13-cheat-sheet-mapping-hld--lld)
+- [Consistency & CAP Tradeoffs](#consistency--cap-tradeoffs)
+- [Interview Cheat Sheet](#interview-cheat-sheet)
+- [Final Takeaways](#final-takeaways)
 
 ---
 
@@ -46,6 +49,13 @@
 - **Style:** async delivery (at-least-once + idempotency); strong consistency on notification record creation; eventual consistency on delivery status.
 
 > Full requirements + estimation live in the main **Notification System — System Design** note (§2, §3).
+
+> **Capacity at a glance** (condensed so an LLD-only reader isn't forced to open the main doc — full derivation in **notification-system-design.md** §3):
+> - **~50M DAU × ~5 notifs/day ≈ 250M/day ≈ 2,900 writes/sec** average; **~10–15k/sec peak** (3–5× for flash sales/festivals).
+> - **Channel split (peak):** push ~60% (~6k/sec), email ~25% (~2.5k/sec), SMS ~5% (~500/sec — expensive, provider-rate-limited), in-app stored for every in-app notification.
+> - **Storage:** ~500 B/row → **~45 TB/year** raw → time-partition + archive (>90 days → S3).
+> - **Bulk campaign:** 10M push over ~30 min ≈ **5,500/sec sustained** → must batch + parallel workers, never one API call.
+> - **What this forces (drives the LLD):** async queue is mandatory, **separate worker pools per channel**, Kafka partitioned by `user_id`, fan-out as a **batch pipeline** (B8).
 
 ### What are we actually building?
 
@@ -58,18 +68,15 @@ Why build one shared service instead of letting the Order team call Twilio thems
 
 The core goal in one breath: **right message, right channel, right time — no duplicates, no spam, and never block the system that asked.**
 
-#### Q: What do "right channel" and "right time" really mean?
+Right channel means respecting the user's choice: if they turned off promo emails but kept push on, a sale goes only to push, while an OTP almost always goes to SMS/push because it's time-critical. Right time means honoring quiet hours and scheduling: a "your movie starts in 1 hour" reminder must fire at T-1hr, not now, and a marketing blast shouldn't wake someone at 3 AM.
 
-- **Right channel** = respect the user's choice. If they turned off promo emails but kept push on, a sale goes only to push. An **OTP** almost always goes to SMS/push because it's time-critical.
-- **Right time** = **quiet hours** and **scheduling**. A "your movie starts in 1 hour" reminder must fire at T-1hr, not now; a marketing blast shouldn't wake someone at 3 AM.
-
-#### Q: Why "at-least-once + idempotency" instead of "exactly-once"?
-
-Networks fail mid-call, so the safe default is **at-least-once**: if unsure, try again (better a rare duplicate attempt than a lost OTP). To stop the user actually *seeing* two copies, every notification carries an **idempotency key** (e.g. `userId:type:orderId`) so a retry maps to the same record instead of creating a new one. (Details in B5/B10.)
+The system favors "at-least-once + idempotency" over "exactly-once" because networks fail mid-call, so the safe default is at-least-once: if unsure, try again — better a rare duplicate attempt than a lost OTP. To stop the user actually seeing two copies, every notification carries an idempotency key (e.g. `userId:type:orderId`) so a retry maps to the same record instead of creating a new one. (Details in B5/B10.)
 
 ---
 
 ## A2. Architecture Overview
+
+> Full architecture rationale + why-each-component lives in **notification-system-design.md** §5–§6 — this diagram is the condensed frame for Part B.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -141,12 +148,7 @@ producer  →  gateway  →  Notification API (decide + save)  →  Kafka bins  
 - **Workers** = one per channel; each just delivers and records the outcome.
 - **WebSocket service** = the extra pipe that pushes in-app messages to a phone that's *currently open*.
 
-#### Q: What is "fan-out" here, and where does it happen?
-
-**Fan-out = one input turns into many outputs.** It shows up in two places:
-
-1. **Channel fan-out** — one "order confirmed" request → a push job **and** an email job **and** an in-app job (three attempts from one notification).
-2. **Audience fan-out** — one campaign → millions of per-user notifications.
+**Fan-out** — one input turning into many outputs — shows up in two places here: **channel fan-out**, where one "order confirmed" request becomes a push job **and** an email job **and** an in-app job (three attempts from one notification), and **audience fan-out**, where one campaign becomes millions of per-user notifications.
 
 ```
 one request ──┬──► PUSH job   (Kafka: notification-normal)
@@ -158,13 +160,13 @@ one campaign ──► 10M user notifications   ← audience fan-out (see B8)
 
 The design keeps each fanned-out piece **independent**: push succeeding and email failing are separate rows, so one bad channel never blocks the others.
 
-#### Q: Why put Kafka in the middle at all — why not call the workers directly?
-
-Because delivery is **slow and flaky** (provider timeouts, rate limits, spikes). Kafka lets the API finish in milliseconds and lets each channel drain at its own pace. During a flash sale, 10M messages pile up **in the queue**, not in the API's memory, and push workers can scale up without touching the SMS path.
+Kafka sits in the middle because delivery is **slow and flaky** (provider timeouts, rate limits, spikes) — calling workers directly would tie the API to that flakiness. Kafka lets the API finish in milliseconds and lets each channel drain at its own pace. During a flash sale, 10M messages pile up **in the queue**, not in the API's memory, and push workers can scale up without touching the SMS path.
 
 ---
 
 ## A3. Services & Responsibilities
+
+> Full component deep dive lives in **notification-system-design.md** §6 — condensed here to frame the class design (B3).
 
 | Service | Responsibility | Data store |
 | --- | --- | --- |
@@ -209,19 +211,9 @@ class PushWorker {
 }
 ```
 
-#### Q: Why must the API never call FCM/Twilio directly (synchronously)?
+The API must never call FCM/Twilio directly (synchronously) because providers are **slow and unreliable**. If the API waited on Twilio for every request, the **caller** (checkout) would be blocked and the whole app would feel frozen; one slow provider (SMS) would drag down **all** channels; and a spike of 1M messages would mean 1M open connections held in the API, which would fall over. By handing off to Kafka and returning `202`, the API stays fast and each channel fails/retries on its own — this is exactly why "**API orchestrates, workers deliver**" is the golden rule.
 
-Because providers are **slow and unreliable**. If the API waited on Twilio for every request:
-
-- The **caller** (checkout) is blocked → the whole app feels frozen.
-- One slow provider (SMS) drags down **all** channels.
-- A spike of 1M messages = 1M open connections held in the API → it falls over.
-
-By handing off to Kafka and returning `202`, the API stays fast and each channel fails/retries on its own. This is exactly why "**API orchestrates, workers deliver**" is the golden rule.
-
-#### Q: Preference Service, Template Service — why separate services and not just tables?
-
-They're **hot, shared, and independently owned**. Every single notification reads preferences and a template, so they're cache-backed for speed, and other teams (a settings page, a marketing template editor) also touch them. Splitting them keeps that logic in one owner instead of copy-pasted into every producer.
+Preference Service and Template Service are separate services rather than just tables because they're **hot, shared, and independently owned**. Every single notification reads preferences and a template, so they're cache-backed for speed, and other teams (a settings page, a marketing template editor) also touch them. Splitting them keeps that logic in one owner instead of copy-pasted into every producer.
 
 ---
 
@@ -240,7 +232,7 @@ They're **hot, shared, and independently owned**. Every single notification read
 
 **Auth per boundary:** internal service → API uses **mTLS or signed service tokens (OAuth client-creds/JWT)**; user → in-app/preferences API uses the user's auth token (can only touch their own data); worker → provider uses secrets from a **vault** (rotated), never env files.
 
-**Dual-write caveat:** `insert notification` (DB) + `publish` (Kafka) are not atomic. Guard with an **outbox** or a **reconciliation sweeper** for `PENDING` rows (see B5, B12).
+**Dual-write caveat:** `insert notification` (DB) + `publish` (Kafka) are not atomic. Guard with an **outbox** or a **reconciliation sweeper** for `PENDING` rows (LLD in B5, B12; full outbox/dual-write treatment in **notification-system-design.md** §16, §23).
 
 ### Sync vs async — only wait when you need the reply
 
@@ -265,9 +257,7 @@ ResponseEntity<?> send(@RequestBody SendRequest req) {
 }
 ```
 
-#### Q: What is the "dual-write" problem in one sentence?
-
-Saving the row to the DB and publishing to Kafka are **two separate writes**; if the service crashes *after* the DB insert but *before* the Kafka publish, you get a notification that's saved but never delivered — stuck at `PENDING` forever.
+The "dual-write" problem, in one sentence: saving the row to the DB and publishing to Kafka are **two separate writes**, so if the service crashes *after* the DB insert but *before* the Kafka publish, you get a notification that's saved but never delivered — stuck at `PENDING` forever.
 
 ```
 insert notification (PENDING)   ✅ committed
@@ -314,13 +304,9 @@ Each store fits a different need. **Postgres (RDBMS)** holds the permanent, must
 | "how many promos today" counter | **Redis** | atomic `INCR` + auto-expire at midnight |
 | Old notifications (90+ days) | **S3** | cheap cold storage; nobody queries them live |
 
-#### Q: Why not just keep preferences in Postgres and skip Redis?
+You *could* keep preferences in Postgres alone and skip Redis — Postgres is the source of truth. But you read preferences on **every** notification, millions of times, and the answer rarely changes, so hitting the DB every time wastes it. That's why we **cache-aside**: read Redis first, fall back to DB on a miss, and **invalidate** the cache when the user updates prefs. Same story for templates.
 
-You *could* — Postgres is the source of truth. But you read preferences on **every** notification, millions of times, and the answer rarely changes. Hitting the DB every time wastes it. So we **cache-aside**: read Redis first, fall back to DB on a miss, and **invalidate** the cache when the user updates prefs. Same story for templates.
-
-#### Q: Why is the ID a Snowflake/UUIDv7 and not a plain `AUTO_INCREMENT`?
-
-A single auto-increment counter is a **write bottleneck** (every insert waits on one sequence) and it **breaks sharding** (two shards can't share one counter without coordinating). Snowflake/UUIDv7 IDs are generated by the app, are **time-sortable** (so `ORDER BY id` ≈ `ORDER BY created_at`), and let any node mint IDs without asking anyone.
+The ID is a Snowflake/UUIDv7 rather than a plain `AUTO_INCREMENT` because a single auto-increment counter is a **write bottleneck** (every insert waits on one sequence) and it **breaks sharding** (two shards can't share one counter without coordinating). Snowflake/UUIDv7 IDs are generated by the app, are **time-sortable** (so `ORDER BY id` ≈ `ORDER BY created_at`), and let any node mint IDs without asking anyone.
 
 ```java
 long id = Snowflake.next();   // e.g. timestamp-bits | machine-bits | sequence-bits
@@ -351,9 +337,7 @@ The four ideas, in plain terms:
 - **Priority** — OTP/payment ("critical") topics are drained first; marketing ("low") is throttled or waits.
 - **No single point of failure** — multiple copies of every stateless piece behind a load balancer, DB and Kafka replicated across availability zones.
 
-#### Q: If a channel's provider goes down, does the user get nothing?
-
-No — that's **graceful degradation**. Channels are independent, so if email is down, push + in-app still deliver *now*, and the email attempt simply retries (backoff → DLQ) without blocking the rest. The user still hears about their order; they just might get the email a bit later.
+If a channel's provider goes down, the user isn't left with nothing — that's **graceful degradation**. Channels are independent, so if email is down, push + in-app still deliver *now*, and the email attempt simply retries (backoff → DLQ) without blocking the rest. The user still hears about their order; they just might get the email a bit later.
 
 ```
 "Order confirmed"  ─┬─► PUSH   ✅ delivered now
@@ -414,9 +398,9 @@ All may share one codebase; they run **different commands** and scale **independ
 
 ### One codebase, many deployments
 
-All the workers can share one codebase/repo, but each runs as a **separate deployment** you scale independently. When push volume spikes, you add push-worker instances — you don't touch the SMS workers.
+> Full deployment + service-ownership deep dive lives in **notification-system-design.md** §20 — condensed here for the LLD.
 
-Concretely, "same code, different entry command" looks like:
+Workers share one codebase but run as **separate deployments**, scaled independently — same image, different start command:
 
 ```bash
 # same jar / image — the START COMMAND decides what this box becomes
@@ -426,9 +410,7 @@ java -jar app.jar --role=email-worker   # Email worker (scale to 20)
 java -jar app.jar --role=sms-worker     # SMS worker   (scale to 5)
 ```
 
-#### Q: Why scale push workers to 100 but SMS to only 5?
-
-Because the **volume and speed differ wildly**. Push is huge and fast (FCM is quick, everyone has the app), so it needs many workers. SMS is lower volume, expensive, and Twilio rate-limits you, so 5 is plenty. Decoupled deployments let you **right-size each channel** instead of scaling everything together.
+Push scales to ~100 while SMS scales to ~5 because volume and cost differ wildly — decoupling lets you **right-size each channel** instead of scaling everything together.
 
 #### Q: "EC2 boundary ≠ service boundary" — what does that mean?
 
@@ -479,13 +461,9 @@ orderServiceClient.notifyDelivered(orderId);    // ask them (API)
 kafka.publish("order-events", new DeliveredEvent(orderId)); // tell them (event)
 ```
 
-#### Q: Why is this rule such a big deal?
+This rule is a big deal because shared databases create **hidden coupling**: if two services both write the `orders` table, a schema change by one silently breaks the other, and nobody can reason about who changed what. Keeping each service the sole writer of its data means you can evolve, shard, or replace one service without a chain reaction — it's the backbone of microservices.
 
-Because shared databases create **hidden coupling**: if two services both write the `orders` table, a schema change by one silently breaks the other, and nobody can reason about who changed what. Keeping each service the sole writer of its data means you can evolve, shard, or replace one service without a chain reaction. It's the backbone of microservices.
-
-#### Q: A retry sounds cross-service — isn't the worker touching two systems?
-
-No. A retry is **entirely inside** the Notification service: the worker updates `notification_db` (its own) and republishes the `notificationId` to a Kafka **retry topic** (its own queue). The failed *provider* call (FCM/Twilio) is an external HTTP call, not a database write — so the "own your DB" rule is never broken.
+A retry might sound cross-service, but the worker isn't touching two systems. A retry is **entirely inside** the Notification service: the worker updates `notification_db` (its own) and republishes the `notificationId` to a Kafka **retry topic** (its own queue). The failed *provider* call (FCM/Twilio) is an external HTTP call, not a database write — so the "own your DB" rule is never broken.
 
 ---
 
@@ -512,21 +490,13 @@ No. A retry is **entirely inside** the Notification service: the worker updates 
 
 ### Kafka lag = the backlog of unprocessed messages
 
-"Lag" is simply *how many messages are waiting that you haven't processed yet*. A small backlog after a busy spike is fine — you'll catch up. A backlog that **keeps growing** means messages arrive faster than you process them, and you'll never catch up without adding capacity.
+> Full Kafka-lag deep dive lives in **notification-system-design.md** §21 — condensed here.
 
 ```
-lag = latest_offset − consumer_offset
-    = "newest message put in the bin"  −  "how far this worker has read"
-    = number of messages still waiting
+lag = latest_offset − consumer_offset  = number of messages still waiting
 ```
 
-- **Steady or shrinking lag** → healthy, workers keep pace.
-- **Growing lag on the *critical* topic** (OTP/payment) → alarm: users are getting OTPs late.
-- **Growing lag on *marketing*** → usually fine; promos can wait.
-
-#### Q: Why watch "oldest message age" instead of just the lag count?
-
-Because a big count on a **fast** topic may clear in seconds, while a small count on a **stuck** topic could be an hour old. **Age answers the real question — "how long is a user actually waiting?"** A 3-message backlog where the oldest is 45 minutes old is a much worse OTP experience than a 50,000-message backlog that's draining in real time.
+Steady/shrinking lag is healthy; **growing lag on the critical topic** (OTP/payment) is an alarm — users are getting OTPs late. Watch **"oldest message age," not just the count**: a 3-message backlog 45 min old is a worse OTP experience than a 50k backlog draining in real time, because **age answers the real question — "how long is a user actually waiting?"**
 
 #### Q: I added more workers but lag won't drop — why?
 
@@ -564,12 +534,9 @@ Adding workers to fix Kafka lag can **overload the DB**.
 
 ### Don't just fix the queue and forget the DB
 
-You added 100 workers to clear the Kafka backlog — but they all write to **one database**. Now the DB is the bottleneck. Scaling workers without scaling/protecting the DB just moves the bottleneck downstream.
+> Full DB-bottleneck deep dive lives in **notification-system-design.md** §22 — condensed here.
 
-The two cheapest, biggest wins:
-
-- **Batch writes** — instead of 5,000 tiny `UPDATE`s, do one `UPDATE ... WHERE id IN (...)`. One round-trip with many rows, not 5,000 single-row round-trips.
-- **Fewer status transitions** — if you don't need `PROCESSING`, go straight `PENDING → SENT`. Every extra state = an extra write.
+100 workers clearing the Kafka backlog all write to **one DB**, so scaling workers without protecting the DB just moves the bottleneck downstream. The two cheapest wins are **batch writes** and **fewer status transitions**:
 
 ```java
 // ❌ 5,000 round-trips
@@ -579,9 +546,7 @@ for (var id : sentIds) db.update("UPDATE notifications SET status='SENT' WHERE i
 db.update("UPDATE notifications SET status='SENT' WHERE id IN (?)", sentIds);
 ```
 
-#### Q: Why avoid `SELECT ... WHERE status='RETRYING'` polling?
-
-Because that query scans a busy table over and over, competing with the live insert/update traffic. Instead, put retries on a **Kafka delayed/retry topic** — the message *comes back* to the worker when it's due, so the DB never gets polled for "what's ready to retry?".
+Avoid `SELECT ... WHERE status='RETRYING'` polling (it scans a busy table, competing with live insert/update traffic) — put retries on a **Kafka delayed/retry topic** so the message comes back when due and the DB is never polled for "what's ready to retry?".
 
 #### Q: Where do indexes help vs hurt here?
 
@@ -760,13 +725,9 @@ notifications (1)  ───►  notification_attempts (many)
 | `scheduled_notifications` | "send later" queue | a cron job drains it |
 | `campaigns` / `campaign_batches` | bulk blast bookkeeping | audience fan-out in chunks |
 
-#### Q: Why split `notifications` and `notification_attempts` at all — why not one table?
+`notifications` and `notification_attempts` are split into two tables because **one message → many channels**, and each channel has its **own** status, provider, retry count, and error. If you crammed it into one row you couldn't say "push SENT but email still RETRYING". Separate attempt rows make each channel **independent** (the whole point of A6's graceful degradation) and give retries a natural home.
 
-Because **one message → many channels**, and each channel has its **own** status, provider, retry count, and error. If you crammed it into one row you couldn't say "push SENT but email still RETRYING". Separate attempt rows make each channel **independent** (the whole point of A6's graceful degradation) and give retries a natural home.
-
-#### Q: What is `notification_key` and why is it `UNIQUE`?
-
-It's the **idempotency key** — a deterministic string like `123:ORDER_CONFIRMED:order_789`. The `UNIQUE` constraint is the database physically refusing to store the same logical message twice. If the Order service accidentally fires the event twice, the second `INSERT` fails, and we return the existing row instead of sending a duplicate.
+`notification_key` is the **idempotency key** — a deterministic string like `123:ORDER_CONFIRMED:order_789`. The `UNIQUE` constraint is the database physically refusing to store the same logical message twice: if the Order service accidentally fires the event twice, the second `INSERT` fails, and we return the existing row instead of sending a duplicate.
 
 ```sql
 -- second identical request can't create a duplicate — the DB blocks it
@@ -774,9 +735,7 @@ INSERT INTO notifications (notification_key, ...) VALUES ('123:ORDER_CONFIRMED:o
 ON CONFLICT (notification_key) DO NOTHING;   -- 0 rows inserted → "already exists, reuse it"
 ```
 
-#### Q: Why version templates instead of editing them?
-
-So an **audit years later still shows exactly what the user saw**. If marketing edits the "promo" wording, we `INSERT version 2` and flip `is_active`; version 1 stays frozen. Each notification also stores the **rendered snapshot** (`title`/`body`) plus `template_version`, so even a later template change can't rewrite history. The `uniq_active_template` partial index guarantees exactly **one** active template per `(type, channel, language)` — no "which one do I use?" ambiguity at render time.
+Templates are versioned instead of edited in place so an **audit years later still shows exactly what the user saw**. If marketing edits the "promo" wording, we `INSERT version 2` and flip `is_active`; version 1 stays frozen. Each notification also stores the **rendered snapshot** (`title`/`body`) plus `template_version`, so even a later template change can't rewrite history. The `uniq_active_template` partial index guarantees exactly **one** active template per `(type, channel, language)` — no "which one do I use?" ambiguity at render time.
 
 ---
 
@@ -923,22 +882,16 @@ Idempotency-Key: 123:ORDER_CONFIRMED:order_789   // same key twice = same notifi
 // → 202 Accepted { notificationId, status: "PENDING" }
 ```
 
-#### Q: Why `202 Accepted` and not `200 OK`?
+The response is `202 Accepted` rather than `200 OK` because `200 OK` implies "done" — and here we are **not** done; we've only *accepted* the work, and delivery happens later in the background. `202 Accepted` is the honest status code for "queued, will process async," and it's the API keeping its promise never to block the caller.
 
-`200 OK` implies "done." Here we are **not** done — we've only *accepted* the work; delivery happens later in the background. `202 Accepted` is the honest status code for "queued, will process async." That's the API keeping its promise never to block the caller.
-
-#### Q: What's the `Idempotency-Key` header for, and why `409 Conflict`?
-
-It's the caller's guarantee against duplicates. If the network hiccups and the Order service retries the exact same request, it sends the **same key**. The server sees the key already exists and returns the **existing** notification (a `409 Conflict` carrying the original `notificationId`) instead of sending a second message. Retrying is now **safe**.
+The `Idempotency-Key` header is the caller's guarantee against duplicates. If the network hiccups and the Order service retries the exact same request, it sends the **same key**. The server sees the key already exists and returns the **existing** notification (a `409 Conflict` carrying the original `notificationId`) instead of sending a second message — retrying is now **safe**.
 
 ```
 1st POST (key=123:ORDER_CONFIRMED:order_789) → 202, creates notification 9001
 2nd POST (same key, a retry)                 → 409, returns existing 9001 (no new send)
 ```
 
-#### Q: Why does the Kafka message carry only `{notificationId, channel}` and not the full title/body?
-
-To keep the queue **small and the truth single**. The worker looks up the full text from the DB when it's ready to deliver. If you copied the whole rendered message into Kafka, you'd bloat the queue and risk it going **stale** (e.g. if the row was updated). A thin pointer is cheaper and always fresh.
+The Kafka message carries only `{notificationId, channel}` rather than the full title/body to keep the queue **small and the truth single**. The worker looks up the full text from the DB when it's ready to deliver; if you copied the whole rendered message into Kafka, you'd bloat the queue and risk it going **stale** (e.g. if the row was updated). A thin pointer is cheaper and always fresh.
 
 ---
 
@@ -1323,28 +1276,19 @@ class SmsWorker {
 }
 ```
 
-#### Q: What's the difference between the Orchestrator and a Worker again?
+To recap the difference between the two: the **Orchestrator is the decision maker** (the "send pipeline"), running once per request — validate → dedup → check prefs → render template → save → enqueue. It decides *whether and what* to send and never touches a provider. The **Worker is the deliverer**, running once per queued job — load the message → call the provider → record `SENT`/`RETRYING`/`FAILED`. It decides *nothing*, it just delivers what it's handed. Keeping them apart means the fast path (accept a request) and the slow path (talk to flaky providers) scale and fail independently.
 
-- **Orchestrator = the decision maker (the "send pipeline").** Runs once per request: validate → dedup → check prefs → render template → save → enqueue. It decides *whether and what* to send. It never touches a provider.
-- **Worker = the deliverer.** Runs once per queued job: load the message → call the provider → record `SENT`/`RETRYING`/`FAILED`. It decides *nothing*, it just delivers what it's handed.
+Bothering with all these interfaces (ports) isn't over-engineering — it buys three concrete payoffs: you can **swap providers** without touching logic (Twilio → SNS, SES → SendGrid); you can **test easily** by plugging in a `FakeSmsPort` that records calls with no real SMS sent; and you can **hide messy details**, since provider fallback, retry, and platform routing all live *inside* the adapter, keeping the orchestrator/worker clean.
 
-Keeping them apart means the fast path (accept a request) and the slow path (talk to flaky providers) scale and fail independently.
+There are so many background workers (SchedulerJob, RetryDispatcher, ReconciliationSweeper) because each one owns a **single "eventually" job** that shouldn't sit on the hot request path: **SchedulerJob** handles "send this later" (reminders) by polling due rows every minute; **RetryDispatcher** nudges failed attempts when their backoff timer is up; and **ReconciliationSweeper** is the safety net for the dual-write gap, re-enqueuing stuck `PENDING` rows — it's idempotent, so re-enqueuing something already sent is harmless (the worker skips it).
 
-#### Q: Why bother with all these interfaces (ports) — isn't it over-engineering?
+#### Q: Why split the orchestrator and the worker at all — why not one class that decides *and* delivers?
 
-Three concrete payoffs:
+Because the two halves have **opposite runtime profiles**. The orchestrator runs **once per request** on the hot path and must return in milliseconds; it only touches fast, reliable things (DB, cache, a Kafka publish). The worker runs **once per queued job** on the slow path and talks to **flaky, rate-limited providers** (FCM/Twilio/SES) that can take seconds or fail. Fusing them would drag the caller's latency down to provider speed and couple their scaling (you'd scale "deciding" just to get more "delivering"). Keeping them apart lets the fast path stay fast and each side scale and fail independently — which is exactly why Kafka sits between them.
 
-1. **Swap providers** without touching logic (Twilio → SNS, SES → SendGrid).
-2. **Test easily** — plug a `FakeSmsPort` that records calls, no real SMS sent.
-3. **Hide messy details** — provider fallback, retry, platform routing all live *inside* the adapter, so the orchestrator/worker stays clean.
+#### Q: Outbox poller vs reconciliation sweeper — do I need both?
 
-#### Q: Why so many background workers (SchedulerJob, RetryDispatcher, ReconciliationSweeper)?
-
-Each one owns a **single "eventually" job** that shouldn't sit on the hot request path:
-
-- **SchedulerJob** — "send this later" (reminders) → polls due rows every minute.
-- **RetryDispatcher** — nudges failed attempts when their backoff timer is up.
-- **ReconciliationSweeper** — the safety net for the dual-write gap: re-enqueues stuck `PENDING` rows. Idempotent, so re-enqueuing something already sent is harmless (the worker skips it).
+They close the **same dual-write gap** at different strengths. The **outbox poller** is the *primary, tight* fix: the notification row **and** an outbox row are written in **one transaction**, and the poller (`SELECT ... FOR UPDATE SKIP LOCKED` → publish → mark `SENT`) guarantees every committed row eventually reaches Kafka — the two can't disagree. The **reconciliation sweeper** is the *loose backstop*: it re-enqueues any `PENDING` row older than N minutes, catching anything the happy path missed (e.g. a system without a full outbox). In an interview, lead with the outbox as the correct fix and mention the sweeper as defense-in-depth. Both are safe because workers are idempotent (`attempt.status == SENT` skip).
 
 ---
 
@@ -1414,9 +1358,7 @@ NotificationStatus rollUp(List<Attempt> attempts) {
 }
 ```
 
-#### Q: What is `PARTIALLY_SENT` and why does it exist?
-
-Because a single notification fans out to several channels (push + email + in-app), they can end **differently**: push delivered, email bounced. The message as a whole isn't fully `SENT` nor fully `FAILED` — it's **`PARTIALLY_SENT`**. This lets the email attempt keep retrying on its own **without** re-sending the push that already worked.
+`PARTIALLY_SENT` exists because a single notification fans out to several channels (push + email + in-app), and they can end **differently**: push delivered, email bounced. The message as a whole isn't fully `SENT` nor fully `FAILED` — it's **`PARTIALLY_SENT`**. This lets the email attempt keep retrying on its own **without** re-sending the push that already worked.
 
 #### Q: Attempt vs Notification status — which one drives retries?
 
@@ -1513,6 +1455,14 @@ if (attempt.status == SENT) return;          // duplicate Kafka message → skip
 
 Both guards are needed because duplicates can appear at either door: the API guard blocks a duplicate *request*, and the worker guard blocks a duplicate *delivery*.
 
+#### Q: If the API already blocks duplicate requests, why does the worker check again?
+
+Because they defend **different failure modes**. The API's `UNIQUE(notification_key)` stops the *source* from creating two notifications (Order service fires the event twice). But once a job is on Kafka, **Kafka itself is at-least-once** — the *same* job can be redelivered to the worker (rebalance, offset not committed before crash) even though the request was never duplicated. So the worker re-checks `attempt.status == SENT` right before calling the provider. Drop either guard and a duplicate slips through the *other* door. This is the "two-stage" model: dedup the request at stage 1, dedup the delivery at stage 2.
+
+#### Q: Is there a separate "idempotency store," or is the DB the store?
+
+Here the **database *is* the idempotency store** — the `UNIQUE(notification_key)` constraint on `notifications` is the whole mechanism, no extra Redis "seen keys" set to keep in sync. The key is **deterministic** (`userId:type:entityId`), so a retried request rebuilds the *same* key, the second `INSERT ... ON CONFLICT DO NOTHING` no-ops, and we return the existing row. (A dedicated store like Redis `SET NX` is an option when you want to reject a duplicate *before* touching the DB, but it adds a second source of truth to reconcile — the unique constraint alone is simpler and authoritative.)
+
 #### Retries with backoff + jitter — "don't all stampede back at once"
 
 When a provider blips (HTTP 503), we don't give up and we don't hammer it. We wait, and **each retry waits longer** (exponential backoff): 1 min, 5 min, 30 min. Crucially we add **jitter** (a little randomness) so that 10,000 failed messages don't *all* retry at the exact same second and knock the provider over the moment it recovers.
@@ -1528,9 +1478,7 @@ Duration backoff(int attempt) {
 
 Without jitter, if every failed message retried at the *same* instant, they'd hit the recovering provider in one synchronized spike. Jitter = each retry waits a *slightly different* amount, spreading the load over a window.
 
-#### Q: What's a DLQ and when does a message land there?
-
-**DLQ = Dead Letter Queue** — the "we gave up auto-retrying, a human should look" bin. A message goes there after it exhausts `MAX_RETRIES` (transient failures that never recovered) or on a **poison** message (malformed, will never succeed). It's parked, not lost, and on-call gets alerted on **DLQ depth**.
+A **DLQ (Dead Letter Queue)** is the "we gave up auto-retrying, a human should look" bin. A message lands there after it exhausts `MAX_RETRIES` (transient failures that never recovered) or on a **poison** message (malformed, will never succeed). It's parked, not lost, and on-call gets alerted on **DLQ depth**.
 
 #### Rate limiting — "no more than 5 promos a day"
 
@@ -1546,9 +1494,7 @@ if (count > limit(type)) return false;             // over the cap → skip this
 
 Redis counts each promotional send; past the daily cap, further promos are skipped — but transactional messages (OTPs) are never capped.
 
-#### Q: Campaign fan-out — how do we notify 10M users without exploding?
-
-Two rules: **stream, don't load**, and **batch**. You pull the audience with a cursor (never `SELECT` 10M rows into memory), chop them into batches of ~5,000, and drop each batch on Kafka. Each user in a batch then becomes a **normal `send()`** — so campaigns automatically inherit the *same* preferences, rate limits, dedup, and workers as one-off notifications.
+Campaign fan-out notifies 10M users without exploding by following two rules: **stream, don't load**, and **batch**. You pull the audience with a cursor (never `SELECT` 10M rows into memory), chop them into batches of ~5,000, and drop each batch on Kafka. Each user in a batch then becomes a **normal `send()`** — so campaigns automatically inherit the *same* preferences, rate limits, dedup, and workers as one-off notifications.
 
 ```java
 var cursor = segmentService.streamUsers(segmentId);   // lazy — one page at a time
@@ -1562,9 +1508,7 @@ for (long userId : cursor) {
 
 The key point: you never load all 10M users into memory at once — you stream them in pages and publish batches as you go.
 
-#### Q: The scheduler — how does "send at T-1hr" work without double-sending?
-
-A cron job wakes every minute and grabs rows whose `scheduled_at <= now` and `status = PENDING`, sends them, and flips them to `DISPATCHED`. To stop two scheduler instances grabbing the same row, use `SELECT … FOR UPDATE SKIP LOCKED` (or update-and-check-rows-affected) so each row is claimed by exactly one worker.
+The scheduler sends "at T-1hr" without double-sending by having a cron job wake every minute and grab rows whose `scheduled_at <= now` and `status = PENDING`, send them, and flip them to `DISPATCHED`. To stop two scheduler instances grabbing the same row, use `SELECT … FOR UPDATE SKIP LOCKED` (or update-and-check-rows-affected) so each row is claimed by exactly one worker.
 
 ---
 
@@ -1600,9 +1544,7 @@ Read the diagram left-to-right:
 
 Notice the **handoff at Kafka**: everything left of it is "decide" (fast), everything right of it is "deliver" (async). The API never waits for FCM — that's the async boundary from A4 in action.
 
-#### Q: If the whole thing is async, how does the caller know it worked?
-
-It doesn't wait to find out — it trusts the `202` and moves on. Delivery outcome lands in the **DB** (attempt/notification status) and, for the user, as the actual push/email. If a caller *needs* delivery status, it reads it back later or subscribes to a status event — but it never blocks the original request on it.
+Since the whole thing is async, the caller doesn't wait to find out whether it worked — it trusts the `202` and moves on. Delivery outcome lands in the **DB** (attempt/notification status) and, for the user, as the actual push/email. If a caller *needs* delivery status, it reads it back later or subscribes to a status event — but it never blocks the original request on it.
 
 ---
 
@@ -1640,9 +1582,7 @@ Walk it as "try, wait, try again, eventually give up":
 try → 503 → RETRYING (+1m) → try → 503 → RETRYING (+5m) → … → FAILED → DLQ → alert
 ```
 
-#### Q: Why push the retry to a topic instead of just `Thread.sleep(60_000)` in the worker?
-
-Because sleeping **ties up a worker thread** doing nothing for a minute (or 30!), and if the worker crashes mid-sleep the retry is lost. Parking it on a **delayed topic** frees the worker to process other jobs, and the retry survives restarts (it's durably in Kafka). The timer lives in the queue, not in a blocked thread.
+The retry is pushed to a topic rather than a plain `Thread.sleep(60_000)` in the worker because sleeping **ties up a worker thread** doing nothing for a minute (or 30!), and if the worker crashes mid-sleep the retry is lost. Parking it on a **delayed topic** frees the worker to process other jobs, and the retry survives restarts since it's durably in Kafka — the timer lives in the queue, not in a blocked thread.
 
 #### Q: Transient vs permanent failure — how does the worker decide whether to retry?
 
@@ -1680,15 +1620,9 @@ segment (10M) → stream in pages → batch(5k) → Kafka → unpack → send() 
                 (never all in RAM)                              (reuses prefs, rate limits, retries)
 ```
 
-#### Q: Why batches of 5,000 instead of one message per user, or one giant message?
+Batches of ~5,000 beat the alternatives: one-per-user at the producer means 10M tiny publishes, huge overhead, and a slow producer, while one giant message means a 10M-user blob that's impossible to retry or track partially. Batches of ~5k are the sweet spot — few enough to publish fast, small enough to retry/track a chunk, and they naturally throttle the firehose.
 
-- **One-per-user at the producer** = 10M tiny publishes = huge overhead and a slow producer.
-- **One giant message** = a 10M-user blob that's impossible to retry or track partially.
-- **Batches of ~5k** = the sweet spot: few enough to publish fast, small enough to retry/track a chunk, and they naturally throttle the firehose.
-
-#### Q: A user has "max 5 promos/day" — does a campaign bypass that?
-
-**No.** Because each campaign recipient goes through the **same `send()`** pipeline, the per-user rate limit, quiet hours, and opt-outs all still apply. If a user already hit their promo cap, the campaign send for them is simply skipped — the blast can't spam anyone the normal rules would protect.
+A campaign does **not** bypass a user's "max 5 promos/day" cap. Because each campaign recipient goes through the **same `send()`** pipeline, the per-user rate limit, quiet hours, and opt-outs all still apply. If a user already hit their promo cap, the campaign send for them is simply skipped — the blast can't spam anyone the normal rules would protect.
 
 ---
 
@@ -1719,13 +1653,9 @@ now:       INSERT scheduled_notifications(scheduled_at = 6:00pm, status=PENDING)
 every min: SELECT ... WHERE status='PENDING' AND scheduled_at <= now()  → send() → status=DISPATCHED
 ```
 
-#### Q: Why store it in a table + poll, instead of an in-memory timer?
+It's stored in a table and polled, rather than kept as an in-memory timer, because in-memory timers **die when the process restarts** — a reboot would silently drop every pending reminder. A DB row is durable: it survives crashes, deploys, and scaling, and any scheduler instance can pick it up. The trade-off is a tiny delay (up to the 1-minute poll interval), which is fine for reminders.
 
-Because in-memory timers **die when the process restarts** — a reboot would silently drop every pending reminder. A DB row is durable: it survives crashes, deploys, and scaling, and any scheduler instance can pick it up. The trade-off is a tiny delay (up to the 1-minute poll interval), which is fine for reminders.
-
-#### Q: Two scheduler instances are running — won't they both send the same reminder?
-
-They could, so we prevent it: claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (or `UPDATE … WHERE status='PENDING'` and check rows-affected). Whichever instance claims the row processes it; the other simply skips locked rows. Plus the notification's own idempotency key is a final backstop against a double-send.
+Running two scheduler instances doesn't mean they'll both send the same reminder, because rows are claimed with `SELECT … FOR UPDATE SKIP LOCKED` (or `UPDATE … WHERE status='PENDING'` and checking rows-affected). Whichever instance claims the row processes it; the other simply skips locked rows. Plus the notification's own idempotency key is a final backstop against a double-send.
 
 ---
 
@@ -1760,9 +1690,7 @@ The layered defenses, in plain terms:
 "exactly once" (hard)  ≈  at-least-once delivery  +  idempotent handlers  →  user sees it once
 ```
 
-#### Q: What does "at-least-once + idempotent" actually guarantee the user sees?
-
-**Exactly one delivered message, effectively.** We might *attempt* twice under the hood (a retry, a duplicate Kafka message), but the two guards above collapse those into a single real send. The user gets their OTP once — never zero times (we retry) and never twice (we dedup).
+What "at-least-once + idempotent" actually guarantees the user sees is **exactly one delivered message, effectively**. We might *attempt* twice under the hood (a retry, a duplicate Kafka message), but the two guards above collapse those into a single real send. The user gets their OTP once — never zero times (we retry) and never twice (we dedup).
 
 #### Q: Why partition Kafka by `user_id`?
 
@@ -1799,13 +1727,9 @@ NotificationPreference getPref(long userId, String type) {
 // on PUT /preferences → redis.del("pref:"+userId+":"+type);  // invalidate, so next read is fresh
 ```
 
-#### Q: What's the `unread:{userId}` counter and why isn't it just `COUNT(*)`?
+The `unread:{userId}` counter isn't just `COUNT(*)` because the bell icon shows an unread badge on **every** app open, and running `SELECT COUNT(*) ... WHERE is_read=false` each time would hammer the DB. So we keep a tiny integer in Redis: `INCR` when a notification is created, `DECR` when one is read, `SET 0` on "mark all read". It's an **O(1)** read for a screen that's viewed constantly, and the DB stays the source of truth (rebuild the counter on a cache miss).
 
-The bell icon shows an unread badge on **every** app open — running `SELECT COUNT(*) ... WHERE is_read=false` each time would hammer the DB. So we keep a tiny integer in Redis: `INCR` when a notification is created, `DECR` when one is read, `SET 0` on "mark all read". It's an **O(1)** read for a screen that's viewed constantly. The DB stays the source of truth (rebuild the counter on a cache miss).
-
-#### Q: What if the cache and DB disagree (stale preference)?
-
-For preferences/templates a few minutes of staleness is acceptable, and the **short TTL + invalidate-on-write** keeps drift tiny. The DB is always the source of truth; the cache is a fast, disposable copy. We never let a cache be the *only* home for something we can't afford to lose.
+If the cache and DB disagree on a preference, that's acceptable: a few minutes of staleness is fine, and the **short TTL + invalidate-on-write** keeps drift tiny. The DB is always the source of truth; the cache is a fast, disposable copy — we never let a cache be the *only* home for something we can't afford to lose.
 
 ---
 
@@ -1847,9 +1771,7 @@ catch (HardBounceException e)   { markFailed(attempt); }                 // perm
 catch (ProviderDownException e) { scheduleRetryWithBackoff(job); }        // transient → try later
 ```
 
-#### Q: When do we retry vs give up?
-
-Ask "**would trying again ever help?**" Transient problems (provider down, timeout, temporary token failure) → retry with backoff. Permanent problems (invalid email, hard bounce, no devices, missing template) → give up immediately and record `FAILED`. Retrying a permanently-broken send just wastes time and provider quota — and delays the DLQ alert a human needs to see.
+The rule for retry vs give up is "**would trying again ever help?**" Transient problems (provider down, timeout, temporary token failure) get a retry with backoff. Permanent problems (invalid email, hard bounce, no devices, missing template) mean giving up immediately and recording `FAILED` — retrying a permanently-broken send just wastes time and provider quota, and delays the DLQ alert a human needs to see.
 
 #### Q: Do OTPs really ignore quiet hours and rate limits?
 
@@ -1885,6 +1807,92 @@ Yes — they're **transactional and essential**. Quiet hours and the "5/day" cap
 Each row is a common interview ask, with the **big-picture answer** (HLD) and the **concrete detail** (LLD) side by side. Answer in that order: sketch the shape first, then drop into specifics only if pushed.
 
 > **One-breath summary of the whole system:** *A source drops a request → the API decides (prefs, template, dedup) and saves it → Kafka decouples decide from deliver → per-channel workers deliver via provider adapters, retrying with backoff and DLQ → idempotency everywhere makes at-least-once look like exactly-once.* If you can say that and then zoom into any one piece (retries, fan-out, scheduling, hot topics), you've got the design.
+
+---
+
+## Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?"
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Notification record creation** | **CP** (strong consistency) | the `INSERT ... ON CONFLICT (notification_key)` is atomic — the unique constraint *is* the dedup guarantee (B1, B5) |
+| **Delivery status** (per-channel attempts) | **Eventual** | at-least-once + idempotent workers; the `SENT` flag lands async after the provider replies (B3.4, B4) |
+| **OTP / transactional path** | **Favor consistency + freshness** | never dropped, never delayed by quiet hours/rate limits; the code itself carries a short TTL (B12) |
+| **Preferences / templates (cache)** | **AP** (availability + eventual) | a few minutes of stale cache is fine; short TTL + invalidate-on-write (B11) |
+| **Promotions / campaigns** | **Eventual** | throttled, retryable, capped per user; delivery lag is acceptable (B8) |
+
+- The **create** is strongly consistent at a single source-of-truth row (RDBMS unique constraint), so a duplicate request can never mint a second notification.
+- Everything downstream — enqueue, deliver, roll-up status — is **eventually consistent**, made safe by idempotent workers (attempt-level `SENT` skip).
+
+> ⚠️ **Pitfall:** don't promise "exactly-once delivery." Over unreliable networks it's impractical — say **at-least-once + idempotency**, which gives the user *effectively-once* while never risking a lost OTP.
+
+> One-liner: **"Strong consistency when creating the record (dedup); eventual consistency on delivery; the OTP path always favors reliability and freshness over politeness."**
+
+---
+
+## Interview Cheat Sheet
+
+> 💡 **Tip:** answer HLD-shape first, then drop straight into the LLD artifact that proves it (the DDL, the state machine, the sequence). That's what this companion is for.
+
+> **"Walk me through the notification LLD."**
+>
+> "A source hits `POST /v1/notifications` with an **`Idempotency-Key`**. The orchestrator **dedups** on `UNIQUE(notification_key)`, resolves **preferences + template**, and in one transaction persists a `notifications` row plus one `notification_attempts` row **per channel**, then enqueues a thin `{notificationId, channel}` job to Kafka and returns **`202`**. Per-channel **workers** deliver via provider adapters and update the attempt to `SENT`/`RETRYING`/`FAILED`. Retries use **backoff + jitter on a delayed topic**, then a **DLQ**. The notification's status is **rolled up** from its attempts."
+
+> **"How do you guarantee no duplicates?"**
+>
+> "**Two-stage dedup.** Stage 1 at the API: `INSERT ... ON CONFLICT (notification_key) DO NOTHING` — the DB refuses a second identical request. Stage 2 at the worker: check `attempt.status == SENT` before calling the provider, because Kafka is at-least-once. One guard blocks a duplicate *request*, the other a duplicate *delivery*."
+
+> **"A notification is saved but never enqueued — what happens?"**
+>
+> "That's the **dual-write gap**. Primary fix: the **outbox pattern** — write the row and an outbox record in the *same* transaction; a poller publishes from the outbox. Backstop: a **reconciliation sweeper** re-enqueues any `PENDING` row older than N minutes. Safe because workers are idempotent."
+
+> **"One channel fails but the others succeed?"**
+>
+> "Each channel is its **own attempt row**, so push can be `SENT` while email is `RETRYING`. The notification rolls up to **`PARTIALLY_SENT`**, and only the failed channel retries — the delivered push is never re-sent."
+
+> **"Notify 10M users for a campaign?"**
+>
+> "**Stream, don't load**: cursor through the segment, batch ~5,000 user IDs per Kafka message, and each recipient becomes an ordinary `send()` — so prefs, rate limits, quiet hours, and dedup all still apply."
+
+> **"Scheduled reminder without a double-send?"**
+>
+> "Persist to `scheduled_notifications`; a cron polls due rows every minute and claims them with `SELECT ... FOR UPDATE SKIP LOCKED` (or update-and-check-rows-affected). Durable across restarts; the idempotency key is the final backstop."
+
+> **"OTP at 2 AM — quiet hours?"**
+>
+> "Quiet hours and the daily cap apply to **`PROMOTION`** types only. **Transactional** types (OTP, payment alerts) bypass them — blocking those would break the product."
+
+### LLD pointers (where each answer lives)
+
+| Interview ask | Go to |
+| --- | --- |
+| Schema / indexes | B1 |
+| API contracts / `202` / `409` | B2 |
+| Class design, ports & adapters | B3 |
+| Status roll-up, `PARTIALLY_SENT` | B4 |
+| Dedup, retry/backoff, campaign fan-out, scheduler | B5 |
+| Happy path / retry+DLQ / campaign / scheduled sequences | B6–B9 |
+| Concurrency & correctness table | B10 |
+| Caching (`unread` counter, cache-aside) | B11 |
+| Edge cases / dual-write / templates | B12 |
+
+---
+
+## Final Takeaways
+
+- **API orchestrates, workers deliver** — never call FCM/Twilio synchronously from the API; return `202 Accepted` after enqueue.
+- **Two tables, one message → many attempts** — `notifications` (logical message + rolled-up status) and `notification_attempts` (per-channel, where retries live).
+- **Two-stage dedup** — `UNIQUE(notification_key)` at the API, `attempt.status == SENT` skip at the worker.
+- **At-least-once + idempotency ≈ exactly-once** — the user sees the message once, even if we attempt twice under the hood.
+- **Outbox (or reconciliation sweeper)** closes the dual-write gap between DB insert and Kafka publish.
+- **Per-channel independence** — one channel failing yields `PARTIALLY_SENT`, never blocks the others.
+- **Retry with backoff + jitter → DLQ** — park retries on a delayed topic; never `Thread.sleep` a worker.
+- **Ports & adapters** — providers, queue, cache, and repo sit behind interfaces; swap Twilio→SNS with a wiring change.
+- **Campaigns reuse `send()`** — stream + batch; per-user rules still apply.
+- **Strong consistency on create, eventual on delivery; OTP always favors reliability.**
+
+> One-breath summary: *source → API decides (prefs, template, dedup) + saves → Kafka decouples decide from deliver → per-channel workers deliver via adapters, retrying with backoff/DLQ → idempotency everywhere makes at-least-once look like exactly-once.*
 
 ---
 

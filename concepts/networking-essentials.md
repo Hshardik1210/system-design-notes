@@ -13,6 +13,9 @@
 - [3. TCP vs UDP](#3-tcp-vs-udp)
 - [4. HTTP Versions (1.1 / 2 / 3)](#4-http-versions-11--2--3)
 - [5. TLS / HTTPS](#5-tls--https)
+- [Connection Pooling, NAT & Hardening](#connection-pooling-nat--hardening)
+- [Common Mistakes](#common-mistakes)
+- [When NOT to Use HTTP/3 / UDP-First](#when-not-to-use-http3--udp-first)
 - [6. Interview Cheat Sheet](#6-interview-cheat-sheet)
 - [7. Final Takeaways](#7-final-takeaways)
 
@@ -41,6 +44,45 @@ Visiting `example.com` involves several distinct steps, each solving a different
 6. **Keep-alive = reusing the connection.** Rather than open a new connection per request, the connection stays open to fetch more (images, scripts, next page).
 
 Everything below is just each of those steps in detail.
+
+#### The full journey, end to end
+
+Stitching every step together — including the optional CDN/load-balancer hop — one page load looks like this:
+
+```
+ you type https://example.com/page
+        │
+        ▼
+ ┌──────────────┐   name → IP
+ │     DNS      │   browser/OS cache → resolver → root → TLD → authoritative
+ └──────┬───────┘   returns a PUBLIC IP (often a CDN/LB edge, not the origin)
+        │  93.184.216.34:443
+        ▼
+ ┌──────────────┐   SYN / SYN-ACK / ACK
+ │  TCP (or QUIC)│  reliable connection to that IP:port  (QUIC = 1 step, over UDP)
+ └──────┬───────┘
+        │
+        ▼
+ ┌──────────────┐   verify cert (CA chain, hostname) → key exchange → session key
+ │     TLS      │   handshake; 1-RTT in TLS 1.3
+ └──────┬───────┘
+        │  encrypted from here on
+        ▼
+ ┌──────────────┐   GET /page HTTP/2
+ │     HTTP     │   request travels over the secured connection
+ └──────┬───────┘
+        │
+        ▼
+ ┌───────────────────────── optional hops ──────────────────────────┐
+ │  CDN edge  ──►  Load Balancer  ──►  reverse proxy  ──►  app server │
+ │  (cache hit? serve now)   (pick a healthy backend)   (business logic)│
+ └──────┬────────────────────────────────────────────────────────────┘
+        │  200 OK + HTML  (then CSS/JS/images reuse the SAME kept-alive connection)
+        ▼
+     browser renders
+```
+
+The first four boxes are *always* there; the CDN/LB/proxy row is what production systems add for caching, scaling, and TLS termination.
 
 #### Q: What's the difference between an IP address and a port?
 
@@ -200,6 +242,8 @@ Ask: *"Is a lost or out-of-order piece a disaster, or just a tiny glitch?"*
 - **HTTP/2 multiplexing:** many concurrent requests over one TCP connection (no more 6-connection limit).
 - **HTTP/3/QUIC:** independent streams so one lost packet doesn't stall the others; 0-RTT resumption.
 
+> ⚠️ **pitfall:** HTTP/2 multiplexing removes *application-level* head-of-line blocking, **not transport-level**. Every stream still shares one TCP connection, so a single lost packet stalls **all** streams until TCP retransmits it. "Multiplexing" is not the same as "no blocking" — only HTTP/3 (QUIC) makes the streams truly independent.
+
 ### What differs between HTTP versions
 
 **HTTP is the request/response protocol** the browser and server speak: "GET `/index.html`" → "here it is, 200 OK." All three versions use the same request/response model — they differ in **how efficiently they move the messages** over the wire.
@@ -315,9 +359,84 @@ So asymmetric crypto is used *once* to securely agree on a symmetric key; then t
 - **TLS termination** = the point where HTTPS is *decrypted*. Often this happens at the **load balancer or CDN** at the edge: it decrypts once, then forwards plain (or re-encrypted) traffic to internal app servers within the trusted private network. This offloads crypto work from app servers.
 - **mTLS (mutual TLS)** = *both* sides present certificates, not just the server. Normal HTTPS only verifies the server; mTLS also verifies the *client*. Used for **service-to-service authentication** inside a system, where each service proves its identity to the others.
 
+> ⚠️ **pitfall:** TLS termination means the decrypted plaintext exists in memory at the terminating box (LB/CDN). Anything past that point is only as private as the network it rides on. Don't assume "we use HTTPS" implies end-to-end encryption — it protects the *client → edge* leg, not automatically the *edge → backend* leg.
+
+#### Q: If the load balancer decrypts, isn't traffic plaintext inside the VPC?
+
+Yes — after TLS termination, the leg from the LB to your app servers is unencrypted **unless you do something about it**. Whether that's acceptable depends on your threat model:
+
+- **Plaintext inside the VPC** — common and often fine when the private network is trusted (isolated subnets, security groups, no other tenants). Simplest and fastest.
+- **Re-encryption (TLS re-origination)** — the LB decrypts to inspect/route, then opens a *fresh* TLS connection to the backend. Protects against sniffing on the internal network at the cost of a second handshake.
+- **mTLS between services** — for zero-trust setups, every internal hop authenticates *and* encrypts, so a compromised host can't freely read or impersonate traffic. This is what service meshes (Istio, Linkerd) automate.
+
+Rule of thumb: the more your "private" network is actually shared (multi-tenant, multiple teams, compliance requirements), the more you want re-encryption or mTLS instead of trusting the VPC boundary.
+
+#### Worked example: mTLS between two services
+
+Service **A** calls service **B**, and *both* prove their identity with a certificate:
+
+```
+Service A (client)                              Service B (server)
+  │  ── ClientHello ─────────────────────────►   │
+  │  ◄── ServerHello + B's cert ──────────────    │  B proves it is "service-b"
+  │  [A verifies B's cert against the internal CA] │
+  │  ── A's client cert ─────────────────────►    │  A proves it is "service-a"
+  │  [B verifies A's cert against the internal CA] │  ← extra step vs normal TLS
+  │  ── key exchange ────────────────────────►    │
+  │  ◄───────────────────────────────────────     │
+  │  ==== encrypted; each side KNOWS who the other is ====
+```
+
+```bash
+# A presents BOTH its cert and the CA that signed B's cert
+curl https://service-b.internal/api \
+  --cert   /certs/service-a.crt \    # A's identity (client cert)
+  --key    /certs/service-a.key \    # A's private key
+  --cacert /certs/internal-ca.crt    # trust anchor for verifying B
+```
+
+Because both certs chain to the same **internal CA**, B can reject any caller without a valid cert — so a random pod that gets onto the network still can't call B. That's the core of zero-trust service-to-service auth.
+
 #### Q: What do 1-RTT and 0-RTT mean?
 
 **RTT = round trip time** (one message out and back). Older TLS needed several round trips to handshake before any data — noticeable latency. **TLS 1.3** cuts this to **1-RTT** (one round trip), and for a server you've talked to before, **0-RTT** lets you send data on the very first message. Fewer round trips = faster page loads, especially on high-latency mobile networks.
+
+> ⚠️ **pitfall (0-RTT replay):** 0-RTT "early data" (in TLS 1.3 and QUIC/HTTP/3) has no round trip to prove freshness, so a network attacker can **capture and replay** it. A replayed `GET` is harmless, but a replayed `POST /transfer` could execute twice. Only send **idempotent, non-state-changing** requests as 0-RTT; leave anything with side effects for after the handshake completes.
+
+---
+
+## Connection Pooling, NAT & Hardening
+
+A few small but frequently-asked pieces that sit around the four core layers.
+
+- **Keep-alive / connection pooling** — opening a connection is expensive (TCP + TLS handshakes = multiple round trips). **Keep-alive** leaves a connection open to reuse for later requests; a **connection pool** keeps a set of ready connections so callers borrow one instead of handshaking each time. This is why HTTP clients, DB drivers, and service-to-service calls all pool connections — the handshake is paid once, then amortized over many requests.
+- **NAT & private IPs** — most machines sit behind **NAT (Network Address Translation)** on **private IPs** (`10.x`, `192.168.x`, `172.16–31.x`) that aren't routable on the public internet. NAT rewrites the source address so many internal hosts share one public IP outbound. This is why **DNS returns *public* IPs** — a client can only connect to a publicly routable address (the LB/CDN/gateway), which then forwards inward to private backends.
+- **HSTS** — a response header (`Strict-Transport-Security`) that tells the browser "only ever use HTTPS for this domain," preventing downgrade-to-HTTP attacks even on the first click after it's remembered.
+- **Certificate pinning** — the client hard-codes which cert/CA it will accept for a host, so a valid-but-attacker-obtained cert from *another* CA is rejected. Common in mobile apps; use sparingly since a bad pin can lock users out on cert rotation.
+
+> 💡 **tip:** In a design interview, "reuse the connection (keep-alive / pooling)" is the standard answer to "how do you cut latency between services?" — it removes repeated handshake round trips without any protocol change.
+
+---
+
+## Common Mistakes
+
+- **Conflating HTTP/2 multiplexing with "no blocking."** Multiplexing removes *application-level* head-of-line blocking; the shared TCP connection still suffers *transport-level* HOL blocking on packet loss. Only HTTP/3 (QUIC) fixes it.
+- **Skipping hostname verification in TLS.** Checking that a cert is *validly signed* is not enough — you must also verify it was issued **for the hostname you dialed**. A valid cert for `attacker.com` must not be accepted for `example.com`. (Disabling this — e.g. `verify=False`, `-k`, `InsecureSkipVerify` — silently reopens the door to man-in-the-middle.)
+- **Assuming UDP is always unreliable.** UDP is *best-effort by default*, but reliability can be built on top of it — HTTP/3/QUIC re-adds ordering, retransmission, and congestion control over UDP. "UDP" doesn't automatically mean "lossy app."
+- **Treating HTTPS as end-to-end.** After TLS termination the internal leg may be plaintext; add re-encryption or mTLS if the internal network isn't trusted.
+- **Sending state-changing requests as TLS 0-RTT early data.** Replayable — keep non-idempotent requests for after the handshake.
+
+---
+
+## When NOT to Use HTTP/3 / UDP-First
+
+HTTP/3 (and UDP-first transports generally) is a big win on lossy, high-latency, mobile networks — but it isn't always the right default:
+
+- **Restrictive firewalls / middleboxes** — many corporate and older networks block or throttle **UDP** (they're tuned for TCP on 80/443). QUIC can be dropped entirely; you *need* a TCP fallback (HTTP/2 or 1.1), which browsers do automatically.
+- **Stable, low-loss datacenter links** — inside a datacenter, packet loss is rare and RTT is tiny, so TCP HOL blocking almost never bites. The benefit of QUIC shrinks while its **CPU cost** (userspace crypto/packet handling, less kernel/NIC offload) can make it *slower* for east-west service traffic.
+- **Environments needing deep TCP tooling** — mature load balancers, DPI, and observability are built around TCP; QUIC's encrypted transport hides much of what those tools inspect.
+
+> 💡 **tip:** Treat HTTP/3 as a client-edge optimization (browser → CDN/LB over the public internet), and keep **TCP-based HTTP/2** for internal, datacenter-to-datacenter calls. Always keep a TCP fallback path; never make UDP the *only* option.
 
 ---
 

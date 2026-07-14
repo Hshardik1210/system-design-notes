@@ -34,15 +34,14 @@ Foundational building blocks — reusable across any system design.
 
 ## 🏗️ System Design
 
-End-to-end designs that apply the concepts above.
+End-to-end designs for **HLD + LLD interview prep** — each doc is a deep dive (architecture, schema, core flows, concurrency, scaling) with sparse beginner callouts, one data model, one design-patterns table, and an interview cheat sheet. Start with [BookMyShow](system-design/bookmyshow-system-design.md) as the template for how the rest are structured.
 
 | Note | What's inside |
 | --- | --- |
 | [BookMyShow — System Design](system-design/bookmyshow-system-design.md) | Seat locking, atomic conditional updates, Redis+DB hybrid lock, payments, outbox+saga, scaling, CAP trade-offs |
 | [BookMyShow — HLD & LLD](system-design/bookmyshow-hld-lld.md) | High- & low-level design: architecture, DDL schema, API contracts, state machines, class design & interfaces |
 | [URL Shortener — System Design](system-design/url-shortener-system-design.md) | base62 encoding, distributed ID generation (KGS/Snowflake), redirects (301 vs 302), caching, analytics, scaling & reliability |
-| [Food Ordering & Delivery — System Design](system-design/food-ordering-system-design.md) | Swiggy/Zomato: 3-sided marketplace, hyperlocal geo-search, real-time delivery-partner dispatch, live GPS tracking, ETA, order state machine, vs Flipkart comparison |
-| [Food Ordering & Delivery — HLD & LLD](system-design/food-ordering-hld-lld.md) | Companion: **all tables** (DDL), full API contracts, class design, **design patterns**, state machines, algorithms, sequences |
+| [Food Ordering & Delivery — System Design](system-design/food-ordering-system-design.md) | Swiggy/Zomato: 3-sided marketplace, hyperlocal geo-search, real-time delivery-partner dispatch, live GPS tracking, ETA, order state machine, vs Flipkart comparison — plus full **HLD & LLD**: all tables (DDL), API contracts, class design, **design patterns**, sequences |
 | [Ride-Hailing — System Design](system-design/ride-hailing-system-design.md) | Uber/Ola: geospatial driver index, real-time matching/dispatch, live tracking, surge pricing, trip state machine, design patterns |
 | [Chat & Messaging — System Design](system-design/whatsapp-chat-system-design.md) | WhatsApp: WebSocket gateways, connection registry, delivery/read receipts, offline sync, group fan-out, presence, ordering, design patterns |
 | [Hotel Management & Reservation — System Design](system-design/hotel-management-system-design.md) | Date-range availability, overbooking prevention (atomic conditional update), reservations, payments, search, design patterns |
@@ -51,6 +50,7 @@ End-to-end designs that apply the concepts above.
 | [Collaborative Editor (Google Docs) — System Design](system-design/google-docs-system-design.md) | Concurrent editing, Operational Transformation vs CRDTs, op log + snapshots, real-time sync, presence, design patterns |
 | [Reddit — System Design](system-design/reddit-system-design.md) | Communities, feed fan-out, hot/top ranking, voting at scale, nested comments, design patterns |
 | [Quora — System Design](system-design/quora-system-design.md) | Q&A platform: question dedup/search, answer-quality ranking, topic feeds, voting, design patterns |
+| [Stack Overflow — System Design](system-design/stackoverflow-system-design.md) | Q&A with **reputation/badges** (event-sourced), accepted answers, tags/inverted index, close-as-duplicate, SEO/edge-cached reads, design patterns |
 | [Distributed Job Scheduler — System Design](system-design/distributed-scheduler-system-design.md) | Cron-as-a-service: finding due jobs, exactly-once-ish execution, leases, recurring jobs, retries/DLQ, design patterns |
 | [Twitter / News Feed — System Design](system-design/twitter-news-feed-system-design.md) | Feed fan-out (push/pull/hybrid), celebrity hot-key, timeline cache, ranking, design patterns |
 | [Facebook — System Design](system-design/facebook-system-design.md) | Bidirectional social graph (TAO-style), ranked News Feed fan-out, posts/reactions/comments, groups/pages, design patterns |

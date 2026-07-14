@@ -14,6 +14,7 @@
 - [4. Sizing](#4-sizing)
 - [5. Variants](#5-variants)
 - [6. Where It's Used](#6-where-its-used)
+- [Common Mistakes](#common-mistakes)
 - [7. Interview Cheat Sheet](#7-interview-cheat-sheet)
 - [8. Final Takeaways](#8-final-takeaways)
 
@@ -79,6 +80,26 @@ The structure is a bit array of `m` bits, all **0** to start, plus `k` hash func
   - If **all** of them are **1**, the item is **"probably present"** — but those bits may have been set to 1 by *other* items that happened to hash to the same positions. That coincidence is a **false positive**.
 
 Key point: the filter never stores the items themselves — only the array of set/unset bits. That's why it's tiny, and also why it can't tell you *which* item set a given bit.
+
+### A false positive, drawn on the bit array
+
+Text says "shared bits collide"; here's what that actually looks like. Take `m = 10`, `k = 3`, and add two items — `add("cat") → {1,4,7}` and `add("owl") → {4,7,9}`:
+
+```
+ index:  0    1    2    3    4    5    6    7    8    9
+ bits:  [0]  [1]  [0]  [0]  [1]  [0]  [0]  [1]  [0]  [1]
+              ▲              ▲              ▲         ▲
+             cat          cat+owl        cat+owl    owl
+
+now check contains("fox"), where fox hashes to {1,4,7}:
+              ▲              ▲              ▲
+            bit 1=1       bit 4=1        bit 7=1     → ALL 1 → "probably present"
+
+but "fox" was never added. Bits 1,4,7 were switched on by cat and owl.
+→ FALSE POSITIVE ⚠️  (no single item "owns" a bit; the filter only sees 1/0)
+```
+
+The filter reads three 1s and can't know they came from *other* items. That coincidence — every one of an unseen item's `k` bits already set — is precisely a false positive. Add more items and more bits flip to 1, so these coincidences get more common (see §3 and §4).
 
 ### The whole thing in ~30 lines of Java
 
@@ -219,6 +240,49 @@ Handy rules of thumb worth memorizing:
 - **~10 bits per item → ~1% false positives** (with the matching `k ≈ 7`). Storing 10M items exactly might cost hundreds of MB; the Bloom filter costs ~12 MB. That's the whole pitch.
 - Want **10× fewer** false positives (0.1%)? It costs about **+4.8 bits per item** — cheap. FP rate drops *exponentially* as you add bits.
 
+### Worked example: n = 1M items, target p = 1%
+
+The doc keeps quoting results ("~10 bits/item, k ≈ 7"); here's the actual plug-in so the numbers aren't magic. Take `n = 1,000,000` and `p = 0.01`.
+
+```
+m = -(n · ln p) / (ln 2)^2
+
+  ln p       = ln(0.01)  = -4.60517
+  (ln 2)^2   = 0.69315^2 =  0.48045
+
+  m = -(1,000,000 × -4.60517) / 0.48045
+    =   4,605,170 / 0.48045
+    ≈   9,585,059 bits
+    ≈   9.6 M bits  =  9.6e6 / 8  ≈  1.2 MB
+```
+
+```
+k = (m / n) · ln 2
+
+  m / n = 9,585,059 / 1,000,000 = 9.585   (≈ 9.6 bits per item)
+  k     = 9.585 × 0.69315       = 6.64    → round to 7 hashes
+```
+
+So **1M items at 1% FP → ~1.2 MB and 7 hashes.** Storing 1M items exactly (say 16-byte keys) would be ~16 MB+; the filter is ~13× smaller. Note the pattern: `m/n ≈ 9.6` bits/item and `k ≈ 7` fall out for *any* `n` at `p = 1%` — the ratios depend only on `p`, not on `n`.
+
+### The exact false-positive formula
+
+The two sizing formulas above come from one closed form for the FP rate:
+
+```
+p ≈ (1 - e^(-k·n/m))^k
+```
+
+One-line intuition, built from the bit array:
+
+- After inserting `n` items with `k` hashes each, a **single** bit is still 0 with probability `(1 - 1/m)^(kn) ≈ e^(-kn/m)`.
+- So a given bit is **1** with probability `(1 - e^(-kn/m))`.
+- A false positive needs **all `k`** of an absent item's bits to already be 1 → raise that to the `k`. Hence `(1 - e^(-kn/m))^k`.
+
+Minimizing this over `k` gives `k = (m/n)·ln 2`, and substituting back gives the `m` formula — that's *why* the sizing rules look the way they do.
+
+> ⚠️ **pitfall:** this formula assumes the `k` hashes are **independent and uniform**. Real code often fakes `k` hashes cheaply with **double hashing** (`h_i = h1 + i·h2`), which is only an *approximation* of independence. It's good enough in practice, but the observed FP rate can be slightly worse than the formula predicts — always leave a little headroom.
+
 #### Q: Why is there a "best" `k`? Wouldn't more hashes always be safer?
 
 No — `k` has a sweet spot. Each hash you add sets **more** bits per item:
@@ -290,6 +354,29 @@ Now deleting `"cat"` decrements 1,4,7. Positions 4 and 7 drop from 2 → 1 (stil
 - **Scalable Bloom filter** — when you **don't know `n` up front** and the filter would otherwise overfill. It chains progressively larger sub-filters as you add items, keeping the overall false-positive rate bounded.
 - **Cuckoo filter** — when you want **deletion *and* good space efficiency**. It stores small fingerprints in a cuckoo hash table; often smaller than a Counting Bloom filter for low target FP rates, with fast lookups and true deletes.
 
+### Bloom vs Cuckoo filter vs HashSet
+
+Three ways to answer "is X in the set?", trading exactness for space:
+
+| | **Bloom filter** | **Cuckoo filter** | **HashSet** |
+| --- | --- | --- | --- |
+| **Space** | ~10 bits/item (1% FP) | similar, often smaller at low FP | stores full items (bytes–KB each) |
+| **Supports delete** | ❌ (use Counting variant) | ✅ true deletes | ✅ |
+| **Exact answer** | ❌ probabilistic (FP possible) | ❌ probabilistic (FP possible) | ✅ exact, no false positives |
+| **Lookup cost** | O(k) | O(1) (2 buckets) | O(1) |
+| **Stores values?** | no | no (fingerprints only) | yes (the items themselves) |
+
+> 💡 **When a plain HashSet wins:** if `n` is small enough that the full set comfortably fits in RAM (say thousands to low millions of short keys), just use a `HashSet`. It's simpler, gives **exact** answers with **zero** false positives, and supports deletes for free. Bloom/Cuckoo filters only pay off when storing the items *exactly* is the thing you can't afford — huge `n`, or many filters (one per SSTable, per shard, per crawler node).
+
+### Counter overflow and merging filters
+
+Two practical details that come up with real deployments:
+
+- **Counting filter overflow.** Counting Bloom counters are usually only **4 bits** (0–15) to keep the memory overhead down. If a slot is hit more than 15 times it **saturates** — the standard fix is to *stop incrementing* at the max rather than wrapping to 0 (wrapping would corrupt the filter). A saturated counter can no longer be safely decremented, so heavy-hit slots may leak a tiny amount of extra FP over time. Size counters for your busiest bit, not the average.
+- **Merging Bloom filters.** Two plain Bloom filters with the **same `m` and `k`** can be merged by a simple **bitwise OR** of their arrays — the result is exactly the filter you'd get from adding both sets. This is why they're great for **distributed work**: e.g. web-crawler nodes each keep a local "seen URLs" filter and periodically OR them together to share progress. (Union is cheap; **intersection is not** meaningful — AND-ing two Bloom filters does *not* give the intersection's filter.)
+
+> 💡 **tip:** don't hand-roll these in production. Use **RedisBloom** (Redis module with `BF.*`/`CF.*` commands for Bloom, Cuckoo, Counting, and scalable filters) or **Guava's `BloomFilter`** (JVM) — both handle sizing, hashing, and serialization for you.
+
 ---
 
 ## 6. Where It's Used
@@ -333,6 +420,16 @@ Most keys are absent from most SSTables, so the filter eliminates the vast major
 - **False positives are unacceptable** for correctness (e.g. "is this the exact password hash?").
 - **Almost everything you look up actually exists** — then the filter says "probably present" nearly every time and you do the expensive lookup anyway; it just adds overhead.
 - You need **frequent deletions** and can't afford a counting variant.
+
+---
+
+## Common Mistakes
+
+> ⚠️ **The three ways people break a Bloom filter in practice:**
+>
+> - **Sizing for `n`, then loading 10× `n`.** The FP rate isn't a gentle slope — it climbs *exponentially* past your design `n`. Size for `n = 1M` at 1% but insert 10M and nearly every bit is 1, so `contains` returns "probably present" for almost everything and the filter becomes useless (worse than useless — pure overhead). Size for **peak** `n`, or use a **Scalable** filter (§5). Bigger-than-needed is fine; smaller-than-actual is fatal.
+> - **Using it where most lookups are positives.** A Bloom filter earns its keep by turning **absent** queries into an instant in-RAM "no." If almost everything you look up actually *exists*, it answers "probably present" nearly every time, so you do the expensive lookup anyway — you've just added a hash step for nothing. It's a filter for **misses**, not hits.
+> - **Clearing bits to "delete."** Zeroing an item's `k` bits can un-set bits that **other** items still rely on, producing a **false negative** — the one thing the structure promises never happens (§5). Plain Bloom filters have no `remove` on purpose; if you need deletes, use a **Counting** or **Cuckoo** filter.
 
 ---
 

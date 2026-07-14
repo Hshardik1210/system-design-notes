@@ -20,10 +20,14 @@
 - [10. Data Model (all tables)](#10-data-model-all-tables)
 - [11. Sequences](#11-sequences)
 - [12. Consistency & Edge Cases](#12-consistency--edge-cases)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Scaling & Failure](#14-scaling--failure)
-- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
-- [16. Final Takeaways](#16-final-takeaways)
+- [13. Scaling & Failure](#13-scaling--failure)
+- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
+- [15. API Design](#15-api-design)
+- [16. Consistency & CAP Tradeoffs](#16-consistency--cap-tradeoffs)
+- [17. Real-World Extensions](#17-real-world-extensions)
+- [18. How to Drive the Interview (framework)](#18-how-to-drive-the-interview-framework)
+- [19. Design Patterns (that can be used)](#19-design-patterns-that-can-be-used)
+- [20. Final Takeaways](#20-final-takeaways)
 
 ---
 
@@ -70,6 +74,8 @@ New way:  file "report.docx"  →  [chunk#a1b2, chunk#c3d4, chunk#e5f6]   (a rec
           edit one paragraph  →  only chunk#c3d4 changes → upload just that ONE chunk
 ```
 
+> 💡 **Jargon, once:** **Delta sync** = only transferring the *changed* chunks of a file, not the whole file. The typo-in-a-50-page-doc example above is delta sync: one chunk changes, one chunk moves.
+
 That "files are recipes of content-fingerprinted chunks" idea is detailed in §5, and the split between the recipe-keeper (metadata) and the byte store (block store) is §6.
 
 ---
@@ -98,8 +104,7 @@ The two requirements that most shape this design:
 | **Durable — never lose a file** | This is the #1 promise of cloud storage. It's why file bytes go to a replicated object store (S3) that keeps many copies, and why concurrent edits become *"conflicted copies"* instead of overwrites (§8). |
 | **Bandwidth-efficient — only move what changed** | This is why we can't just upload whole files. It forces **chunking + delta sync** (§5) and the **change journal** (§7) as the core mechanics. |
 
-> **Q: "Works offline" — how is that even a requirement for a *cloud* app?**
-> Because your laptop keeps a **real local copy** of the folder (Dropbox isn't only-in-the-browser). You can edit on a plane; the app just remembers "these changed" locally and syncs them when the internet comes back. That's why the client is a genuine software component with its own little database, not just a web page (see §4).
+"Works offline" is a requirement even for a *cloud* app because your laptop keeps a **real local copy** of the folder (Dropbox isn't only-in-the-browser). You can edit on a plane; the app just remembers "these changed" locally and syncs them when the internet comes back. That's why the client is a genuine software component with its own little database, not just a web page (see §4).
 
 ---
 
@@ -138,11 +143,9 @@ Two very different cost centers, and it's worth naming them separately:
 | **The bytes (blocks)** | Huge (the exabytes) | The actual chunk contents | Cheap bulk object store (S3) |
 | **The bookkeeping (metadata)** | Comparatively tiny, but *busy* | "which chunks make up which file version," cursors, the journal | A real (sharded) database |
 
-> **Q: 100 billion files sounds impossible for one database — how?**
-> You **shard** the metadata: split those billions of rows across many database servers, each owning a slice of users/namespaces. No single machine holds all of it. (More in §14.) The bytes themselves are S3's problem, and S3 is built to be effectively infinite.
+100 billion files isn't impossible for a database once you **shard** the metadata: split those billions of rows across many database servers, each owning a slice of users/namespaces. No single machine holds all of it. (More in §13.) The bytes themselves are S3's problem, and S3 is built to be effectively infinite.
 
-> **Q: Why is "sync mostly small deltas" a good thing for capacity?**
-> Because the expensive part (moving bytes) mostly *doesn't happen*. Most of the time a device just needs "here are the 3 tiny journal entries since you last checked" and maybe one changed chunk — not gigabytes. The design is tuned so the common case is cheap.
+"Sync mostly small deltas" is good for capacity because the expensive part (moving bytes) mostly *doesn't happen*. Most of the time a device just needs "here are the 3 tiny journal entries since you last checked" and maybe one changed chunk — not gigabytes. The design is tuned so the common case is cheap.
 
 ---
 
@@ -178,9 +181,9 @@ Unlike most system-design problems where the "client" is just a browser, here th
 
 (The three server-side components — Metadata Service, Block Store, Notification Service — are listed in the architecture summary above.)
 
-#### Q: Why does the client talk to metadata FIRST, then transfer chunks separately?
+### Why metadata calls and chunk transfers are split
 
-Because the two are wildly different kinds of work, and mixing them would be wasteful:
+The client talks to metadata first, then transfers chunks separately, because the two are wildly different kinds of work, and mixing them would be wasteful:
 
 - **Metadata calls are small and chatty** — "what changed since cursor N?", "do you already have these 5 chunk hashes?". These hit the database (the brain).
 - **Chunk transfers are big and dumb** — literally moving megabytes of bytes. These should go **straight to S3**, not through your application servers (which would become an expensive bottleneck just forwarding bytes).
@@ -208,12 +211,13 @@ class UploadController {
 }
 ```
 
-> **Q: Isn't it insecure to let the client talk to S3 directly?**
-> No — the pre-signed URL is the safeguard. It's scoped to **one specific chunk**, it **expires quickly**, and the metadata service only issues it after checking the user's permissions and quota. The client can't wander around S3; it can only do the one narrow thing the URL authorizes.
+It isn't insecure to let the client talk to S3 directly, because the pre-signed URL is the safeguard. It's scoped to **one specific chunk**, it **expires quickly**, and the metadata service only issues it after checking the user's permissions and quota. The client can't wander around S3; it can only do the one narrow thing the URL authorizes.
 
 ---
 
 ## 5. Chunking & Deduplication
+
+> 💡 **Jargon, once:** **Chunking** = slicing a file into small blocks. **CDC (content-defined chunking)** = choosing block boundaries by the *content* (a rolling hash) instead of a fixed ruler, so an early insert doesn't reshuffle every block. **Dedup (deduplication)** = storing identical bytes exactly once, keyed by their hash.
 
 Split each file into **chunks**; identify each by its **content hash (SHA-256)** — **content-addressed storage**.
 
@@ -341,13 +345,13 @@ List<byte[]> splitContentDefined(byte[] data) {
 
 The chunk is **shared in storage but not in access.** Physically there's one copy of those bytes in S3 (dedup). But *permission* to read a file comes from the **metadata** — you can only fetch a chunk if a file recipe you're allowed to see references it. You never get to browse chunks by hash directly, so dedup across users leaks nothing. (Real systems also guard against a subtle "does this hash exist?" probing attack, but the core answer is: access is decided by metadata, not by owning a fingerprint.)
 
-#### Q: Isn't there a risk two different chunks get the same hash (a collision)?
+### Hash collisions are a theoretical, not practical, risk
 
-In theory yes; in practice, with SHA-256, essentially never — the space of possible hashes is so astronomically large (2^256) that you'd sooner win the lottery every day for a lifetime. Systems treat SHA-256 equality as "the bytes are identical." That's what makes content-addressing trustworthy.
+There's in theory a risk two different chunks get the same hash (a collision); in practice, with SHA-256, essentially never — the space of possible hashes is so astronomically large (2^256) that you'd sooner win the lottery every day for a lifetime. Systems treat SHA-256 equality as "the bytes are identical." That's what makes content-addressing trustworthy.
 
-#### Q: Why hash at all — why not just track "bytes 0–4MB, 4–8MB…"?
+### Why hash instead of just tracking byte offsets
 
-Because offsets don't tell you whether the *content* is the same. Two files can have completely different bytes at "0–4MB." The hash is what lets you say "these exact bytes already exist, skip the upload" and "this chunk didn't get corrupted in transit" (re-hash after download and compare) — dedup **and** integrity from the same fingerprint.
+Offsets don't tell you whether the *content* is the same. Two files can have completely different bytes at "0–4MB." The hash is what lets you say "these exact bytes already exist, skip the upload" and "this chunk didn't get corrupted in transit" (re-hash after download and compare) — dedup **and** integrity from the same fingerprint.
 
 ---
 
@@ -360,6 +364,19 @@ Because offsets don't tell you whether the *content* is the same. Two files can 
 
 - **Why split?** Blocks are huge + immutable + dumb → cheap object storage. Metadata is small + transactional + queried constantly → a database. Each scales independently.
 
+### Database & storage choices (which DB, and why at scale)
+
+Polyglot persistence again, but the fork here is sharper than most systems: two data models with **opposite** requirements live side by side. Deciding question: *"does this need ACID transactions and rich queries, or is it an immutable blob keyed by its own hash?"*
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Files/folders, versions, chunk lists, sharing ACLs | **RDBMS**, sharded by user/namespace | Rename/move/share are metadata-only transactions; base-version conflict detection (§8) needs an atomic compare-and-set on `current_version`; ACLs need joins | A KV/object store has no cross-row transactions over `files` + `file_versions` + `shares` — a rename or permission grant could land half-applied |
+| Chunk bytes (content-addressed, deduped) | **Block/object store (S3)** | Chunks are immutable and named by their own hash — a perfect fit for cheap, infinite, replicated blob storage; dedup is essentially free (same hash = same object) | Putting 4MB chunks in the metadata DB blows up its size/cost for data that's never queried by content, only fetched by key |
+| Locks, device sessions, hot cursors | **Redis** | Sync polling and lock checks are high-frequency and latency-sensitive; TTL-based keys naturally expire stale sessions | Hitting the RDBMS for every "am I locked?" check on a busy namespace adds load for data that doesn't need durability beyond a few seconds |
+| Sync/notify events (journal fan-out, device wake-ups) | **Queue (Kafka) / notification service** | Devices need push, not poll; a durable log lets a device offline for days replay exactly what it missed | Polling the metadata DB from millions of idle devices is a self-inflicted DDoS; a queue/pub-sub absorbs the fan-out |
+
+**Why split metadata (relational) from blocks (object store), and how chunk dedup works in the object store:** the metadata service is small per user but *constantly* mutated — every edit, cursor advance, and share — exactly the transactional, low-latency workload an RDBMS is built for, and it shards cleanly by `user_id`/`namespace_id` since virtually every query is scoped to one user's tree (§13). The block store, by contrast, holds the actual bytes — huge, write-once, named by content hash — so "does this chunk already exist?" is a single key lookup (`hasChunk(hash)`) rather than a byte-for-byte comparison; two users who happen to upload identical bytes collide on the same S3 key, and the object is physically stored **once**, with the metadata layer tracking `ref_count` so it's only garbage-collected once nobody's recipe points at it anymore (§12). Neither store could do the other's job well: cramming blobs into the RDBMS wrecks its size and backup times; cramming transactional metadata into S3 means hand-rolling ACID. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
+
 ### Block store vs metadata service
 
 The two subsystems have opposite jobs:
@@ -369,9 +386,9 @@ The two subsystems have opposite jobs:
 
 You don't touch the block store to rename a file — you just update the metadata. That single idea (move metadata, not bytes) is why rename/move/restore are near-instant.
 
-#### Q: Why not just keep everything in one big database?
+### Why not just keep everything in one big database
 
-Because bytes and bookkeeping have opposite needs, and forcing them into one store makes both worse:
+Bytes and bookkeeping have opposite needs, and forcing them into one store makes both worse:
 
 | | **Block store (bytes)** | **Metadata (bookkeeping)** |
 | --- | --- | --- |
@@ -382,7 +399,7 @@ Because bytes and bookkeeping have opposite needs, and forcing them into one sto
 
 Databases are expensive per gigabyte and terrible at storing exabytes of blobs; object stores are cheap and infinite but can't do `WHERE owner_id = 42 AND is_deleted = false`. Split them and each does what it's good at — and each **scales independently** (add S3 capacity without touching the DB, and vice versa).
 
-#### Q: "Chunks are immutable" — what does that mean and why does it matter?
+### What "chunks are immutable" means and why it matters
 
 Immutable = **a chunk, once written, is never modified in place.** If you edit a file, you don't rewrite an existing chunk; you create a *new* chunk with new bytes and therefore a new hash, and point the new file version at it. The old chunk sits untouched (still used by old versions or other users). This is what makes:
 
@@ -405,6 +422,8 @@ byte[] downloadFile(long versionId) {
 ---
 
 ## 7. Sync — Journal, Cursor & Notifications
+
+> 💡 **Jargon, once:** a **namespace** is one self-contained sync scope with its own change log — your personal Drive is one, each shared folder is another. A **cursor** is a device's bookmark ("I've applied up to seq N") into that log. Full definition below.
 
 Devices don't poll every file — they sync against a **per-namespace change journal** using a **cursor**.
 
@@ -480,17 +499,38 @@ void syncNamespace(long namespaceId) {
 }
 ```
 
-#### Q: What exactly is a "namespace"?
+### What exactly is a "namespace"
 
 A namespace is **one journal's worth of stuff** — a self-contained scope that changes together and syncs together. Your personal Drive is one namespace. A folder shared with your team is a *separate* namespace with its *own* journal, so everyone who has it gets those changes (and only those). Splitting into namespaces is what lets a shared folder sync to five people without dumping everyone's private files into one giant log. (More in §9.)
 
-#### Q: The journal only says WHICH file changed — how does the device know which *bytes* to download?
+### From "what changed" to which bytes to download
 
-Two steps, and this is the payoff of everything before it: (1) the journal entry gives the device the new **version id**; (2) the device fetches that version's **chunk recipe** and downloads only the chunk hashes it doesn't already have locally. So "file changed" → "here's the new recipe" → "I already have 9 of these 10 chunks, fetch 1." That's **delta sync**, powered by the content-addressed chunks from §5.
+The journal only says WHICH file changed; the device figures out which *bytes* to download in two steps, and this is the payoff of everything before it: (1) the journal entry gives the device the new **version id**; (2) the device fetches that version's **chunk recipe** and downloads only the chunk hashes it doesn't already have locally. So "file changed" → "here's the new recipe" → "I already have 9 of these 10 chunks, fetch 1." That's **delta sync**, powered by the content-addressed chunks from §5.
 
 #### Q: How does offline mode fit in?
 
 While offline, the device can't receive notifications or upload — so it just **queues its local changes** in its own little database (Watcher noticed them, Chunker chunked them). On reconnect it does both directions: **push** its queued deltas up (upload new chunks, commit new versions → new journal entries), and **pull** the journal from its cursor to learn what others did. If both sides touched the same file while it was offline, that's a conflict → §8.
+
+### Initial sync & bootstrap
+
+Everything above describes the *steady state* — a device that already has the folder and just needs the delta. But what about a **brand-new device** that installs the app and has to pull down a whole 500 GB folder for the first time? That's the **bootstrap** case, and it's the same journal mechanic pointed at `cursor = 0`.
+
+```
+Fresh device: cursor = 0  →  GET /delta?cursor=0
+  → server streams the ENTIRE current state as journal entries (or a compacted snapshot)
+  → device downloads chunks it lacks (which, on a fresh device, is ALL of them)
+  → advances cursor to the latest seq once caught up
+```
+
+Three things make first sync survivable instead of a thundering, all-or-nothing download:
+
+- **Cursor = 0 is just "I've applied nothing."** The journal doesn't special-case new devices — the same "give me everything after N" query with `N = 0` returns the full state. For huge namespaces the server may hand back a **compacted snapshot** (current recipes only, not every historical entry) plus the latest `seq`, so the device doesn't replay years of history.
+- **Backpressure** — the client paces itself: bounded parallelism (e.g. 4–8 chunk downloads at a time), and it **checkpoints its cursor as it goes** so a crash at 300 GB resumes from 300 GB, not from 0. It also backs off when the network or disk is saturated rather than opening a thousand connections.
+- **500 GB bootstrap strategy** — prioritize **metadata first** (show the folder tree and file names immediately, even before bytes arrive), then stream chunk bytes lazily / on-demand or lowest-folders-first. Dedup helps here too: if the same machine already had another synced account or a **LAN peer** has the bytes (see §17), many chunks are fetched locally instead of from S3.
+
+> 💡 **The insight:** first sync isn't a different system — it's the ordinary delta sync with `cursor = 0` and a lot more missing chunks. Checkpoint the cursor so a 500 GB pull is *resumable*, never a restart-from-scratch.
+
+> ⚠️ **Pitfall:** don't let a fresh device fetch every chunk with unbounded parallelism — you'll saturate the user's uplink, hammer S3, and (across millions of new installs) create a self-inflicted load spike. Bounded concurrency + backpressure is mandatory, not optional.
 
 ---
 
@@ -551,9 +591,22 @@ CommitResult commitVersion(long fileId, long baseVersion, List<String> newRecipe
 
 Because Dropbox stores **arbitrary files** — a Word doc, a Photoshop file, a zipped video project. It has no idea what "merging" two edited binary blobs even means; a naive byte-merge would corrupt the file. Google Docs *can* merge because it understands its own document structure and edits (that's a different technique — operational transforms / CRDTs; see the Google Docs note). For a general file store, the safe, honest answer is: **keep both, let the human sort it out.** Data is never lost.
 
-#### Q: Is a "conflicted copy" a whole duplicate file wasting space?
+### A conflicted copy is not a wasteful full duplicate
 
-No — thanks to dedup (§5), the conflicted copy **shares all the chunks it has in common** with the original. If the two versions differ in just one chunk, the "duplicate" costs one extra chunk plus a small recipe, not a whole second file.
+Thanks to dedup (§5), the conflicted copy **shares all the chunks it has in common** with the original. If the two versions differ in just one chunk, the "duplicate" costs one extra chunk plus a small recipe, not a whole second file.
+
+#### Q: Why not use CRDTs or OT to merge concurrent edits, like collaborative editors do?
+
+Because those techniques need to **understand the data they're merging**, and a file store deliberately doesn't. It helps to lay the three strategies side by side:
+
+| Strategy | What it does | Fits |
+| --- | --- | --- |
+| **Three-way merge** (base + A + B) | Diff each side against the common ancestor and combine non-overlapping changes; flag true overlaps | Structured, line-oriented text (source code, `git`) |
+| **CRDT / OT** | Model every edit as a commutative operation so concurrent ops converge automatically with no conflict | *Live* collaborative editors on a known document model (Google Docs) |
+| **LWW (last-writer-wins)** | Keep whichever write arrived last; silently drop the other | Caches, presence — places where losing a write is acceptable |
+| **Conflicted copies** ✅ | Keep **both** sides as separate files; a human reconciles | **Arbitrary binary files** (the file-store case) |
+
+CRDTs and OT work for Google Docs because the app owns the document's structure — it knows an edit is "insert character at position 12" and can prove two such ops commute. Dropbox stores a **Photoshop file, a zip, an encrypted blob** — opaque bytes with no operation model, so there's nothing to make commute; a byte-level "merge" would just corrupt the file. **Three-way merge** needs a meaningful diff/ancestor, which again assumes text-like structure. **LWW** is off the table outright: silently discarding a write violates the cardinal rule (**never lose data**). That leaves **conflicted copies** — the only strategy that's *correct for content you can't interpret*: keep both, lose nothing, let the human decide. (See the Google Docs note for how OT/CRDT work when you *do* control the document model.)
 
 ---
 
@@ -599,13 +652,13 @@ byte[] downloadFileForUser(long userId, long fileId) {
 }
 ```
 
-#### Q: If chunks are deduped across users, does sharing "just work" because we already store the bytes once?
+### Dedup is not the same thing as sharing permission
 
-Careful — those are two different things. **Dedup** is a storage optimization (identical bytes live once, invisibly). **Sharing** is a *permission* grant recorded in metadata. You can only access a file if a `shares`/namespace grant lets you — not merely because the underlying bytes happen to be stored. So the byte you're downloading might physically be the same chunk another user also uses, but you're allowed to read it because *your file's recipe* references it and you have a role on *your* namespace.
+If chunks are deduped across users, sharing doesn't "just work" merely because we already store the bytes once — those are two different things. **Dedup** is a storage optimization (identical bytes live once, invisibly). **Sharing** is a *permission* grant recorded in metadata. You can only access a file if a `shares`/namespace grant lets you — not merely because the underlying bytes happen to be stored. So the byte you're downloading might physically be the same chunk another user also uses, but you're allowed to read it because *your file's recipe* references it and you have a role on *your* namespace.
 
-#### Q: What happens the moment access is revoked?
+### What happens the moment access is revoked
 
-Because every sync and download re-checks permissions in the metadata service, revoking a share **immediately** stops that user's devices from pulling new journal entries or downloading chunks for that namespace. (Bytes already downloaded to their disk are, realistically, already on their disk — revocation stops *future* sync, not time travel.)
+Every sync and download re-checks permissions in the metadata service, revoking a share **immediately** stops that user's devices from pulling new journal entries or downloading chunks for that namespace. (Bytes already downloaded to their disk are, realistically, already on their disk — revocation stops *future* sync, not time travel.)
 
 ---
 
@@ -655,7 +708,7 @@ Don't memorize the columns — understand the **shape**. Each table maps directl
 | `files` | The folder tree: names, parent folders, which version is current, soft-delete flag | §1 |
 | `file_versions` | One row per saved version of a file (the history) | §8 versioning |
 | `version_chunks` | **The recipe**: for a version, the ordered list of chunk hashes | §5 "file = recipe" |
-| `chunks` | The dedup registry: each unique chunk hash + how many recipes point at it (`ref_count`) | §5 dedup + §14 GC |
+| `chunks` | The dedup registry: each unique chunk hash + how many recipes point at it (`ref_count`) | §5 dedup + §13 GC |
 | `change_journal` | The append-only log of "what changed," numbered by `seq` | §7 journal |
 | `device_sync_state` | Each device's bookmark (`cursor`) into the journal | §7 cursor |
 | `shares` | Who has what role on which namespace | §9 sharing |
@@ -670,7 +723,9 @@ WHERE  vc.version_id = 7
 ORDER  BY vc.seq;          -- order matters: chunks are glued back together in this sequence
 ```
 
-#### Q: What is `ref_count` and why is it in the `chunks` table?
+### What `ref_count` tracks and why it lives in the `chunks` table
+
+> 💡 **Jargon, once:** **ref-count (reference count)** = a tally of how many recipes point at a chunk. It's the bookkeeping that makes dedup safe to *undo*: a chunk is only deletable once its count hits 0. ⚠️ Don't delete on "this one file stopped using it" — another user or an old version may still reference the exact same bytes.
 
 `ref_count` = **how many file versions currently point at this chunk.** Because chunks are shared (dedup), you can't delete a chunk just because *one* file stopped using it — five other files (or old versions) might still need it. So each chunk keeps a tally:
 
@@ -681,15 +736,25 @@ UPDATE chunks SET ref_count = ref_count + 1 WHERE chunk_hash = 'a1b2...';
 -- A version is deleted/expired and no longer references it → one fewer
 UPDATE chunks SET ref_count = ref_count - 1 WHERE chunk_hash = 'a1b2...';
 
--- Only chunks nobody references anymore are safe to garbage-collect (see §14)
+-- Only chunks nobody references anymore are safe to garbage-collect (see §13)
 SELECT chunk_hash FROM chunks WHERE ref_count = 0;
 ```
 
-This is classic **reference counting** — the same idea a language runtime uses to know when an object is safe to free. GC (and the race it creates) is covered in §14.
+This is classic **reference counting** — the same idea a language runtime uses to know when an object is safe to free. GC (and the race it creates) is covered in §13.
 
-#### Q: Why is delete a `is_deleted` flag instead of actually removing the row?
+### Why delete is an `is_deleted` flag instead of removing the row
 
 That's a **soft delete (tombstone)**: mark it deleted but keep the data for a restore window (the "deleted files" trash you can recover from). It also plays nicely with sync — a `DELETE` becomes a normal journal entry other devices apply, rather than a mysteriously-vanished row. Hard deletion (really freeing chunks) happens later via GC once `ref_count` hits 0.
+
+### Indexes that matter
+
+Don't list every index — name the few that back the hot paths, and say *what query each one serves*. These three carry the system:
+
+- **`change_journal (namespace_id, seq)`** — the sync superpower. It's already the composite primary key, and it makes the single most-run query, *"give me entries after my cursor"*, a **range scan** (`WHERE namespace_id = ? AND seq > ?`) instead of a full-log scan. Every device wake-up hits this; without it, sync degrades to O(journal size).
+- **`chunks (ref_count)`** (partial, `WHERE ref_count = 0`) — the **GC candidate scan**. The sweeper (§13, §17) periodically asks "which chunks does nobody reference anymore?"; a plain scan over billions of chunk rows would be brutal, so index the `ref_count = 0` set directly.
+- **`files (parent_folder_id)`** — **folder-tree traversal**. Rendering a folder, or walking a subtree to compute what a device must sync, is "give me the children of this folder"; this index turns each level of the walk into a fast lookup. (Already present in the schema above as `idx_files_folder`.)
+
+> 💡 **The pattern:** each index maps 1:1 to a query in the critical path — cursor catch-up, GC sweep, tree walk. If you can't name the query an index serves, you probably don't need it.
 
 ---
 
@@ -766,7 +831,7 @@ void commitVersionSafely(long fileId, List<String> recipe) {
 
 #### Q: What's the "GC race," and why does it need a grace period?
 
-Garbage collection frees chunks nobody uses anymore (`ref_count = 0`, see §10/§14). The danger is a **race** between "this chunk looks unused" and "someone is about to use it":
+Garbage collection frees chunks nobody uses anymore (`ref_count = 0`, see §10/§13). The danger is a **race** between "this chunk looks unused" and "someone is about to use it":
 
 ```
 1. GC scans:  chunk XX has ref_count = 0  → "looks unused, I'll delete it"
@@ -780,24 +845,7 @@ The fix is a **grace period**: don't delete a chunk the instant it hits 0; wait 
 
 ---
 
-## 13. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Content-Addressed Storage** | Chunks keyed by hash | Dedup + integrity |
-| **Strategy** | Chunking (fixed vs content-defined), conflict resolution | Swap algorithms |
-| **Observer / Pub-Sub** | Change notifications to devices | Push sync instead of poll |
-| **Event Sourcing / Journal** | Per-namespace change journal + cursor | Efficient "what changed since" |
-| **Memento / Snapshot** | File version history | Restore old states |
-| **Reference Counting** | Chunk `ref_count` → GC unreferenced chunks | Reclaim storage |
-| **Producer-Consumer** | Async chunk processing, thumbnailing, indexing | Offload work |
-| **Repository** | Metadata access | Abstraction |
-| **Facade** | Sync client API over metadata + block store | Simple client |
-| **Ports & Adapters** | Block store, notification, auth | Swap infra |
-
----
-
-## 14. Scaling & Failure
+## 13. Scaling & Failure
 
 - **Block store (S3)** = durable, replicated, effectively infinite; **dedup + compression** cut storage massively.
 - **Metadata service** sharded by user/namespace; the transactional brain; **journal** makes sync O(delta).
@@ -828,13 +876,13 @@ Several layers, each covering a different failure:
 - **Conflicts → conflicted copies** — concurrent edits never overwrite; both survive (§8).
 - **Versioning + soft delete** — even *you* deleting or mangling a file is recoverable within the retention window, because old versions (and their chunks) are retained.
 
-#### Q: Why is a garbage collector even needed — can't we delete chunks immediately when a file is deleted?
+### Why a garbage collector is needed instead of deleting chunks immediately
 
-No, because of dedup: the chunk you'd delete might still be referenced by another version, another file, or another *user*. That's why deletion is a two-step dance: (1) drop the reference (`ref_count--`), (2) a background **GC** later frees only chunks whose count reached 0 — and even then, after a **grace period** to dodge the race in §12. Deleting bytes is the one truly irreversible action, so the system is deliberately slow and careful about it.
+Chunks can't be deleted the instant a file is deleted, because of dedup: the chunk you'd delete might still be referenced by another version, another file, or another *user*. That's why deletion is a two-step dance: (1) drop the reference (`ref_count--`), (2) a background **GC** later frees only chunks whose count reached 0 — and even then, after a **grace period** to dodge the race in §12. Deleting bytes is the one truly irreversible action, so the system is deliberately slow and careful about it.
 
 ---
 
-## 15. Interview Cheat Sheet
+## 14. Interview Cheat Sheet
 
 > **"How do you sync efficiently without re-uploading whole files?"**
 > "Chunk the file (**content-defined boundaries** so an early insert doesn't reshuffle everything), hash each chunk, and only upload chunks whose hashes are new. A file version is just an ordered list of chunk hashes — editing one part changes one chunk."
@@ -851,9 +899,178 @@ No, because of dedup: the chunk you'd delete might still be referenced by anothe
 > **"How does dedup save space + handle GC?"**
 > "Content-addressed chunks are stored once (across versions/users), tracked by **ref_count**; GC reclaims chunks at ref_count 0 (with a grace period to avoid races)."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **GC race with an in-flight upload** | A chunk hits `ref_count = 0` just as a new upload dedups against it. **Grace period**: mark "deletable at T," only free it if *still* unreferenced after T, and have commits re-check/re-bump `ref_count` — so the in-flight upload wins and no live chunk is deleted (§12). |
+| **Share revoked mid-upload** | The uploader loses access while chunks are still going up. Bytes may land in the block store (harmless — content-addressed, unreferenced), but the **version commit re-checks the `shares` grant and fails**, so no journal entry is created and other members never see it. Orphaned chunks get GC'd. |
+| **Offline a week, then reconnect** | Device does both directions: **pull** journal from its stale cursor (may be thousands of entries → server may return a **compacted snapshot** instead of every entry), and **push** its queued local deltas. Files touched on *both* sides → **conflicted copies** (§8). Same mechanic as first sync (§7), just a bigger delta. |
+| **Two devices upload identical new bytes at once** | Both compute the same hash and both may `PUT` to the same S3 key — idempotent (same content), so it's safe; `ref_count` ends correct because commits bump it transactionally. Dedup still holds. |
+| **Partial upload then crash** | Chunks upload independently; the version is **committed only when all its chunks exist** (§12), so peers never see a half-file. Retry re-sends only the missing chunks. |
+| **Rename during another device's sync** | Rename is a **metadata-only** journal entry; the other device applies it as an ordinary op (no bytes move). Ordering by `seq` keeps it deterministic. |
+
+> **Ultimate layer model:** content-hash = dedup + integrity · journal + cursor = O(delta) sync · ref-count + grace period = safe GC · base-version check = conflict detection · conflicted copies = never lose data.
+
 ---
 
-## 16. Final Takeaways
+## 15. API Design
+
+> 💡 Distinguish **metadata operations** (small, transactional, hit the DB) from **block-store transfers** (big, dumb bytes, go straight to S3 via pre-signed URLs). This **two-phase upload** — probe/authorize on the metadata service, then transfer on the block store — is the shape of every write.
+
+```
+--- Metadata service (the "brain": small, transactional) ---
+POST /v1/has-chunks                                → dedup probe: which of these hashes are NEW?
+     body: { hashes: [a1b2, c3d4, ...] }
+     → 200 { missing: [c3d4] }                       (only c3d4 must be uploaded)
+
+POST /v1/upload-url                                → authorize a direct block upload
+     body: { hash: c3d4, size }
+     → 200 { url: <pre-signed S3 PUT>, expiresAt }   (temporary, chunk-scoped)
+
+POST /v1/version                                   → commit a new file version (the recipe)
+     body: { fileId, baseVersion, chunkHashes: [a1b2, c3d4, e5f6] }
+     header: Idempotency-Key: <uuid>
+     → 201 { versionId, seq }                        | 409 { conflict, conflictedCopyId }
+
+GET  /v1/delta?namespaceId=..&cursor=N             → pull changes since a cursor
+     → 200 { entries: [ {seq, fileId, versionId, op} ... ], nextCursor }
+
+GET  /v1/versions?fileId=..                        → version history (for restore)
+POST /v1/restore                                   → point a file at an old version
+     body: { fileId, versionId }
+
+POST /v1/shares                                    → grant a role on a namespace
+     body: { namespaceId, granteeId, role }
+DELETE /v1/shares                                  → revoke (stops future sync immediately)
+
+--- Notification service (push, not poll) ---
+GET  /v1/notify?namespaceIds=..                    → long-poll / WebSocket: "namespace X changed"
+     → wakes the device, which then calls GET /delta
+
+--- Block store (the "muscle": bytes only, NOT our servers) ---
+PUT  <pre-signed S3 URL>                            → upload one chunk's bytes directly to S3
+GET  <pre-signed S3 URL>                            → download one chunk's bytes directly from S3
+```
+
+### Two-phase upload: metadata first, bytes second
+
+Every upload is **two phases against two different systems**, and keeping them separate is the whole point (§4):
+
+```
+Phase 1 — METADATA (cheap, chatty, hits the DB):
+  POST /has-chunks [a1,c3,XX]  → { missing: [XX] }   (dedup probe: a1 & c3 already exist)
+  POST /upload-url {hash: XX}  → { url, expiresAt }  (authorize ONE chunk, briefly)
+
+Phase 2 — BLOCK STORE (heavy, dumb, skips our servers):
+  PUT <pre-signed url> <XX bytes>                    (client → S3 directly)
+
+Back to METADATA (commit the recipe):
+  POST /version {baseVersion, [a1,c3,XX]}            → seq++ → wake other devices
+```
+
+- **`/has-chunks`** is the **dedup probe**: hand the server a list of hashes, get back only the ones it lacks. This is what turns "upload a file" into "upload the one chunk that actually changed" — the API-level face of delta sync.
+- **`/upload-url`** returns a **pre-signed, chunk-scoped, short-lived** S3 URL. The metadata service checks permission + quota *before* issuing it; the client then transfers bytes straight to S3 so gigabytes never flow through our application servers.
+- **`/version`** is the transactional commit. It carries the **`baseVersion`** so the server can detect a concurrent edit (base-version mismatch → conflicted copy, §8) and appends a **journal entry** so other devices get woken.
+- **`/delta`** + **`/notify`** are the read/sync side: `/notify` pushes "something changed," `/delta` returns only the entries after your cursor (§7).
+
+> ⚠️ **Pitfall:** don't stream chunk bytes *through* a `POST /upload` on your metadata/app servers. It turns your transactional brain into a dumb byte pump, wrecks its latency, and wastes bandwidth. Metadata authorizes; **the block store moves the bytes**.
+
+> The write path (`/has-chunks` → `/upload-url` → `/version`) and the read path (`/notify` → `/delta`) are the same two flows drawn in §11, just named as endpoints.
+
+---
+
+## 16. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you pick consistency, and where do you pick availability?" A file-sync system is a great answer because it deliberately picks **differently for metadata vs sync**.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Metadata commit** (new version, rename, share, `ref_count`) | **CP** (strong consistency) | The version commit needs an **atomic compare-and-set on `current_version`** to detect conflicts (§8) and keep recipes correct. A split-brain that accepted two "current" versions would corrupt history or lose data. Correctness > availability here. |
+| **Sync notifications** (`/notify` wake-ups) | **AP** (availability + eventual) | A missed or delayed push is harmless — the device still catches up via `/delta` from its cursor. Better to stay available and be a few seconds late than to block. |
+| **Block store (chunk bytes)** | **AP-ish, but trivially consistent** | Chunks are immutable and content-addressed, so there's no "conflicting write" to a chunk — any replica that has the bytes is correct. Replicate freely for availability. |
+| **Downstream (thumbnails, indexing, analytics)** | **Eventual** | Async, retryable, off the critical path. |
+
+The signature move is the **"conflicted copy" itself as a CAP decision**: when two devices commit against the same base version, the system *could* block one writer until it resolves (favoring consistency) — but instead it **accepts both writes and reconciles later** (a conflicted copy). That's choosing **availability over strict single-value consistency**: the write is never rejected or blocked, at the cost of two copies existing until a human merges them.
+
+- Metadata is **strongly consistent per file/namespace** (the compare-and-set is serializable on that row), and **eventually consistent across the fleet** (devices converge as they drain the journal).
+- Bytes are safe by construction: **content-addressing means a chunk can't be "stale"** — its name *is* its content.
+
+> One-liner: **"Strong consistency where the recipe/version is committed (CP metadata), eventual/available everywhere the bytes flow and sync — and a conflict becomes a *conflicted copy* rather than a blocked write (availability over consistency)."**
+
+---
+
+## 17. Real-World Extensions
+
+> Brief, high-signal add-ons that show breadth. Each is a sentence or two — enough to raise, not derail, an interview.
+
+### Client-side / end-to-end encryption (zero-knowledge)
+
+Encrypt chunks **on the device** with a key the server never sees, so the provider stores ciphertext it can't read ("zero-knowledge"). The catch: **dedup and encryption fight each other** — random per-user keys mean identical files encrypt to *different* bytes, killing cross-user dedup. Real systems use **convergent encryption** (derive the key from the content's own hash) so identical plaintext still yields identical ciphertext (dedup survives), accepting a known confirmation-of-file weakness. ⚠️ Server-side features (search, thumbnails, web preview) mostly stop working once the server can't read the bytes.
+
+### Selective sync & bandwidth throttling
+
+**Selective sync** lets a device subscribe to only *part* of a namespace (don't pull the 500 GB video folder onto a laptop with a 256 GB SSD) — it applies journal entries but downloads bytes lazily / only for chosen subtrees. **Bandwidth throttling** caps up/download rate so sync doesn't hog the user's connection; pairs naturally with the **backpressure** from first sync (§7).
+
+### Trash / restore flow
+
+Delete is a **soft delete** (§10): the row is tombstoned and chunks are retained for a **retention window**, so "Trash → Restore" just clears the flag and re-points the file — no re-upload, because `ref_count` kept the chunks alive. Only after the window expires does GC drop the references and reclaim bytes.
+
+### LAN sync
+
+When two devices on the **same local network** both belong to a namespace, a new device can fetch chunks **peer-to-peer over the LAN** instead of from S3. The metadata service still decides *what* to sync (recipes, permissions); the LAN just provides a **faster/cheaper source for the bytes** — a huge win for the 500 GB bootstrap (§7). Chunks are content-addressed, so a LAN-fetched chunk is verified by re-hashing exactly like an S3-fetched one.
+
+### GC sweeper design
+
+The garbage collector is a **background sweeper**, not part of any request. Sketch:
+
+```
+1. Candidate scan   → SELECT chunk_hash FROM chunks WHERE ref_count = 0   (uses the ref_count index, §10)
+2. Grace period     → skip chunks whose ref_count hit 0 more recently than T (dodge the in-flight-upload race, §12)
+3. Verify + delete  → re-check ref_count is STILL 0 in a transaction, then delete the S3 object
+4. Rate-limit       → sweep in small batches so GC never competes with live traffic
+```
+
+- Runs on a **scheduler** (periodic), reads the **`chunks(ref_count = 0)`** partial index, and honors the **grace period** so an upload that's about to re-reference a chunk isn't beaten to the delete.
+- Deleting bytes is the **only irreversible action** in the system, so the sweeper is deliberately conservative: verify-under-transaction, batch, back off. Wasted space is cheap; a deleted-but-needed chunk is unforgivable.
+
+---
+
+## 18. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6.
+
+1. **Clarify requirements** (functional + NFRs) — §2
+2. **Estimate scale** (files, bytes, dedup savings, sync deltas) — §3
+3. **Define APIs** (metadata ops vs block-store transfers; two-phase upload) — §15
+4. **High-level architecture + data model** — §4, §10
+5. **Deep dive: the hard part** → **chunking + dedup + delta sync** (content-addressing) — §5, §6
+6. **Deep dive: sync engine** → **change journal + cursor + notifications**, then **conflicts** — §7, §8
+7. **Address scale + edge cases** → sharding metadata, GC + grace period, first sync — §12, §13, §17
+8. **Summarize tradeoffs** — §16, §14
+
+> 🎤 **Lead with the core insight:** state up front that "the crux is *don't move whole files* — content-address chunks so dedup and delta sync fall out, and sync devices against a per-namespace journal." Then spend most of your time on chunking and the journal. That's what they're testing.
+
+---
+
+## 19. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Content-Addressed Storage** | Chunks keyed by hash | Dedup + integrity |
+| **Strategy** | Chunking (fixed vs content-defined), conflict resolution | Swap algorithms |
+| **Observer / Pub-Sub** | Change notifications to devices | Push sync instead of poll |
+| **Event Sourcing / Journal** | Per-namespace change journal + cursor | Efficient "what changed since" |
+| **Memento / Snapshot** | File version history | Restore old states |
+| **Reference Counting** | Chunk `ref_count` → GC unreferenced chunks | Reclaim storage |
+| **Producer-Consumer** | Async chunk processing, thumbnailing, indexing | Offload work |
+| **Repository** | Metadata access | Abstraction |
+| **Facade** | Sync client API over metadata + block store | Simple client |
+| **Ports & Adapters** | Block store, notification, auth | Swap infra |
+
+---
+
+## 20. Final Takeaways
 
 - **Chunk + content-address (hash)** → dedup + **delta sync** (only changed chunks) + resumable + integrity; use **content-defined chunking** for stable dedup under edits.
 - Split **metadata service** (small, transactional: files/versions/chunk lists/**journal**) from **block store** (huge, dumb: chunk bytes).

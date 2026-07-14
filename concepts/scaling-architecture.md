@@ -16,6 +16,7 @@
 - [6. What Changes at Massive Scale](#6-what-changes-at-massive-scale)
 - [7. How to Find the Bottleneck](#7-how-to-find-the-bottleneck)
 - [8. Before vs After](#8-before-vs-after)
+- [Common Mistakes](#common-mistakes)
 - [9. Interview Cheat Sheet](#9-interview-cheat-sheet)
 - [10. Final Takeaways](#10-final-takeaways)
 
@@ -271,6 +272,15 @@ Copying edits to the replicas isn't instant — there's a tiny delay. **Replicat
 
 Fixes: read *your own* recent writes from the primary, or wait for the replica to catch up. This is why replicas scale reads but don't magically make everything consistent.
 
+### Connection pooling (the hidden database limit)
+
+A database can only hold a **limited number of open connections** — each one costs memory and (in Postgres) a backend process. This bites the moment you scale the app tier: 50 app servers × 100 connections each = **5,000 connections** slamming a database that comfortably serves a few hundred. It then spends its time juggling connections instead of running queries, and new connections start to queue or error out.
+
+- **In-app pool** — each app server reuses a small fixed set of connections (e.g. HikariCP) instead of opening a fresh one per request.
+- **External pooler** — a middle layer that multiplexes *thousands* of app connections onto a *few* real DB connections: **PgBouncer** (Postgres), **RDS Proxy** (AWS), ProxySQL (MySQL).
+
+> ⚠️ **Scaling the app tier can *hurt* the DB.** More app servers means more connections, and past the DB's limit the database falls over even while its CPU looks idle. Pool connections *before* you fan out the app tier.
+
 ### Sharding (scaling writes — the hard part)
 
 Replicas fix **reads**, but **every write still goes to the one primary**. Eventually even that can't keep up. **Sharding** = split the data itself across **many independent databases**, each owning a slice.
@@ -307,6 +317,30 @@ They're **complementary**, not either/or — real systems do **both**: shard the
 - **Cross-shard queries are painful.** "List all users alphabetically" now has to ask *every* shard and merge results — slow and complex.
 - **Hot shards.** If one slice gets way more traffic (a celebrity all on shard 2), that shard becomes a mini-bottleneck again. (Same "hot key" idea as salting in stream systems.)
 - **Resharding is hard.** Adding a shard later means *moving* data around while live — genuinely tricky. This is why you cache and add replicas **first**, and only shard when writes truly force you to.
+
+#### Q: Partitioning vs sharding — aren't they the same thing? (beginners conflate these)
+
+Both "split" data, but at **different levels** — one splits a *table*, the other splits across *machines*:
+
+| | **Partitioning** | **Sharding** |
+| --- | --- | --- |
+| Scope | **One** database, one machine | **Many** databases, many machines |
+| Splits | One big table → smaller **sub-tables** (by range / time / hash) | One dataset → **rows spread across servers** by shard key |
+| Goal | Manageable tables, prune old data, faster scans | Spread **writes + storage** across machines |
+| Analogy | One filing cabinet, labeled drawers | Many filing cabinets in different rooms |
+
+One line: **partitioning splits a table inside one DB; sharding splits the data across many DBs.** Sharding is essentially partitioning taken *across machines*, which is exactly why it's harder (cross-machine queries, resharding). You often still partition *within* each shard.
+
+### CQRS — a separate read model (not just replicas + cache)
+
+Replicas and caches make reads of the **same shape** of data faster. **CQRS (Command Query Responsibility Segregation)** goes further: you keep **two different models** — one optimized for **writes** (normalized, transactional) and a **separate read-optimized view** (denormalized, pre-joined, shaped exactly like the screen needs it). Writes update the write model; a **projection** keeps the read model in sync, usually via events.
+
+> ⚠️ **Read replicas + cache ≠ CQRS.** Replicas and caches serve the *same* schema faster. CQRS is a *different* schema for reads — a purpose-built projection (e.g. a `user_feed` table, an Elasticsearch index) rebuilt from writes. Adding replicas is not CQRS.
+
+- **When to build it:** the read pattern is expensive or wildly different from the write pattern — heavy aggregations, full-text search, a feed that fans out from many tables, dashboards that would need giant joins on every request. Pre-compute the answer into a read model instead of recomputing it live.
+- **The cost:** two models to keep in sync → the read side is **eventually consistent** (the projection lags the write). Only reach for it when a plain replica or cache can't shape the data cheaply enough.
+
+> 💡 **Event sourcing** is *related but different*: instead of storing current state, you store the **log of every change** (events) and derive state by replaying them. It pairs naturally with CQRS (events feed the read projections), but you can do CQRS without it — most teams do.
 
 ---
 
@@ -386,11 +420,23 @@ A few of the table rows explained:
 
 > One line: at massive scale you **scale every layer** *and* assume **every layer will sometimes fail**, so redundancy and monitoring stop being optional.
 
+### Auto-scaling: scale on the *right* signal
+
+Auto-scaling (Kubernetes **HPA** — Horizontal Pod Autoscaler) adds and removes instances automatically under load. The hard part isn't turning it on — it's **choosing the metric to scale on**:
+
+- **CPU / memory** — the default. Great for CPU-bound services; useless for a worker that's *waiting* on I/O — it looks idle while its queue backs up.
+- **Queue lag / backlog** — for async consumers, scale on **how far behind** you are (Kafka consumer lag, SQS queue depth), not CPU. This is the right signal for background work.
+- **Custom / app metrics** — requests-per-second, p99 latency, in-flight requests — when neither CPU nor queue depth reflects the real load.
+
+> 💡 **Scale on the signal that actually saturates.** A queue-worker scaled on CPU will never scale up (it's I/O-bound); scale it on **lag** instead. Match the trigger to whatever the service is truly bottlenecked on.
+
 ---
 
 ## 7. How to Find the Bottleneck
 
 Don't scale blindly — **measure, then fix the actual limit**:
+
+> ⚠️ **Over-engineering is the #1 mistake — don't scale before you measure.** Adding shards, replicas, or regions "to be safe" burns money and complexity while often fixing the *wrong* bottleneck. The worst offender: **don't shard too early** — sharding is the hardest, least reversible step. Cache and add replicas first; shard only when write volume *provably* forces it.
 
 ```
 1. Metrics first: CPU, memory, DB QPS/latency, cache hit ratio, queue lag, p99
@@ -457,6 +503,21 @@ This table is just **stage 0 vs stage 8** side by side:
 - **CDN / Regions: optional → critical / multi-region.** One location → many regions with failover.
 
 > The point of showing both columns: **you are not supposed to build the right column on day one.** Every "Massive Scale" entry was *added later*, only when volume forced it. Starting with the right column for a 10-user app is the classic **over-engineering** mistake.
+
+---
+
+## Common Mistakes
+
+The recurring ways teams get scaling wrong — most are variations of *acting before measuring*:
+
+- **Sharding too early.** Sharding is the hardest, least reversible step. Cache + replicas + a bigger primary buy a *very* long runway; shard only when writes provably force it.
+- **Ignoring replication lag.** Adding replicas, then reading a user's *own* fresh write from a lagging replica → "did my save fail?" Route read-your-writes to the primary (§4).
+- **Scaling the app tier without measuring the DB.** Adding app servers when the **database** is the real limit just sends *more* load (and more connections) to the choke point. Find the saturated resource first (§7).
+- **Building multi-region before single-region is stable.** Multi-region multiplies operational complexity — data consistency, failover, cross-region latency. Get one region solid first.
+- **Treating replicas/cache as CQRS.** They speed up the *same* data; a genuinely different read pattern needs a purpose-built read model (see CQRS in §4).
+- **Auto-scaling on the wrong metric.** CPU-scaling an I/O-bound queue worker never scales up. Scale on the signal that saturates — lag, RPS, p99 (§6).
+
+> 💡 The through-line: **measure → fix the one saturated resource → re-measure.** Nearly every mistake above is skipping that first *measure* step.
 
 ---
 

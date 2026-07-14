@@ -1,6 +1,6 @@
 # Databases — Deep Dive (SQL, NoSQL, Storage Internals & Scaling)
 
-> **Goal:** understand **how each database physically stores data**, **when to use which**, and **how to scale each** — including the hard part: *how a cluster decides which node holds a given key* (Redis hash slots, Mongo config servers, Cassandra token ring). This is the "which DB and why" note.
+> **Goal:** the "which DB and why" note — pick the right database, know how it stores data, and know how to scale it (including the hard part: *how a cluster decides which node holds a given key* — Redis hash slots, Mongo config servers, Cassandra token ring).
 >
 > Builds on **Database Fundamentals** (SQL vs NoSQL, ACID/BASE, CAP) and **Database Indexing** (B-Tree internals).
 
@@ -24,8 +24,9 @@
 - [12. DynamoDB & others (quick hits)](#12-dynamodb--others-quick-hits)
 - [13. Replication, Partitioning & Routing (the scaling core)](#13-replication-partitioning--routing-the-scaling-core)
 - [14. Decision Cheat Sheet](#14-decision-cheat-sheet)
-- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
-- [16. Final Takeaways](#16-final-takeaways)
+- [15. Common Mistakes](#15-common-mistakes)
+- [16. Interview Cheat Sheet](#16-interview-cheat-sheet)
+- [17. Final Takeaways](#17-final-takeaways)
 
 ---
 
@@ -517,6 +518,32 @@ You (client) → mongos (router) → checks config servers (metadata) → routes
 
 If your shard key is something that only ever increases (like a timestamp or auto-increment id), **all new writes target the same newest chunk → the same one shard** — while the others sit idle. That overloaded shard is a **hot shard**, and you've effectively un-scaled your cluster. A good key has **high cardinality** (many distinct values) and **spreads writes evenly** (hashing helps). Same "hot key" idea as a viral ad overloading one Kafka partition in the Ad Click Aggregation note.
 
+### MongoDB consistency — writeConcern, readConcern, and where you read
+
+Mongo is single-leader per shard (a **primary** + **secondaries**), so consistency comes down to two dials you set per operation.
+
+| Dial | Controls | Common values |
+| --- | --- | --- |
+| **writeConcern** `w` | How many nodes must ack a write before it's "done" | `1` (primary only, fast, can be lost on failover) · `"majority"` (durable — survives failover) |
+| **readConcern** | How fresh/committed the data you read must be | `"local"` (may be rolled back) · `"majority"` (only data acked by a majority) |
+| **read preference** | *Which* node you read from | `primary` (freshest) · `secondary` / `nearest` (scales reads, may be stale) |
+
+```javascript
+db.orders.insertOne(
+  { _id: 1, total: 1500 },
+  { writeConcern: { w: "majority" } }        // not "done" until a majority persists it
+);
+db.orders.find({ _id: 1 })
+  .readConcern("majority")                    // read only majority-committed data
+  .readPref("primary");                       // from the primary → freshest
+```
+
+- **Primary reads** = strongly consistent (you always see the latest committed write). **Secondary reads** scale read throughput but can be **stale** (replication lag) → fine for dashboards, risky for read-after-write.
+- **`w: "majority"` writes** are the durability guarantee: because a majority persisted the write, a failover election can never lose it (a new primary must have it). `w: 1` is faster but a crash before replication can drop that write.
+- **Strong read-after-write** on Mongo = `w: "majority"` + read from **primary** (or `"majority"` readConcern). This is Mongo's analog of Cassandra's `R + W > N` (§13).
+
+> ⚠️ **Reading from secondaries is not free consistency.** It boosts read scale but exposes replication lag — a user may not see their own just-saved change. Only route to secondaries for data that tolerates staleness.
+
 ---
 
 ## 8. Cassandra (wide-column)
@@ -619,6 +646,20 @@ GET user:123   →  hit Redis (RAM)   → answer in microseconds
 
 By default Redis can persist to disk (**RDB** snapshots + **AOF** write log) so it can reload after a restart. But you generally treat it as *disposable cache* — the durable truth lives in your main database, and Redis is rebuilt/repopulated from there. Don't store data you can't afford to lose *only* in Redis.
 
+**RDB vs AOF — the two persistence modes:**
+
+| | **RDB** (snapshot) | **AOF** (append-only file) |
+| --- | --- | --- |
+| What it saves | Point-in-time **binary dump** of the whole dataset, every N seconds/changes | **Log of every write command**, replayed on restart |
+| Restart speed | **Fast** (load one compact file) | Slower (replay the log) |
+| Durability | **Coarse** — lose everything since the last snapshot (e.g. up to minutes) | **Fine** — lose ≤1s with `everysec` (or 0 with `always`, but slow) |
+| File size / cost | Small, cheap; fork+dump can spike memory | Larger; needs periodic **rewrite/compaction** to stay small |
+| Best for | Backups, fast recovery, tolerable data loss | Minimal data loss on crash |
+
+> 💡 **Common production setup: enable both.** AOF (`appendfsync everysec`) for low-loss durability, plus periodic RDB snapshots for fast restarts and backups. Redis replays AOF on boot but keeps RDB as a compact recovery point.
+
+> ⚠️ Persistence does **not** make Redis a system of record. Even with AOF `always`, treat Redis as a cache/derived store — the authoritative copy belongs in your primary DB.
+
 ### Why Redis (ElastiCache) is fast — and what it's *not*
 
 | Why fast | Detail |
@@ -695,6 +736,8 @@ Full-text **search** + log analytics via an **inverted index** (Lucene).
 
 ### Why it's fast for search — the inverted index
 
+> 💡 **Intuition first:** an inverted index is exactly the **index at the back of a textbook**. You don't read every page to find "mitochondria" — you flip to the index, which lists the pages where that word appears. Elasticsearch stores, for every word, the list of documents that contain it. So *reading the intuition below is enough to "get" it — the FST/skip-list details in the next subsection are just how it's made fast.*
+
 A normal DB would **scan every row** to find text matches (`LIKE '%fox%'` = O(n), no index help). Elasticsearch flips it around, exactly like the index at the back of a book:
 
 ```
@@ -760,14 +803,31 @@ No. Treat it as a **derived read model**, not the source of truth. You keep the 
 
 Store **embeddings** (high-dimensional vectors from ML models) and find the **nearest** vectors by similarity — powering semantic search, recommendations, and **RAG** (retrieval-augmented generation for LLMs).
 
+### First, the intuition: meaning as coordinates
+
+Elasticsearch finds documents that contain your **exact words**. A vector DB finds things that are **similar in meaning**, even with zero words in common. Search "cheap flights" and it can surface "budget airfare deals."
+
+**How?** An ML model turns any text/image into a list of numbers (an **embedding** or **vector**). Think of it as **coordinates for meaning**: every word/sentence/image becomes a point in space, and **things that mean similar things sit close together**. So "find similar" is literally "find the nearest points."
+
+```
+"budget airfare"   → [0.11, -0.4, 0.9, ...]   ┐  these two points sit
+"cheap flights"    → [0.12, -0.38, 0.88, ...] ┘  close together → similar
+"grilled salmon"   → [-0.7, 0.2, 0.05, ...]      far away → unrelated
+```
+
+> 💡 **Mental model:** picture a map where distance = dissimilarity. "Nearest neighbors" are the closest dots. Embeddings do exactly this, just in hundreds of dimensions instead of two — and the model, not you, decides the coordinates.
+
 ```
 text/image → embedding model → vector [0.12, -0.3, ...] (e.g. 768 dims)
 query vector → find top-k nearest vectors by cosine / dot / L2 distance
 ```
 
-- **Exact nearest-neighbor is O(n)** over millions of vectors → too slow. Use **ANN (Approximate Nearest Neighbor)** indexes:
-  - **HNSW** (Hierarchical Navigable Small World) — a navigable graph; fast, high recall (most popular).
-  - **IVF** (inverted file / clustering) + **PQ** (product quantization) — cluster then search nearest clusters; compresses vectors.
+### Then the internals: ANN indexes (HNSW, IVF)
+
+Computing the distance to *every* stored vector (**exact** search) is **O(n)** — too slow over millions of items. So vector DBs use **ANN (Approximate Nearest Neighbor)** indexes that jump to the right neighborhood fast, trading a tiny bit of accuracy (**recall**) for large speed gains:
+
+- **HNSW** (Hierarchical Navigable Small World) — a navigable graph connecting nearby points; you "walk" toward the query. Fast, high recall (most popular).
+- **IVF** (inverted file / clustering) + **PQ** (product quantization) — cluster the vectors, then only search the nearest clusters; PQ compresses vectors to save memory.
 - **Options:** dedicated (**Pinecone, Milvus, Weaviate, Qdrant**) or add-ons (**pgvector** for Postgres, Elasticsearch/OpenSearch, Redis vector).
 
 ```sql
@@ -780,25 +840,22 @@ SELECT id FROM docs ORDER BY embedding <=> '[...]' LIMIT 5;   -- <=> = cosine di
 - **Use when:** "find similar" by meaning (not keywords) — semantic search, recommendations, dedup, RAG.
 - **Scaling:** shard vectors across nodes; ANN index per shard; scatter-gather + merge top-k. Trade **recall vs latency** via index params.
 
-### Searching by meaning, not by words
-
-Elasticsearch finds documents that contain your **exact words**. A vector DB finds things that are **similar in meaning**, even with zero words in common. Search "cheap flights" and it can surface "budget airfare deals."
-
-**How?** An ML model turns any text/image into a list of numbers (an **embedding** or **vector**) that captures its *meaning*. Similar meanings → vectors that sit **close together in vector space**. So "find similar" becomes "find the nearest vectors."
-
-```
-"budget airfare"   → [0.11, -0.4, 0.9, ...]   ┐  these two vectors are
-"cheap flights"    → [0.12, -0.38, 0.88, ...] ┘  very close → judged similar
-"grilled salmon"   → [-0.7, 0.2, 0.05, ...]      far away → unrelated
-```
-
-Computing the distance to *every* stored vector (exact search) is too slow over millions of items, so vector DBs use **ANN (Approximate Nearest Neighbor)** indexes (**HNSW** = a navigable graph connecting nearby vectors) that jump to the right neighborhood fast, trading a tiny bit of accuracy (**recall**) for large speed gains.
-
 #### Q: Where does this actually get used?
 
 - **Semantic search** ("find docs about X" by meaning).
 - **Recommendations** ("users who liked this also liked…").
 - **RAG (Retrieval-Augmented Generation):** before an LLM answers, embed the question, fetch the most *relevant* chunks of your docs from the vector DB, and feed them to the model so it answers from *your* data. This is the backbone of most "chat with your documents" apps.
+
+#### Q: What is "recall vs latency," and how do I tune it?
+
+Because ANN is *approximate*, it can miss a few true nearest neighbors. **Recall** = the fraction of the true top-k neighbors your search actually returns (100% = same answer as exact search). **Latency** = how fast each query is. They trade off directly — exploring more of the graph or more clusters raises recall but costs time:
+
+- **HNSW:** raise `ef_search` (candidates explored per query) → higher recall, slower. `M` (graph connectivity, set at build time) raises recall but grows the index.
+- **IVF:** raise `nprobe` (clusters scanned per query) → higher recall, slower.
+
+Tune to your SLA: e.g. accept **~95% recall** for single-digit-ms queries, or push toward **99%** when correctness matters more than speed.
+
+> 💡 There is no "correct" recall — it's a dial. Benchmark recall on a labelled query set, then pick the cheapest params that clear your quality bar.
 
 #### Q: Do I need a dedicated vector DB?
 
@@ -815,6 +872,37 @@ Not always. **pgvector** adds vector search to Postgres, and Elasticsearch/Redis
 | **Neo4j** | Graph; Cypher; relationship-heavy queries (friends-of-friends, fraud) |
 | **InfluxDB / TimescaleDB** | Time-series (metrics/IoT); time-partitioned, downsampling |
 | **Memcached** | Pure in-memory cache (simpler than Redis, multi-threaded, no data structures/persistence) |
+
+### DynamoDB worked example — modeling a query-first access pattern
+
+DynamoDB forces you to design **around your queries** (like Cassandra). A table has a **partition key** (`PK` — hashed to pick the partition/node) and an optional **sort key** (`SK` — orders items *within* a partition). You can only query efficiently by `PK` (plus an optional `SK` range) — everything else needs a secondary index or a scan.
+
+**Access pattern:** *"list a user's orders, newest first."* Model `user_id` as the partition key and `created_at` as the sort key:
+
+```
+Table: Orders
+  PK = user_id          # all of one user's orders live in one partition
+  SK = created_at       # sorted within the partition → free "newest first"
+
+Query: PK = "u_123", SK descending, limit 20
+  → one partition, one sorted range read → fast, cheap ✅
+```
+
+Now a **second** access pattern appears: *"find an order by its `order_id`"* — but `order_id` isn't the table's key. Add a **Global Secondary Index (GSI)**, which is a separate copy of the data re-keyed for that query:
+
+```
+GSI: byOrderId
+  PK = order_id         # re-partitioned by order_id
+  → Query PK = "o_987" → lands directly on it, no scan ✅
+
+GSI: byStatusRecent     # "recent PENDING orders for a user"
+  PK = user_id
+  SK = status#created_at # composite sort key enables "status = PENDING, newest first"
+```
+
+> 💡 **Rule:** in DynamoDB you don't add indexes to speed up arbitrary queries later — you enumerate every access pattern up front and give each one a `PK`/`SK` (on the table or a GSI). A query with no matching key degrades to a full **`Scan`** (slow + expensive).
+
+> ⚠️ Choose the partition key for **even spread**. Keying by something low-cardinality or monotonic (e.g. `status`, or a date bucket everyone writes to today) creates a **hot partition** — the same throttling trap as a Cassandra/Mongo hot shard.
 
 ---
 
@@ -928,9 +1016,37 @@ Because it's the trick that makes **adding/removing a shard cheap**. With naive 
 
 > **Polyglot persistence:** real systems use **several** — e.g. Postgres (source of truth) + Redis (cache) + Elasticsearch (search) + a warehouse (analytics) + a vector DB (semantic). Pick per access pattern; keep one source of truth and sync others via CDC/events.
 
+### When NOT to use each engine
+
+Knowing an engine's *anti-patterns* is as useful as its strengths:
+
+| Engine | Don't use it when… | Reach for instead |
+| --- | --- | --- |
+| **PostgreSQL** | You need heavy OLAP scans over billions of rows, or write throughput beyond one primary | Column store (ClickHouse) / NewSQL (Spanner, CockroachDB) |
+| **MongoDB** | Your data is highly relational with many-way joins and cross-entity transactions | PostgreSQL |
+| **Cassandra** | You need ad-hoc queries, joins, or can't define access patterns up front | PostgreSQL / MongoDB |
+| **Redis** | The data must be durable/authoritative, or is bigger than RAM | A disk-based DB (as source of truth), Redis only as cache |
+| **Elasticsearch** | You need it as the source of truth or for transactional writes | Postgres as truth; ES as a derived search index |
+| **Vector DB** | Your queries are exact keyword/field lookups, not similarity by meaning | Elasticsearch (text) / SQL (structured filters) |
+
 ---
 
-## 15. Interview Cheat Sheet
+## 15. Common Mistakes
+
+The most common ways teams pick the wrong tool — each maps back to an earlier section.
+
+- **Elasticsearch as source of truth.** It's a *derived, eventually-consistent, near-real-time* search index (§10). A lost/rebuilt cluster or a missed refresh means data gone or stale. Keep the truth in Postgres; feed ES via CDC/ETL.
+- **Redis for durable data.** RAM is volatile and Redis is a *cache* (§9). Even with AOF, don't make it the only copy of anything you can't afford to lose.
+- **Cassandra without query-first modeling.** Cassandra rewards you only if you design tables per query shape (§8). Expecting ad-hoc `WHERE`/joins leads to `ALLOW FILTERING` full scans and pain.
+- **Wrong partition/shard key.** A low-cardinality or monotonic key (timestamp, auto-increment, `status`) funnels traffic to one node — a **hot shard/partition** that un-scales the cluster (§7, §8, §12). Pick high-cardinality keys that spread load *and* match your queries.
+- **Running OLAP on Postgres (OLTP).** Heavy `GROUP BY`/scans over billions of rows on your production DB hammer the app (§2.3). Ship to a column store / warehouse (ClickHouse, BigQuery) via ETL/CDC.
+- **Picking MongoDB for heavy joins.** Documents shine for self-contained, nested entities. Highly relational data with many-way joins and cross-entity transactions belongs in a relational DB (§7 vs §3).
+
+> 💡 **Meta-lesson:** almost every mistake above is *using a specialized store outside its access pattern*. Start from "what do my reads and writes look like?" (§1), keep one source of truth, and add specialized stores only for the specific need they solve.
+
+---
+
+## 16. Interview Cheat Sheet
 
 > **"SQL or NoSQL — how do you decide?"**
 > "By access pattern + consistency + scale. Default to relational (Postgres) for ACID, joins, and flexible queries. Go NoSQL for a specific need: Redis for sub-ms cache, Cassandra for write-heavy scale, Mongo for flexible documents, Elasticsearch for search, a vector DB for similarity. Most real systems are polyglot."
@@ -952,7 +1068,7 @@ Because it's the trick that makes **adding/removing a shard cheap**. With naive 
 
 ---
 
-## 16. Final Takeaways
+## 17. Final Takeaways
 
 - **Storage engine is destiny:** **B-Tree** = balanced/read + range (SQL, Mongo); **LSM** = write-heavy append + compaction (Cassandra); **column store** = analytics; **inverted index** = search; **ANN/HNSW** = vectors.
 - **SQL (Postgres/MySQL)** = ACID + joins + flexible queries; single write primary → scale reads via **replicas**, writes via **sharding (Vitess/Citus)** or **NewSQL (Spanner/CockroachDB)**.

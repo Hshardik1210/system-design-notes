@@ -2,6 +2,8 @@
 
 > **Core challenge:** Reliably deliver the **right message** to the **right user** on the **right channel** at the **right time** — without duplicates, without spam, and without blocking the source system. Used by Amazon (order updates), Swiggy (delivery tracking), BookMyShow (show reminders), LinkedIn (activity alerts), WhatsApp (messages).
 
+> **The tension in one line:** to never *lose* a notification you must retry (**at-least-once**), but every retry risks sending the *same* thing twice — so the entire design is "try hard enough that nothing is dropped, dedup hard enough that nothing lands twice, and never spam." Almost every decision below serves this.
+
 > **How to read this doc:** each section has the dense interview summary first, then a **deep dive** (annotated Java and the exact confusions that come up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
 ---
@@ -37,8 +39,9 @@
 - [27. Final Architecture](#27-final-architecture)
 - [28. How to Drive the Interview](#28-how-to-drive-the-interview)
 - [29. Interview Cheat Sheet](#29-interview-cheat-sheet)
-- [30. Design Patterns (that can be used)](#30-design-patterns-that-can-be-used)
-- [31. Final Takeaways](#31-final-takeaways)
+- [30. Consistency & CAP Tradeoffs](#30-consistency--cap-tradeoffs)
+- [31. Design Patterns (that can be used)](#31-design-patterns-that-can-be-used)
+- [32. Final Takeaways](#32-final-takeaways)
 
 ---
 
@@ -54,6 +57,19 @@ A notification system sends messages to users through one or more **delivery cha
 | **In-app** | Bell icon with unread count |
 | **WhatsApp** | Order updates (where supported) |
 | **WebSocket / SSE** | Live chat, real-time feed updates |
+
+### Channel cost, speed & reach (beginner matrix)
+
+The channels behave nothing alike — this difference drives *which* channel a `type` uses and *how many workers* each needs (§3, §6.3):
+
+| Channel | Cost per message | Speed to user | Reach / constraint |
+| --- | --- | --- | --- |
+| **In-app** | ~free (a DB write) | **Instant** — but only seen when the app is open | Any logged-in user; no external provider |
+| **Push** | Very cheap | **Fast** (sub-second via FCM/APNS) | Needs the app installed + a valid device token |
+| **Email** | Cheap | **Slow** (seconds to deliver; may sit unread in an inbox) | Almost universal; great for rich/long content + receipts |
+| **SMS** | **Expensive** (real ₹/$ per message) | Medium (seconds; provider-rate-limited) | Near-universal reach, no app needed — reserve for OTP/critical |
+
+> 💡 **Rule of thumb:** push/in-app for volume, email for rich content, **SMS only when it must arrive and the other channels can't reach them** (OTP, "payment failed"). Cost + rate limits are exactly why SMS gets few, carefully-throttled workers.
 
 ### Mental model
 
@@ -160,7 +176,7 @@ The two columns above (Functional vs Non-Functional) answer two different questi
 
 The NFRs are usually what makes the system *hard* — anyone can send one push; sending 250M/day with no duplicates and OTPs in under a second is the real engineering.
 
-#### Q: Which requirement is the "hardest" one and why?
+### The "hardest" requirement, and why
 
 > **"No duplicates" + "at-least-once delivery"** — because those two pull in opposite directions.
 
@@ -223,16 +239,16 @@ double avgPerSec = perDay / 86_400.0;      // 86,400 seconds in a day ≈ 2,900/
 double peakPerSec = avgPerSec * 5;         // bursts are ~3–5× the average ≈ 14,500/sec
 ```
 
-#### Q: Why split traffic by channel (push 60%, SMS 5%)?
+### Why split traffic by channel (push 60%, SMS 5%)
 
-Because the channels behave nothing alike, and that difference **shapes the whole design**:
+The channels behave nothing alike, and that difference **shapes the whole design**:
 
 - **Push** is cheap and high-volume → you'll run *lots* of push workers.
 - **SMS** costs real money per message and providers rate-limit you → few workers, careful throttling.
 
 Sizing them separately is why we later run **separate worker pools per channel** ([§6.3](#63-channel-workers)) instead of one pool. The estimate isn't trivia; it's the justification for that decision.
 
-#### Q: A campaign is 10M messages — why not just loop and send them?
+### A campaign is 10M messages — why not just loop and send them
 
 The last block shows the trap: 10M users pushed in one go = a wall of traffic that dwarfs normal load. That's why fan-out ([§11](#11-fan-out--bulk-notifications)) is a **spread-it-out batch pipeline** (5,500/sec for 30 min), not a `for` loop. Estimation is what reveals that a campaign is a *different* problem from a single notify.
 
@@ -320,11 +336,11 @@ public ResponseEntity<Ack> send(@RequestBody NotificationRequest req) {
 }
 ```
 
-#### Q: What is the `idempotencyKey` and why does the caller send it?
+### What the `idempotencyKey` is, and why the caller sends it
 
 `idempotencyKey` = a **fingerprint of the business event**, e.g. `123:ORDER_CONFIRMED:order_789`. The caller builds it from things that are stable for that event (user + type + the specific order). If the Order Service (or Kafka) accidentally fires the *same* event twice, both requests carry the **same** key → the notification system stores only one → the user gets one push, not two. The caller provides it because only the caller knows what makes *this* event unique. Full mechanics in [§13](#13-idempotency--deduplication).
 
-#### Q: Why does the send payload not include the actual message text?
+### Why the send payload doesn't include the actual message text
 
 Notice the request has `type` and `data`, but no "title"/"body" string. That's deliberate: the **template system** ([§15](#15-template-system)) turns `type + data` into text at send time. The caller says *"an order was confirmed, here are the facts"*; the notification service decides the exact wording (and language, and per-channel length). This keeps message copy in one place instead of scattered across every calling service.
 
@@ -393,9 +409,9 @@ Follow one order-confirmation through the picture top to bottom:
 
 The single most important idea in the whole diagram is that **the queue sits in the middle**, so the left half (accepting work) and the right half (delivering work) can run, fail, and scale **independently**.
 
-#### Q: Why not skip the queue and let the API call the workers directly?
+### Why not skip the queue and let the API call the workers directly
 
-Because then the API's speed would be chained to the *slowest provider*. The queue **decouples** them: the API dumps a message and returns in milliseconds; workers drain the queue at their own pace. If Twilio has a bad 10 minutes, messages simply **wait** in Kafka instead of being lost or blocking anyone.
+If it did, the API's speed would be chained to the *slowest provider*. The queue **decouples** them: the API dumps a message and returns in milliseconds; workers drain the queue at their own pace. If Twilio has a bad 10 minutes, messages simply **wait** in Kafka instead of being lost or blocking anyone.
 
 ```java
 // The API side — never touches a provider, just enqueues:
@@ -409,7 +425,7 @@ public void onMessage(QueueMsg msg) {
 }
 ```
 
-#### Q: Kafka vs SQS vs RabbitMQ — how do I choose without memorizing?
+### Kafka vs SQS vs RabbitMQ — choosing without memorizing
 
 One-line mental model:
 
@@ -516,13 +532,13 @@ class NotificationApiService {
 }
 ```
 
-#### Q: What's the "dual-write hazard" the warning box mentions?
+### What the "dual-write hazard" the warning box mentions
 
 The API does two things that live in **two different systems**: (1) insert a DB row, (2) publish to Kafka. There's no single "do both or neither" button across a database *and* a message broker. So if the process dies *after* the insert but *before* the publish, you get a row stuck at `PENDING` forever — a notification that exists on paper but never gets delivered.
 
 The fix (**outbox** or a **reconciliation sweeper**) is covered in [§23](#23-failure-scenarios--mitigations) — for now just internalize *"two systems, one crash = trouble."*
 
-#### Q: Why is the Preference Service separate from the workers?
+### Why the Preference Service is separate from the workers
 
 So the decision *"is this user allowed to get a promo SMS at 11 PM?"* is made **once, up front**, in one place — before anything is queued. If each worker re-checked preferences you'd duplicate that logic four times and risk them disagreeing. One gatekeeper, one answer.
 
@@ -616,17 +632,31 @@ void onOrderConfirmed(OrderConfirmed e) {
 }
 ```
 
-#### Q: What does `PARTIALLY_SENT` mean and why keep it?
+### What `PARTIALLY_SENT` means, and why keep it
 
 One business event fans out to several channels, and they can succeed **independently**. Push might land while email bounces. `PARTIALLY_SENT` records that mixed outcome honestly instead of lying with a flat `SENT` or `FAILED`. It also tells a retry job *"only the email needs another attempt"* — the push is already done. Per-channel truth lives in the `notification_attempts` table ([§8](#8-data-model--schema)).
 
-#### Q: Why check idempotency *before* doing all this work?
+### Why check idempotency *before* doing all this work
 
-Because the whole point is **"one business event → one notification."** If the same `ORDER_CONFIRMED` arrives twice (Kafka is at-least-once), the second pass should find the key already exists and stop — otherwise the user gets two "order confirmed" pings. Checking early also avoids wasting template rendering and DB writes on a duplicate.
+The whole point is **"one business event → one notification."** If the same `ORDER_CONFIRMED` arrives twice (Kafka is at-least-once), the second pass should find the key already exists and stop — otherwise the user gets two "order confirmed" pings. Checking early also avoids wasting template rendering and DB writes on a duplicate.
 
 ---
 
 ## 8. Data Model & Schema
+
+### Database & storage choices (which DB, and why at scale)
+
+No single store fits every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question for the master record is *"do we need a UNIQUE constraint to enforce idempotency?"* — the answer is yes (§13), which points straight at a relational store rather than an eventually-consistent one.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Notifications (master record), attempts, preferences, templates — **source of truth** | **RDBMS** (PostgreSQL/MySQL) | Idempotency and "exactly one active template" are enforced as **UNIQUE constraints** — `notification_key` UNIQUE, `(notification_id, channel)` UNIQUE on attempts, a partial unique index for one active template per `(type, channel, language)`. These are database guarantees, not app-level bookkeeping. | An eventually-consistent NoSQL store gives you none of these constraints for free — you'd have to hand-roll dedup and "which version is live" checks in application code, and still race under concurrent writers. |
+| Event backbone — every "send this" command, from API to channel workers | **Kafka**, partitioned by `user_id` | Durable log **decouples** the API from slow providers (Twilio/FCM can have a bad 10 minutes without losing anything, §5); partitioning by `user_id` gives **per-user ordering** (push and email for the same event don't arrive out of order) while spreading load across partitions. | Calling FCM/Twilio/SES synchronously from the API chains its latency to the *slowest* provider and loses messages on a crash mid-call. SQS/RabbitMQ lack Kafka's cheap replay for reprocessing after a bug fix. |
+| Rate-limit counters, dedup markers, in-app unread badge, WebSocket connection routing, hot cache (preferences/templates/device tokens) | **Redis** | All are checked on nearly **every** request (thousands/sec) — an atomic `INCR`/`SET NX EX` is O(1), auto-expires, and needs no durability beyond a TTL. It's a scoreboard, not a ledger. | Counting `notifications` rows for a rate limit, or `COUNT(*) WHERE is_read=false` for the unread badge, re-runs the same expensive query millions of times a day against the RDBMS. |
+| Massive append-only delivery logs (optional, only past RDBMS scale) | **Cassandra** | If attempt volume genuinely outgrows one RDBMS's indexes (huge fleets, long retention), a wide-column store absorbs unbounded appends — attempts are already scoped to one `notification_id`, so there's no cross-row transaction to give up. | Not worth the operational cost by default — you lose the `UNIQUE (notification_id, channel)` constraint and must dedupe attempts in application code instead of at the DB layer. |
+| Rich HTML email templates, large attachments | **Blob store (S3) + CDN** | Big, mostly-static bytes are cheap to store and serve from the edge; the DB keeps only a pointer. | Inlining HTML blobs into `notification_templates` bloats a hot table and kills cache locality for every other template read. |
+
+**Why RDBMS wins for the master record, and Kafka (not sync calls) for delivery:** at ~15k inserts/sec (§3) a single RDBMS primary handles the write volume comfortably — the hard requirement isn't throughput, it's the **UNIQUE constraints** that make idempotency (§13) a database guarantee instead of app-level bookkeeping. Kafka sits between the API and the channel workers precisely so the API never blocks on a provider call; partitioning by **`user_id`** keeps one user's notifications ordered while spreading users evenly across partitions, and a genuinely hot `user_id` (a broadcast/system account) is handled the same way as any hot-key problem — extra consumer capacity or a synthetic sub-key, not a redesign. Preferences, templates, and device tokens are read constantly but change rarely, so a Redis cache sits in front of the RDBMS rather than hitting Postgres on every send. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ### Users (minimal — usually owned by User Service)
 
@@ -788,20 +818,7 @@ CREATE UNIQUE INDEX uniq_active_template
     WHERE is_active = TRUE;
 ```
 
-When copy changes, **insert a new version** — do not overwrite v1:
-
-| type | channel | version | is_active | body_template |
-| --- | --- | --- | --- | --- |
-| ORDER_CONFIRMED | PUSH | 1 | false | "Order {{orderId}} confirmed" |
-| ORDER_CONFIRMED | PUSH | 2 | true | "Hi {{name}}, order {{orderId}} confirmed!" |
-
-**Selecting the template to use for a new send** — always pick the active row:
-
-```sql
-SELECT * FROM notification_templates
-WHERE type = 'ORDER_CONFIRMED' AND channel = 'PUSH' AND language = 'en'
-  AND is_active = TRUE;
-```
+When copy changes, **insert a new version** — do not overwrite v1 (worked example + the "pick the active row" query are in [§15](#15-template-system)).
 
 The `notifications` row stores `template_type` + `template_version` (or a direct `template_id` FK — see [§15](#15-template-system)) **plus** the rendered `title`/`body` snapshot — so you always know exactly what was sent, even after v2 goes live.
 
@@ -823,7 +840,7 @@ The **one distinction that matters most**: `notifications` vs `notification_atte
 > `notifications` = the **intent** ("we mean to tell user 123 their order is confirmed") — created **once** per event.
 > `notification_attempts` = the **delivery log** ("push try #1 to FCM failed, try #2 succeeded; email try #1 succeeded") — **many** rows, one per channel, updated on every retry.
 
-The `notifications` row is the *intent*, created once. The `notification_attempts` rows are the *per-channel delivery log* — one row per channel, updated on every retry. You never re-create the notification because a delivery failed — you just log another attempt against it.
+You never re-create the notification row because a delivery failed — you just log another attempt against it.
 
 ```java
 // One "notifications" row = one intent, created once:
@@ -847,17 +864,17 @@ class NotificationAttempt {
 }
 ```
 
-#### Q: Why not just use an auto-increment ID (1, 2, 3, ...)?
+### Why not just use an auto-increment ID (1, 2, 3, ...)
 
 Because a single auto-increment counter lives in **one** database. At ~15k inserts/sec that counter becomes a traffic jam, and worse — the moment you want to **shard** (split the table across many DBs), two shards would both hand out "id = 1000." **Snowflake / UUIDv7** IDs are generated by the app itself (no central counter), are still roughly time-ordered, and never collide across shards.
 
-#### Q: Why store the rendered `title`/`body` on the row if we have templates?
+### Why store the rendered `title`/`body` on the row if we have templates
 
 Templates change. If a support agent asks *"what exact text did we send user 123 last March?"*, re-rendering today's template might give **different** words (the template was edited since). Snapshotting the final text on the `notifications` row freezes history: you keep exactly what was sent, not just a pointer to a template that may have changed since. Compliance and debugging both depend on this.
 
-#### Q: Why the `UNIQUE (notification_id, channel)` on attempts?
+### Why the `UNIQUE (notification_id, channel)` on attempts
 
-So there is **exactly one attempt row per channel** per notification, which you *update* on each retry — instead of inserting a new row every try and drowning in duplicates. "Push to notification 5" is one row whose `attempt_count` ticks up; it's not five rows.
+This guarantees **exactly one attempt row per channel** per notification, which you *update* on each retry — instead of inserting a new row every try and drowning in duplicates. "Push to notification 5" is one row whose `attempt_count` ticks up; it's not five rows.
 
 ---
 
@@ -915,13 +932,13 @@ public void deliverInApp(QueueMsg msg) {
 }
 ```
 
-#### Q: If in-app is just a DB row, what's the WebSocket part for?
+### If in-app is just a DB row, what the WebSocket part is for
 
 Pure in-app works even with no live connection — the app sees the new row *next time it opens or polls*. The WebSocket ([§18](#18-real-time-notifications-websocket--sse)) is an optional live nudge so the bell icon updates the *instant* the row is written, without the user reopening the app. Delivery = the DB row; the WebSocket is just freshness.
 
-#### Q: Why not `SELECT COUNT(*) WHERE is_read = false` for the badge?
+### Why not `SELECT COUNT(*) WHERE is_read = false` for the badge
 
-Because the bell is checked on **every app open** by **every user** — that's a firehose of counting queries over a growing table. Instead keep a tiny Redis counter per user (`unread:123 = 7`): `INCR` when a row is added, `DECR` on read, `SET 0` on "mark all read." An O(n) scan becomes an O(1) lookup. Full pattern in [§26](#26-read-models-counters--digests).
+The bell is checked on **every app open** by **every user** — that's a firehose of counting queries over a growing table. Instead keep a tiny Redis counter per user (`unread:123 = 7`): `INCR` when a row is added, `DECR` on read, `SET 0` on "mark all read." An O(n) scan becomes an O(1) lookup. Full pattern in [§26](#26-read-models-counters--digests).
 
 ---
 
@@ -980,13 +997,13 @@ public void deliverPush(QueueMsg msg) {
 }
 ```
 
-#### Q: Why do tokens "expire," and why deactivate instead of delete?
+### Why tokens "expire," and why deactivate instead of delete
 
 The OS reissues tokens periodically (app reinstall, OS update, restore-from-backup). When you push to an old token, FCM replies `Unregistered`/`InvalidRegistration`. You mark that row `is_active = false` so you stop wasting calls on a dead box. Soft-deactivating (vs hard delete) keeps a paper trail for debugging *"why did this user stop getting pushes?"* — the row is still there, just flagged inactive.
 
-#### Q: FCM vs APNS — do I need to care which?
+### FCM vs APNS — do you need to care which
 
-Slightly. Android → **FCM** (Google), iOS → **APNS** (Apple), Web → FCM Web Push. The push worker just needs to route each token to the right provider based on the device's `platform` column. A good design hides this behind one interface so the rest of the code says `push.send(token, msg)` and the adapter picks FCM vs APNS underneath (the **Ports & Adapters** pattern — see [§30](#30-design-patterns-that-can-be-used)).
+Slightly. Android → **FCM** (Google), iOS → **APNS** (Apple), Web → FCM Web Push. The push worker just needs to route each token to the right provider based on the device's `platform` column. A good design hides this behind one interface so the rest of the code says `push.send(token, msg)` and the adapter picks FCM vs APNS underneath (the **Ports & Adapters** pattern — see [§31](#31-design-patterns-that-can-be-used)).
 
 ---
 
@@ -1056,11 +1073,11 @@ void goodFanOut(Campaign c) {
 }
 ```
 
-#### Q: Why put campaigns on the `-low` priority topic?
+### Why put campaigns on the `-low` priority topic
 
-So a 10M-user marketing blast can't clog the pipe that carries **OTPs and payment alerts**. A promo landing 3 minutes late is fine; an OTP landing 3 minutes late is useless. Separate topics + separate worker pools mean the campaign flood drains on its own lane while critical notifications sail past ([§16](#16-priority-queues), [§21](#21-kafka-lag)).
+This way a 10M-user marketing blast can't clog the pipe that carries **OTPs and payment alerts**. A promo landing 3 minutes late is fine; an OTP landing 3 minutes late is useless. Separate topics + separate worker pools mean the campaign flood drains on its own lane while critical notifications sail past ([§16](#16-priority-queues), [§21](#21-kafka-lag)).
 
-#### Q: Is this the "celebrity / hot key" problem too?
+### Is this the "celebrity / hot key" problem too?
 
 Related but different. Campaign fan-out is *known and plannable* (you decide to blast 1M users, so you pace it). The celebrity problem is when **one entity** (a superstar's post) triggers fan-out to millions of *followers* unpredictably — same "spread the work + rate limit" toolkit, just triggered by user behavior instead of a scheduled campaign. See the linked [Fan-Out / Fan-In](../concepts/fan-out-fan-in.md) note.
 
@@ -1117,6 +1134,36 @@ SendGrid fails → try AWS SES
 
 Log which provider succeeded in `notification_attempts`.
 
+### Provider rate limits & backoff ceilings
+
+Each provider caps how fast you may call it. Exceed it and you get `429 / throttled` — so worker concurrency and backoff must respect these, not just retry blindly:
+
+| Provider (channel) | Rough throughput cap | On hit (`429`/quota) |
+| --- | --- | --- |
+| **FCM / APNS** (push) | Very high (100k+/sec with batch sends) | Honor `Retry-After`; exponential backoff; batch device tokens per call |
+| **Twilio** (SMS) | Low per sender — ~1 msg/sec on a long code; higher on short code / A2P 10DLC | Backoff + queue; scale by adding sender numbers, not just workers |
+| **SES / SendGrid** (email) | Per-account send rate + daily quota (ramps up over time) | Throttle producers to the account rate; `454` throttling → backoff |
+
+> ⚠️ The backoff ceiling isn't just politeness — a genuinely down provider should stop being hammered. Cap retries at the DLQ threshold (§12) and let the **circuit breaker** (§31) open so healthy channels aren't starved of workers.
+
+**Regulatory ceilings (promotional vs transactional):** law caps sends independently of provider limits.
+
+- **Promotional** SMS/email must honor **one-click unsubscribe** (CAN-SPAM / CASL / GDPR) and prior opt-in; India's **TRAI DND** blocks promo SMS to registered numbers and bans marketing outside ~9 AM–9 PM.
+- **Transactional** (OTP, receipts, security alerts) are **exempt** from unsubscribe/DND — they may send anytime. This is exactly why `type` maps to preferences (§14) and why the two paths never share a rate-limit bucket. (Full compliance in §25.)
+
+### Inbound provider webhooks (delivery receipts & bounces)
+
+Handing a message to a provider (`SENT`) is **not** proof the user got it. Providers call *back* with the real outcome — wire these inbound webhooks to close the loop:
+
+| Provider signal | Meaning | Action |
+| --- | --- | --- |
+| **Delivery receipt** (Twilio status callback, FCM/APNS) | Reached the device/handset | `SENT → DELIVERED` on the attempt |
+| **Hard bounce** (SES/SendGrid) | Email address invalid | Mark address bad; **suppress** future sends to it |
+| **Complaint / spam report** | User flagged as spam | Flip the promo preference off; stop sending |
+| **Invalid token** (FCM `Unregistered`) | App uninstalled / token dead | `is_active = false` on the device (§10) |
+
+> These callbacks are **at-least-once too** — dedup them (provider event id) and treat the webhook handler like any other idempotent consumer.
+
 ### Why wait longer each time (backoff)?
 
 When a delivery fails, you retry — but **not instantly, and not at a fixed rhythm**. You wait a little, then more, then a lot: 1 min, 5 min, 30 min. This is **exponential backoff**.
@@ -1143,15 +1190,15 @@ void handleFailure(Notification n, Channel ch, int attempt) {
 }
 ```
 
-#### Q: What is "jitter" and why does fixed backoff cause a "thundering herd"?
+### What "jitter" is, and why fixed backoff causes a "thundering herd"
 
 If a provider goes down, thousands of messages fail at once. With a *fixed* 1-minute retry, all of them retry at **exactly** the same second the minute later — a synchronized stampede that knocks the just-recovering provider straight back down. **Jitter** = adding a random wobble to each delay so retries **spread out** over time instead of firing in one spike.
 
-#### Q: What is a Dead Letter Queue (DLQ), really?
+### What a Dead Letter Queue (DLQ) really is
 
 It's a separate queue for messages that couldn't be delivered. After N failed attempts, you stop retrying and park the message there, where a human (or an alert) can look: *bad payload? provider permanently rejecting? bug?* You do **not** retry forever — an OTP from 30 minutes ago is worthless, so old messages should die, not loop. DLQ = "we couldn't deliver this; someone please look," not "we'll keep trying to infinity."
 
-#### Q: What's provider fallback vs retry?
+### Provider fallback vs retry
 
 - **Retry** = try the **same** provider again later (maybe it was a blip).
 - **Fallback** = try a **different** provider (Twilio down → send via AWS SNS). 
@@ -1170,6 +1217,8 @@ Use fallback when one vendor is having a bad day but the message still matters *
 | --- | --- | --- |
 | **Stage 1: Create notification** | Insert one row per business event | `notification_key` + `UNIQUE` constraint |
 | **Stage 2: Deliver notification** | Worker sends via FCM/email/SMS; may retry | `notification_id` + `notification_attempts` |
+
+> ⚠️ These are **two different guards** — don't collapse them. The `UNIQUE` index does **not** stop double-*sending* (retries reuse the same row), and the attempt-status check does **not** stop duplicate *rows* (that's the unique key's job). You need **both**.
 
 ```
 Unique index  =  create once
@@ -1291,11 +1340,11 @@ Two *different* duplicate problems exist, and each needs its own guard:
 
 Put simply: stage 1 prevents **duplicate notification records** for one event; stage 2 prevents **double-sending** even while retrying the one record. The unique index guards **creation**; it does **not** block delivery retries — those happen on the existing row.
 
-#### Q: Why does the queue message carry only `{notificationId, channel}` and not the full text?
+### Why the queue message carries only `{notificationId, channel}` and not the full text
 
 Three reasons: (1) **small messages** = faster queue, cheaper storage; (2) the worker re-reads the **current** DB row, so if something was corrected, it sends the fixed version; (3) it keeps the body (which may contain PII) out of the queue. The worker "hydrates" the full notification from the DB just before sending.
 
-#### Q: Isn't "at-least-once + dedup" just a clumsy "exactly-once"?
+### Isn't "at-least-once + dedup" just a clumsy "exactly-once"?
 
 Practically, yes — and it's the sane choice. True exactly-once across a queue + DB + third-party provider is very hard and usually overkill. "At-least-once delivery + idempotent handling" gives you the same *observable* result (user sees it once) with far less complexity. That's why re-enqueuing a stuck row ([§23](#23-failure-scenarios--mitigations)) is safe: worst case the worker sees `SENT` and skips.
 
@@ -1367,11 +1416,11 @@ boolean shouldSend(long userId, String type, Channel ch, Instant now) {
 }
 ```
 
-#### Q: Why use a Redis counter instead of counting rows in the DB?
+### Why use a Redis counter instead of counting rows in the DB
 
-Because this check runs **before every single send** at peak thousands/sec. Counting `notifications` rows each time would hammer the DB. Redis `INCR` is a single in-memory atomic operation (O(1)), and the key auto-expires at end of day so you don't accumulate junk. It's a scoreboard, not a ledger.
+This check runs **before every single send** at peak thousands/sec. Counting `notifications` rows each time would hammer the DB. Redis `INCR` is a single in-memory atomic operation (O(1)), and the key auto-expires at end of day so you don't accumulate junk. It's a scoreboard, not a ledger.
 
-#### Q: Do OTPs and receipts respect these limits?
+### Do OTPs and receipts respect these limits?
 
 **No** — and this is critical. **Transactional** messages (OTP, payment failed, password reset) *bypass* marketing rate limits and quiet hours, because the user needs them regardless of the hour or the daily cap. Only **promotional** messages are gated. This is exactly why the `type → preference` mapping exists: it lets the system treat "your OTP" and "50% off shoes!" completely differently. (Legal note in [§25](#25-security-pii--compliance).)
 
@@ -1495,21 +1544,9 @@ CREATE UNIQUE INDEX uniq_active_template
 
 Publishing a new version becomes a small transaction: flip the old row to `is_active = false`, insert the new row with `is_active = true`.
 
-### A template is a message with blanks to fill in
+### Turning a template + data into the final text
 
-A **template** is a message with **blanks** to fill in:
-
-```
-Hi {{name}}, your order {{orderId}} has been confirmed for ₹{{amount}}.
-```
-
-At send time you supply the data `{ name: "Hardik", orderId: 789, amount: 1500 }`, and rendering fills the blanks:
-
-```
-Hi Hardik, your order 789 has been confirmed for ₹1500.
-```
-
-The whole point: **never hardcode message text in code.** If the marketing team wants to reword "Order confirmed!" to "Woohoo, your order's in!", that should be a data change (a new template row), not a code deploy.
+Rendering, mechanically, is just find-and-replace on the `{{placeholders}}` shown at the top of this section. The whole point: **never hardcode message text in code.** If the marketing team wants to reword "Order confirmed!" to "Woohoo, your order's in!", that should be a data change (a new template row), not a code deploy.
 
 ```java
 String render(String template, Map<String, Object> data) {
@@ -1526,15 +1563,17 @@ Template pick(String type, Channel ch, String lang) {
 }
 ```
 
-#### Q: Why version templates instead of just editing the text?
+> ⚠️ **Never send a blank or failed-render body.** If the template is missing, or `data` leaves a placeholder unfilled (user sees literal `Hi {{name}}` or an empty push), **fail fast** — don't deliver garbage. Validate that all placeholders resolved and the body is non-empty *before* enqueue; on failure, mark the notification `FAILED`, alert, and DLQ it (§23) rather than pushing an empty/broken message the user can't un-see.
 
-Because old notifications must still show what they *actually said*. If you overwrite v1's text and a customer disputes *"you told me ₹1500!"*, you've lost the evidence. So: **new copy = new version row**; the old one stays with `is_active = false` for audit.
+### Why version templates instead of just editing the text
 
-#### Q: What does "exactly one active template" prevent?
+Old notifications must still show what they *actually said*. If you overwrite v1's text and a customer disputes *"you told me ₹1500!"*, you've lost the evidence. So: **new copy = new version row**; the old one stays with `is_active = false` for audit.
+
+### What "exactly one active template" prevents
 
 If two rows for `(ORDER_CONFIRMED, PUSH, en)` were both `is_active = true`, the render step wouldn't know which wording to use — a coin flip. The partial unique index makes that state **impossible** in the database. Publishing a new version is then a tiny transaction: flip old → inactive, insert new → active. No ambiguous "which one is live?" moment.
 
-#### Q: `type` vs `template_id` — what's the difference?
+### `type` vs `template_id` — the difference
 
 - `type` (`ORDER_CONFIRMED`) = **why** the notification is sent. Stable forever — it's the business event.
 - `template_id` = **which exact wording row** produced the text. Changes every time copy changes.
@@ -1582,11 +1621,11 @@ public void deliverCritical(QueueMsg m) { /* OTPs, payment alerts */ }
 public void deliverMarketing(QueueMsg m) { /* deprioritized under load */ }
 ```
 
-#### Q: Why not just one queue with a "priority" field and sort it?
+### Why not just one queue with a "priority" field and sort it
 
-Because a single queue (especially Kafka) is basically **first-in-first-out per partition** — it doesn't re-sort by importance. If 10M low-priority messages went in *before* your OTP, the OTP waits behind all of them. Physically separate topics + separate worker pools are how you guarantee the fast lane is actually fast. The priority field in the API request is what *routes* the message to the right topic.
+A single queue (especially Kafka) is basically **first-in-first-out per partition** — it doesn't re-sort by importance. If 10M low-priority messages went in *before* your OTP, the OTP waits behind all of them. Physically separate topics + separate worker pools are how you guarantee the fast lane is actually fast. The priority field in the API request is what *routes* the message to the right topic.
 
-#### Q: Can low-priority ever be dropped?
+### Can low-priority ever be dropped?
 
 Yes — **with product approval**. Under severe overload, delaying or even dropping "recommended for you" pings is acceptable; dropping OTPs never is. Making priority explicit is what lets you make that trade-off safely instead of dropping messages at random.
 
@@ -1635,18 +1674,18 @@ public void dispatchDue() {
 }
 ```
 
-#### Q: Why a `DISPATCHED` status? Isn't that extra bookkeeping?
+### Why a `DISPATCHED` status — isn't that extra bookkeeping?
 
 It stops **double-sending**. The poller runs every minute; without marking rows `DISPATCHED`, the same due row would be picked up again next minute and the user gets the reminder twice. Flipping to `DISPATCHED` is the "I've handled this one" checkmark — the same idea as idempotency, applied to time.
 
-#### Q: DB polling vs a "delayed queue" — which is better?
+### DB polling vs a "delayed queue" — which is better
 
 - **Cron + DB poll** (query due rows every minute) — dead simple, great for modest scale; the cost is a repeated query on a big table.
 - **Delayed queue / scheduler** (Kafka delayed messages, Temporal, Quartz) — you hand the message a "deliver after X" and the infra holds it; more precise and less DB load, but more moving parts.
 
 Rule of thumb: start with the poll (with an index on `(scheduled_at) WHERE status='PENDING'`); graduate to a dedicated scheduler when the poll gets heavy or you need second-level precision.
 
-#### Q: What happens if the user cancels (movie booking cancelled)?
+### What happens if the user cancels (movie booking cancelled)
 
 Flip `scheduled_notifications.status = CANCELLED`. When the poller runs, that row no longer matches "PENDING and due," so it's silently skipped — no reminder for an event that isn't happening. Because the reminder was *written down* rather than already sent, cancelling is trivial.
 
@@ -1700,11 +1739,11 @@ void onInAppCreated(long userId, Notification n) {
 }
 ```
 
-#### Q: Why is the WebSocket service "stateful" and why does that matter?
+### Why the WebSocket service is "stateful," and why that matters
 
-Because it *holds live connections in memory* — user 123's socket physically lives on one machine. That's different from stateless API servers where any server can handle any request. Consequences: you need **sticky sessions** (route a user back to the same server) or a **shared Redis phonebook** to find them, and you scale by **user affinity** (spread users across servers), not by a plain load balancer. A restart of that server drops those sockets (clients reconnect).
+It *holds live connections in memory* — user 123's socket physically lives on one machine. That's different from stateless API servers where any server can handle any request. Consequences: you need **sticky sessions** (route a user back to the same server) or a **shared Redis phonebook** to find them, and you scale by **user affinity** (spread users across servers), not by a plain load balancer. A restart of that server drops those sockets (clients reconnect).
 
-#### Q: WebSocket vs push — when do I use which?
+### WebSocket vs push — when to use which
 
 - **App open / foreground** → WebSocket or SSE for instant, in-app freshness (the bell updates live).
 - **App closed / background** → **push** (FCM/APNS), because there's no open line to the app; only the OS can wake it.
@@ -1769,17 +1808,23 @@ int maxParallelWorkers = topic.partitionCount();   // 100 partitions → at most
 // adding a 101st worker to a 100-partition topic → it just sits idle
 ```
 
+> ⚠️ **Partition count is a hard ceiling on parallelism, and painful to change later** — reducing partitions is effectively impossible, and increasing them re-shuffles which `user_id` lands where (breaking per-user ordering for in-flight keys). **Size partitions for peak up front**, not for today's load.
+
 #### Q: Why can't I just add unlimited workers to go faster?
 
 Because **a Kafka partition is read by only one consumer in a group at a time.** If a topic has 100 partitions, the 101st worker has no partition to own — it idles. So the *ceiling* on parallelism is the partition count. Plan partitions ahead (they're painful to reduce later). This is the single most common "why isn't adding workers helping?" gotcha ([§21](#21-kafka-lag)).
 
-#### Q: Why cache preferences and templates instead of hitting the DB?
+### Why cache preferences and templates instead of hitting the DB
 
-Because they're read **constantly** but change **rarely**. Every notification needs "what are user 123's prefs?" and "what's the ORDER_CONFIRMED template?" — reading those from the DB millions of times/day is wasteful. Cache them in Redis (prefs with a short TTL + invalidate on update; templates practically forever).
+They're read **constantly** but change **rarely**. Every notification needs "what are user 123's prefs?" and "what's the ORDER_CONFIRMED template?" — reading those from the DB millions of times/day is wasteful. Cache them in Redis (prefs with a short TTL + invalidate on update; templates practically forever).
 
-#### Q: Stateless vs stateful — why does it matter for scaling?
+### Stateless vs stateful — why it matters for scaling
 
 **Stateless** things (the API) hold no per-user memory, so you can clone them freely and any copy serves any request — trivial to scale. **Stateful** things (the WebSocket service, [§18](#18-real-time-notifications-websocket--sse)) remember something per user (a live connection), so you must route each user consistently. The rule: **push state out to shared stores (DB/Redis/Kafka) so your compute stays stateless and cloneable.**
+
+### Multi-region (deferred — but know the shape)
+
+Multi-region active-active is out of scope ([§2](#2-requirements)), but mention the shape so it's clearly a *deferral*, not a blind spot: you'd run a **full pipeline per region** (regional Kafka + workers + DB), route each event to the user's **home region** (for latency and data-residency laws like GDPR), and **replicate the read-mostly data** (preferences, templates) across regions while keeping the write-heavy `notifications`/`attempts` regional. In-app read models (unread counters) stay regional. The genuinely hard parts — cross-region preference/token consistency and clean failover without double-sending — are why it's deferred: the dedup guarantee ([§13](#13-idempotency--deduplication)) must still hold across regions, which usually means pinning a user (and their `notification_key` space) to one region at a time.
 
 ---
 
@@ -1860,11 +1905,11 @@ Same service (Notification Service), different processes:
   ↑ all share the SAME notification_db (one ownership domain)
 ```
 
-#### Q: "EC2 boundary ≠ service boundary" — what does that mean?
+### "EC2 boundary ≠ service boundary" — what this means
 
 Running on **different machines** does *not* make them different services. The push worker on EC2-B and the API on EC2-A are both the **Notification Service** — they share one DB and one ownership domain. A "service" is about *who owns the data and logic*, not *how many boxes it runs on*. So the push worker updating `notification_db` is completely correct; it's the same service touching its own data.
 
-#### Q: Can a worker write to another service's database?
+### Can a worker write to another service's database?
 
 **No.** The push worker must never `UPDATE order_db` directly — that violates microservice boundaries and creates hidden coupling (change Order's schema, break Notifications). If the Order Service wants delivery status, it should **ask** (call Notification's API) or **listen** (consume a `NOTIFICATION_DELIVERY_FAILED` event) — never reach into the other's tables.
 
@@ -1879,7 +1924,7 @@ notificationWorker.update(orderDb, ...);          // Notification touching Order
 orderService.onEvent(NotificationDeliveryFailed e) { ... }
 ```
 
-#### Q: Same codebase or separate deployments — which is right?
+### Same codebase or separate deployments — which is right
 
 A spectrum: (1) API + worker in **one process** (prototypes only — API load starves workers); (2) **same codebase, separate processes** (`api.js` vs `worker.js`) — most startups, shared repo but independent scaling; (3) **separate deployments** per channel — best isolation, most ops. Pick based on scale; the key property to preserve is that workers can **scale and fail independently** of the API.
 
@@ -1952,24 +1997,13 @@ long lag = latestOffset - consumerOffset;   // 100,000 - 95,000 = 5,000 waiting
 //   5,000 lag sitting for 30 min  = an OTP disaster
 ```
 
-#### Q: Is lag always bad?
-
-No — context decides:
-
-| Situation | Verdict |
-| --- | --- |
-| Brief spike, clears in a couple minutes | Fine — that's what the queue is *for* (absorbing bursts) |
-| Lag that keeps growing and never catches up | Bad — you're under-provisioned; add capacity |
-| Any lag on the **OTP** topic | Never acceptable |
-| Lag on the **marketing** topic | Usually tolerable |
-
-This is exactly why OTPs and marketing get **separate topics** ([§16](#16-priority-queues)) — a campaign flood can lag on its own lane without delaying a login code.
+The "Is lag always bad?" table above is exactly why OTPs and marketing get **separate topics** ([§16](#16-priority-queues)) — a campaign flood can lag on its own lane without delaying a login code.
 
 #### Q: What's a "poison message" and why can it block everything?
 
 A **poison message** is one that always fails (malformed payload, a bug in handling it). If the worker keeps retrying it forever, it can jam the partition — everyone behind it waits on a message that will *never* succeed. Fix: after N failures, shove it to the **DLQ** and move on. Don't let one bad apple stall the whole line.
 
-#### Q: I added workers but lag didn't drop — why?
+### Added workers but lag didn't drop — why
 
 Almost always: **you hit the partition ceiling** (workers > partitions → extras idle, [§19](#19-scaling-the-system)), or the **bottleneck is downstream** (slow provider, slow DB writes) so more workers just pile up waiting on the same slow thing. The fix then isn't more workers — it's more partitions, or speeding up the slow step (batch DB writes, faster provider path).
 
@@ -2066,7 +2100,7 @@ The main levers, in plain terms:
 
 Because throughput is limited by the **slowest** shared resource. More workers fix the *queue* but can drown the *DB* — and an overloaded DB fails *everything* (writes, reads, retries) at once. The healthy target is **worker count ≤ what the DB can sustain**; let Kafka absorb the surge instead of forcing it through the database.
 
-#### Q: What's "write amplification" here?
+### What "write amplification" means here
 
 One logical notification can trigger *several* DB writes: insert `notifications`, insert an `attempts` row per channel, update status on success/failure, plus retry bookkeeping. Three channels → easily 5+ writes per notification. At 1M/min that's millions of writes/min. "Reduce write amplification" = cut needless steps (e.g. skip a `PROCESSING` status you don't actually use; `PENDING → SENT` is enough).
 
@@ -2087,35 +2121,14 @@ One logical notification can trigger *several* DB writes: insert `notifications`
 
 ### Event publishing reliability (the dual-write problem)
 
-Two boundaries in this system are both dual-writes — a DB write and a Kafka publish that are **not atomic**:
+Two boundaries in this system are both **dual-writes**: two things must both happen, but they live in **two systems** with no shared "all-or-nothing" switch, so a DB write and a Kafka publish are **not atomic**:
 
 | Boundary | Failure if naïve | Fix |
 | --- | --- | --- |
 | **Source → Notification** (Order emits event) | Order committed but event lost → user never notified | **Transactional Outbox** in source: write order + outbox row in one TX; a relay publishes outbox → Kafka |
 | **Notification API → Kafka** (insert row, then enqueue) | Row inserted, process crashes before enqueue → stuck in `PENDING`, never delivered | **Outbox** in notification DB *or* a **reconciliation sweeper** (below) |
 
-**Reconciliation sweeper** (safety net for stuck rows):
-
-```sql
--- Runs every 1–5 min; re-enqueues rows that were persisted but never delivered
-SELECT notification_id, ... FROM notifications
-WHERE status = 'PENDING' AND created_at < now() - interval '5 minutes'
-LIMIT 1000;
--- → re-publish to Kafka (idempotent: worker skips if attempt already SENT)
-```
-
-Because the whole pipeline is **at-least-once + idempotent**, re-enqueuing a row that *was* actually delivered is harmless — the worker sees `attempt.status = SENT` and skips.
-
-> See: [Outbox & Saga](../concepts/outbox-and-saga.md).
-
-### The "dual-write" problem
-
-The nastiest failure here is the **dual-write**: two things must both happen, but they live in **two systems** with no shared "all-or-nothing" switch:
-
-1. Insert the `notifications` row (in the database), **and**
-2. Publish the message to Kafka.
-
-If the process dies **between** step 1 and step 2, you've got a row that says `PENDING` but no queue message — a notification that will **never** be delivered, silently. The DB commit succeeded but the publish didn't, so the two systems disagree.
+The second boundary is the nastiest in practice — if the process dies **between** the insert and the publish, the row says `PENDING` but no queue message ever went out, so the notification is silently lost:
 
 ```java
 // The trap — two systems, one crash gap:
@@ -2127,23 +2140,23 @@ queue.publish(topic, msg);          // ❌ never runs
 Two standard fixes:
 
 - **Transactional Outbox** — write the notification row **and** an "outbox" row in the **same DB transaction** (so they're atomic). A separate relay process reads the outbox and publishes to Kafka, marking rows done. Now the DB commit *guarantees* the intent to publish survives a crash.
-- **Reconciliation sweeper** — a safety-net job that periodically finds rows stuck at `PENDING` for more than a few minutes and re-enqueues them.
+- **Reconciliation sweeper** — a safety-net job that periodically finds rows stuck at `PENDING` for more than a few minutes and re-enqueues them:
 
-```java
-// Sweeper — the safety net (runs every few minutes)
-@Scheduled(fixedRate = 300_000)
-public void sweepStuck() {
-    var stuck = repo.find("status='PENDING' AND created_at < now() - interval '5 minutes'");
-    for (var n : stuck) queue.publish(topicFor(n), new QueueMsg(n.id(), n.channel()));
-    // safe to re-enqueue even if it WAS delivered: the worker sees attempt=SENT and skips
-}
+```sql
+-- Runs every 1–5 min; re-enqueues rows that were persisted but never delivered
+SELECT notification_id, ... FROM notifications
+WHERE status = 'PENDING' AND created_at < now() - interval '5 minutes'
+LIMIT 1000;
+-- → re-publish to Kafka (idempotent: worker skips if attempt already SENT)
 ```
 
-#### Q: Why is re-enqueuing a maybe-already-sent notification safe?
+> See: [Outbox & Saga](../concepts/outbox-and-saga.md).
 
-Because the whole pipeline is **at-least-once + idempotent** ([§13](#13-idempotency--deduplication)). If the sweeper re-sends a row that actually *did* go out, the worker checks `attempt.status == SENT` for that `(notification_id, channel)` and skips it. Worst case = a redundant no-op, never a duplicate to the user. That safety is exactly what *lets* us use a blunt "just re-enqueue stuck rows" sweeper.
+### Why re-enqueuing a maybe-already-sent notification is safe
 
-#### Q: Outbox vs sweeper — do I need both?
+The whole pipeline is **at-least-once + idempotent** ([§13](#13-idempotency--deduplication)). If the sweeper re-sends a row that actually *did* go out, the worker checks `attempt.status == SENT` for that `(notification_id, channel)` and skips it. Worst case = a redundant no-op, never a duplicate to the user. That safety is exactly what *lets* us use a blunt "just re-enqueue stuck rows" sweeper.
+
+### Outbox vs sweeper — do you need both
 
 The **outbox** *prevents* lost publishes (correct-by-construction, but more plumbing). The **sweeper** *recovers* from them after the fact (simpler, but there's a delay before it catches the stuck row). Many systems start with the sweeper for its simplicity and add an outbox at the source (Order → Notification boundary) where losing the event entirely would be worst.
 
@@ -2187,13 +2200,13 @@ try {
 }
 ```
 
-#### Q: Why alert on "oldest message age," not just lag count?
+### Why alert on "oldest message age," not just lag count
 
-Because a big number isn't always an emergency, but *staleness* usually is. 10,000 lag that clears in 30 seconds is fine; 10,000 lag where the front message has waited 30 minutes means OTPs are rotting. Age captures "how late is the *worst* affected user," which maps directly to user pain. (Same idea as [§21](#21-kafka-lag).)
+A big number isn't always an emergency, but *staleness* usually is. 10,000 lag that clears in 30 seconds is fine; 10,000 lag where the front message has waited 30 minutes means OTPs are rotting. Age captures "how late is the *worst* affected user," which maps directly to user pain. (Same idea as [§21](#21-kafka-lag).)
 
-#### Q: Why per-channel dashboards instead of one big one?
+### Why per-channel dashboards instead of one big one
 
-Because failures look totally different per channel: SMS failing spikes *cost* and hits provider rate limits; push failing often means *dead tokens*; email failing might be a *bounce/spam* issue. One blended "success rate" hides which channel is actually on fire. Splitting by channel (and provider) makes the root cause obvious.
+Failures look totally different per channel: SMS failing spikes *cost* and hits provider rate limits; push failing often means *dead tokens*; email failing might be a *bounce/spam* issue. One blended "success rate" hides which channel is actually on fire. Splitting by channel (and provider) makes the root cause obvious.
 
 ---
 
@@ -2251,13 +2264,13 @@ boolean allowed(User u, Notification n) {
 
 Because they're **legally different categories**. **Transactional** messages (OTP, receipts, security alerts) are things the user *needs* to complete an action they started — laws like CAN-SPAM/GDPR let those through even if the user unsubscribed from marketing. **Promotional** messages must honor opt-outs, one-click unsubscribe, and quiet hours. This legal split is the deep reason the whole system tracks `type` and maps it to preferences.
 
-#### Q: What does "right to be forgotten" mean for our tables?
+### What "right to be forgotten" means for our tables
 
 Under GDPR a user can demand you erase their data. That means purging/anonymizing their PII across `notifications`, `in_app_notifications`, and `user_devices`. This is *far* easier if data is **time-partitioned** (drop old partitions wholesale) and PII is isolated in specific columns you can null out — another reason partitioning ([§22](#22-db-bottlenecks--mitigations)) pays off. "Delete my data" becomes a targeted purge job, not a frantic table scan.
 
-#### Q: Why "never log the body" if it makes debugging harder?
+### Why "never log the body" if it makes debugging harder
 
-Because logs get shipped to many places (log aggregators, dashboards, backups) and are read by many people — a message body in a log is PII leaking far and wide. Log the **`notification_id`** instead; if someone needs the actual text, they look it up in the (access-controlled, encrypted) DB. Debuggability without a data breach.
+Logs get shipped to many places (log aggregators, dashboards, backups) and are read by many people — a message body in a log is PII leaking far and wide. Log the **`notification_id`** instead; if someone needs the actual text, they look it up in the (access-controlled, encrypted) DB. Debuggability without a data breach.
 
 ---
 
@@ -2323,11 +2336,11 @@ public void flushDigests() {
 }
 ```
 
-#### Q: If Redis is just a counter, what's the source of truth?
+### If Redis is just a counter, what's the source of truth
 
 The **database** is always the source of truth (the actual `in_app_notifications` rows). Redis is a fast *derived* number — a "read model." If Redis is wiped or drifts, you **rebuild** it by counting the DB once and re-caching. Never treat the counter as authoritative; treat it as a cache you can always regenerate.
 
-#### Q: Doesn't batching make notifications late?
+### Doesn't batching make notifications late?
 
 Yes — deliberately. That's the trade-off: batching **reduces spam and cost** but **adds latency**. So you only apply it to **low-priority, high-frequency** types (social pings, activity feeds). Anything urgent — OTP, payment, delivery-arriving — **bypasses** batching and sends immediately. You never make a login code wait for the 15-minute digest flush.
 
@@ -2476,7 +2489,26 @@ Use this **30-minute framework**:
 
 ---
 
-## 30. Design Patterns (that can be used)
+## 30. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Notifications aren't one answer — each path picks differently.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Create notification (master row + dedup)** | **CP** (strong consistency) | The `UNIQUE(notification_key)` insert must be strongly consistent — a duplicate event has to be *rejected*, so we favor consistency (fail/err the write) over availability on that one row. Dedup is worthless if two replicas both accept the "first" insert. |
+| **Delivery status / attempts / read state** | **Eventual** | `SENT → DELIVERED`, retries, and provider webhooks converge over time. A row briefly showing `RETRYING` while a receipt is in flight is fine. |
+| **OTP / transactional path** | **Consistency + priority > availability of promo workers** | A login code must go out **correctly and fast** even if the promo pipeline is degraded. We keep the critical lane isolated (its own topics/workers, §16) and would rather shed *marketing* availability than delay an OTP. |
+| **In-app feed / unread badge** | **AP** (eventual) | The Redis counter (§26) can lag or be rebuilt from the DB — a stale badge for a few seconds is acceptable. |
+| **Preferences / templates (cached)** | **Eventual** (read-mostly) | Served from Redis with a TTL (§19); a preference or template change may take seconds to propagate. Correctness at *send time* still comes from the DB row. |
+
+- The system is **eventually consistent across services** (outbox/queue, §23), but **strongly consistent at the dedup row** — the one place a duplicate must be impossible.
+- When forced to choose under partition, the rule is **priority-aware**: keep the transactional lane alive; let promotional availability degrade first.
+
+> One-liner: **"Strong consistency on the dedup write, eventual everywhere else — and when something has to give, drop promo availability before transactional."**
+
+---
+
+## 31. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -2495,7 +2527,7 @@ Use this **30-minute framework**:
 
 ---
 
-## 31. Final Takeaways
+## 32. Final Takeaways
 
 - **Async queue-based architecture** — API enqueues, workers deliver; never block source systems.
 - **Two stages** — unique index = **create once** (`notifications`); retries = **send many times** (`notification_attempts` on same `notification_id`).

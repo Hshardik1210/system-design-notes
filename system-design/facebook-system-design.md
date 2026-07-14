@@ -21,10 +21,12 @@
 - [11. API Design](#11-api-design)
 - [12. Sequences](#12-sequences)
 - [13. Consistency & Edge Cases](#13-consistency--edge-cases)
-- [14. Design Patterns (that can be used)](#14-design-patterns-that-can-be-used)
-- [15. Scaling & Failure](#15-scaling--failure)
-- [16. Interview Cheat Sheet](#16-interview-cheat-sheet)
-- [17. Final Takeaways](#17-final-takeaways)
+- [14. Scaling & Failure](#14-scaling--failure)
+- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
+- [16. Consistency & CAP Tradeoffs](#16-consistency--cap-tradeoffs)
+- [17. How to Drive the Interview (framework)](#17-how-to-drive-the-interview-framework)
+- [18. Design Patterns (that can be used)](#18-design-patterns-that-can-be-used)
+- [19. Final Takeaways](#19-final-takeaways)
 
 ---
 
@@ -67,18 +69,18 @@ Facebook:  Alice ◄──friends──►  Bob              (two directions, bo
 
 Why this matters for the design: with a two-way friendship, "Alice's friends" and "the people who see Alice's posts" are (mostly) the **same set**. That symmetry lets us store and read the relationship efficiently, but it also means every friendship is really **two edges** to keep in sync (Alice→Bob *and* Bob→Alice).
 
-#### Q: Isn't a "graph" just a fancy word? Do we literally store dots and lines?
+### What a "graph" actually is: nodes and edges
 
-Pretty much, yes. A **graph** = **nodes** (the dots: users, posts, pages) + **edges** (the lines: "is friends with", "authored", "likes"). We don't draw pictures; we store it as **adjacency lists** — for each user, the list of ids they're connected to:
+A **graph** = **nodes** (the dots: users, posts, pages) + **edges** (the lines: "is friends with", "authored", "likes"). We don't draw pictures; we store it as **adjacency lists** — for each user, the list of ids they're connected to:
 
 ```
 friends[Alice] = [Bob, Carol, Dave, ...]     // Alice's ~300 friends
 friends[Bob]   = [Alice, Eve, ...]           // Bob's list (contains Alice back)
 ```
 
-#### Q: Why compare against Twitter/Instagram so much?
+### Why compare against Twitter/Instagram so much
 
-Because they share ~80% of the design (fan-out feeds, caching, the celebrity problem), so the interview is really about the **20% that's different**: Facebook's **mutual** (two-way) graph and its **heavy ML ranking** that blends friends + groups + pages. Knowing the shared parts lets you spend your breath on the distinctive parts.
+They share ~80% of the design (fan-out feeds, caching, the celebrity problem), so the interview is really about the **20% that's different**: Facebook's **mutual** (two-way) graph and its **heavy ML ranking** that blends friends + groups + pages. Knowing the shared parts lets you spend your breath on the distinctive parts.
 
 ---
 
@@ -92,6 +94,17 @@ Because they share ~80% of the design (fan-out feeds, caching, the celebrity pro
 
 **Non-functional**
 - **Read-heavy** (reads ≫ writes); low-latency feed; huge scale (billions); **eventual consistency OK** for feed/counts; **privacy is strict** (never leak a restricted post).
+
+### NFRs (targets that drive the design)
+
+| NFR | Target / Note |
+| --- | --- |
+| **Consistency** | **Eventual** for feed & counters (a post can appear a few seconds late). **Strong-ish** for friendship state (no half-friendships) and **correctness-first** for privacy (fail-closed). |
+| **Availability** | Very high for reads (feed/browse) — AP; the feed must serve even if fan-out is behind. |
+| **Latency** | Feed read low (tens of ms from cache); privacy check must stay cheap (backed by TAO). |
+| **Scale** | Billions of users, ~1 trillion edges, millions of feed reads/sec → precompute + cache. |
+| **Durability** | Posts, friendships, reactions must never be lost (feed cache is rebuildable). |
+| **Privacy** | Strict — a restricted post must **never** leak; default to deny on any doubt. |
 
 ---
 
@@ -117,13 +130,13 @@ The point of this section isn't the exact digits — it's to **prove to yourself
 
 The same operation ("deliver a post to followers") has wildly different cost depending on recipient count: fanning out to 300 friends is cheap; fanning out to 100 million followers is not.
 
-#### Q: What does "read-heavy" really mean, and why do we keep repeating it?
+### What "read-heavy" really means
 
 It means **reads ≫ writes** — people consume way more than they produce. You might scroll past 500 posts today (500 reads) but write only 1 post (1 write). When a system is read-heavy, the winning strategy is: **do the expensive work once at write time, save the result, and make reads cheap.** That single idea (precompute + cache) explains most of this doc.
 
-#### Q: A trillion edges sounds huge — is that data or just pointers?
+### A trillion edges: data size vs. read frequency
 
-Just pointers (ids). An edge is tiny — basically "user A is friends with user B", a couple of numbers. But a *trillion* tiny things is still enormous in total, and more importantly you **read** these edges constantly (every feed build needs "who are X's friends?"). It's the **read frequency**, not the storage size, that forces the TAO-style cache (§5).
+It's just pointers (ids). An edge is tiny — basically "user A is friends with user B", a couple of numbers. But a *trillion* tiny things is still enormous in total, and more importantly you **read** these edges constantly (every feed build needs "who are X's friends?"). It's the **read frequency**, not the storage size, that forces the TAO-style cache (§5).
 
 ---
 
@@ -158,7 +171,7 @@ Walking the boxes in plain terms:
 - **Comment/Reaction Service** — handles likes/comments, and counts them **asynchronously** (later, in the background) because there are billions.
 - **Notification / Media / Search** — pings, photo/video storage on a CDN, and the search index.
 
-#### Q: What is Kafka doing sitting in the middle?
+### What Kafka is doing sitting in the middle
 
 **Kafka is a shared event log.** When something happens ("Alice posted", "Bob liked"), the service that noticed it just **publishes an event to Kafka and moves on** — it does *not* wait for fan-out, ranking, indexing, and notifications to finish. Other services (workers) consume those events and do their part on their own time.
 
@@ -172,17 +185,21 @@ void createPost(Post p) {
 }
 ```
 
-**Why bother?** (1) The user's post feels instant because we don't make them wait for 300 feed-writes. (2) If the search indexer is down, posting still works — the note waits on Kafka until search recovers. (3) One event ("POST_CREATED") can trigger **many** independent reactions (fan-out, features, index, notify) without the poster knowing about any of them. This is the **Observer / Pub-Sub** pattern (see §14).
+**Why bother?** (1) The user's post feels instant because we don't make them wait for 300 feed-writes. (2) If the search indexer is down, posting still works — the note waits on Kafka until search recovers. (3) One event ("POST_CREATED") can trigger **many** independent reactions (fan-out, features, index, notify) without the poster knowing about any of them. This is the **Observer / Pub-Sub** pattern (see §18).
 
-#### Q: Why split "Graph", "Post", and "Feed" instead of one big app?
+### Why split Graph, Post, and Feed instead of one big app
 
-Because they scale and fail **independently**. The graph is read insanely often (every feed build), so it needs its own giant cache. Posts are write-then-read-many. Feeds are CPU-heavy (ranking). Separating them lets you throw hardware at exactly the bottleneck, and a bug in ranking can't take down friend requests.
+They scale and fail **independently**. The graph is read insanely often (every feed build), so it needs its own giant cache. Posts are write-then-read-many. Feeds are CPU-heavy (ranking). Separating them lets you throw hardware at exactly the bottleneck, and a bug in ranking can't take down friend requests.
 
 ---
 
 ## 5. The Social Graph (TAO)
 
 The friend graph is the foundation — **~1 trillion edges**. Facebook's real system is **TAO** (a graph-aware cache over sharded MySQL).
+
+> 💡 **Jargon:** **TAO** = "The Associations and Objects" — Facebook's read-through cache that stores the graph as **objects** (nodes) and **associations** (edges). When you hear "TAO" in an interview, just say "the graph cache in front of sharded MySQL."
+
+> 💡 **Jargon:** an **edge / association** is one directed link between two things ("Alice → friend → Bob"). A friendship is **two** edges kept in sync.
 
 | Concept | Detail |
 | --- | --- |
@@ -301,7 +318,32 @@ Why this is the entire point: friend lists are read on **every single feed build
 
 Great instinct, but at Facebook's scale a single graph DB can't hold a trillion edges or take millions of reads/sec. TAO's trick is boring on purpose: **plain sharded MySQL** for durability (battle-tested, easy to operate) **+ a huge custom cache** for speed. You give up fancy multi-hop graph traversals you don't need, and you get scale and reliability you do need.
 
-#### Q: What does "sharded by id" mean, and why co-locate a user's friends?
+### Cache invalidation, stale reads, and the negative cache
+
+A read-through cache is only as good as its **invalidation** — the rules for when a cached copy stops being trusted. Three things bite here, and each has a standard fix:
+
+1. **Invalidation on write.** When an edge changes (add/remove friend), the write path must **invalidate both users' cached lists** so the next read reloads fresh (that's the `taoCache.invalidate(...)` calls in the write-through code above). Miss this and Alice keeps seeing a friend she just removed.
+2. **Stale cache after a missed invalidation.** In a huge distributed cache, an invalidation message can be dropped or a replica can lag → a shard serves a **stale** friend list for a while. This is *acceptable* for feed building (eventual consistency), but not for privacy — which is why privacy is re-checked on read against the freshest available graph (§8), and TAO entries carry a short **TTL** as a backstop so any stale edge self-heals.
+3. **Negative caching on a miss.** A lookup for an edge that **doesn't exist** ("is Alice friends with Zoe?" → no) is common — friend-suggestion and privacy checks probe non-edges constantly. If we cached only *hits*, every such probe would fall through to MySQL forever. So TAO also caches the **absence** of an edge (a "negative" entry with a short TTL). This stops repeated misses from hammering the DB — the same defense as a Bloom filter / negative cache in front of any store.
+
+```java
+// READ-THROUGH with a NEGATIVE cache: remember "does not exist" too, so misses don't re-hit MySQL.
+boolean areFriends(long a, long b) {
+    Boolean cached = taoCache.getEdge(a, "friend", b);   // returns TRUE, FALSE, or null(=unknown)
+    if (cached != null) return cached;                   // hit — including a cached FALSE (negative)
+    boolean exists = mysql.edgeExists(a, "friend", b);   // miss → one DB probe
+    taoCache.putEdge(a, "friend", b, exists, SHORT_TTL); // cache the answer — even if it's FALSE
+    return exists;
+}
+```
+
+> ⚠️ **Pitfall:** without a negative cache, a hot non-edge (e.g. privacy checks for a public figure's post against millions of non-friends) turns into millions of DB misses — a self-inflicted DoS. Cache the "no" too.
+
+#### Q: If the cache can go stale, how can privacy ever be safe?
+
+Two different consistency needs. For **feed building**, a slightly stale friend list just means a post shows up a second late — nobody cares. For **privacy**, we lean on the fact that `canView` (§8) is evaluated on **read** against TAO, and TAO's write-through invalidation + short TTL make revocation take effect within seconds; combined with **fail-closed** defaults, the worst realistic case is a brief window, not a permanent leak. When you truly cannot tolerate any window (e.g. a hard block), invalidate synchronously on that specific edge before returning.
+
+### What "sharded by id" means, and why co-locate a user's friends
 
 **Sharding** = splitting the data across many machines so no single one holds it all. The rule here is usually `shard = hash(user_id) % numShards`. Because we shard by the **user's** id, **all of Alice's friendship edges live on the same shard**. So "who are Alice's friends?" is **one machine, one lookup** — not a scatter-gather across thousands of machines.
 
@@ -310,9 +352,9 @@ shard(Alice) → machine 7 → holds Alice's object + all of Alice's "friend" ed
 shard(Bob)   → machine 2 → holds Bob's object + all of Bob's "friend" edges
 ```
 
-#### Q: If friendship is two edges, what happens on unfriend?
+### Unfriending: deleting both edges
 
-You delete **both** edges (Alice→Bob and Bob→Alice) and invalidate both cached lists. This is also why "make/break friendship" is one of the few places we want **strong-ish consistency** — you don't want a half-friendship where Alice sees Bob as a friend but Bob doesn't see Alice.
+On unfriend, you delete **both** edges (Alice→Bob and Bob→Alice) and invalidate both cached lists. This is also why "make/break friendship" is one of the few places we want **strong-ish consistency** — you don't want a half-friendship where Alice sees Bob as a friend but Bob doesn't see Alice.
 
 ---
 
@@ -413,9 +455,9 @@ List<Long> buildFeed(long viewer) {
 
 So most posts are pre-delivered into feeds (push), but the few very high-degree accounts are not fanned out — their recent posts are pulled in at read time. The reader sees one combined feed; behind the scenes two methods were used.
 
-#### Q: Why store only post **ids** in the feed, not the whole post?
+### Why the feed stores only post ids, not the whole post
 
-Because a viral post would otherwise be **copied in full into millions of feeds** — massive duplication. Instead each feed holds lightweight **ids**, and the actual content lives once in a shared **post cache**. At read time we "**hydrate**" — swap ids for real content by one cache lookup per post. One viral post = **one** cached copy, referenced by millions of feeds.
+A viral post would otherwise be **copied in full into millions of feeds** — massive duplication. Instead each feed holds lightweight **ids**, and the actual content lives once in a shared **post cache**. At read time we "**hydrate**" — swap ids for real content by one cache lookup per post. One viral post = **one** cached copy, referenced by millions of feeds.
 
 ```java
 List<Post> hydrate(List<Long> postIds) {
@@ -424,7 +466,30 @@ List<Post> hydrate(List<Long> postIds) {
 }
 ```
 
-#### Q: What happens to my feed when I accept a *new* friend?
+### Merging groups and pages into the candidates
+
+Your feed isn't only friends' posts — it also blends posts from **groups** you joined and **pages** you follow. These are just **more candidate sources** that get unioned in before ranking. Each source has the same push/pull decision:
+
+- **Friends** — normal fan-out (push), pulled if the friend is high-degree.
+- **Groups** — a group behaves like a shared author; a small group can push to members, a huge group (millions of members) is treated like a celebrity → **pull at read**.
+- **Pages** — almost always high-degree (a page can have 100M followers) → **pull at read**; never fan out 100M writes for one page post.
+
+```java
+// Candidate generation UNIONS every source the viewer subscribes to, then privacy-filters (§8).
+List<Long> candidates(long viewer) {
+    List<Long> c = new ArrayList<>();
+    c.addAll(redis.zrange("feed:" + viewer, 0, 500));        // pushed friend posts (precomputed)
+    for (long g : graph.groupIds(viewer))                    // groups → pull recent
+        c.addAll(postStore.recentPostIds(g, 20));
+    for (long p : graph.pageIds(viewer))                     // pages → pull recent (high-degree)
+        c.addAll(postStore.recentPostIds(p, 20));
+    return c.stream().filter(id -> canView(viewer, postStore.get(id))).toList();  // privacy FIRST
+}
+```
+
+> 💡 **Tip:** groups/pages don't need a new mechanism — they reuse the **same hybrid fan-out + candidate-generation + rank** pipeline. In the interview, say "groups and pages are just extra candidate sources merged in, with high-degree ones pulled at read."
+
+### What happens to your feed when you accept a new friend
 
 Two options (see §13): **backfill** their recent posts into your precomputed feed asynchronously, or just **rely on pull** to naturally include them next time you build the feed. Either way you don't need to rebuild everyone's feed — only the two people whose relationship changed.
 
@@ -492,17 +557,45 @@ List<Post> rank(List<Post> candidates, long viewer) {
 }
 ```
 
-#### Q: Do we run this expensive ML on all trillion edges / every post ever?
+### Ranking runs on a bounded candidate set, not the whole graph
 
-**No — that's the key trick.** Ranking runs only on a **bounded candidate set** (a few hundred to a couple thousand recent, eligible posts), never the whole graph. Candidate generation shrinks "everything" down to "the handful of things that could plausibly appear in your feed right now," and only *then* do we score. Cheap enough to do per feed build.
+**That's the key trick.** Ranking runs only on a **bounded candidate set** (a few hundred to a couple thousand recent, eligible posts), never the whole graph. Candidate generation shrinks "everything" down to "the handful of things that could plausibly appear in your feed right now," and only *then* do we score. Cheap enough to do per feed build.
 
-#### Q: Where does privacy fit in the pipeline?
+### Where privacy fits in the pipeline
 
 **Step 1, before anything else.** Restricted posts are filtered out during **candidate generation**, so a post you're not allowed to see never even reaches the scoring model. You can't accidentally rank-and-show something the model never received (§8).
 
-#### Q: "Affinity" — what is that in plain terms?
+### "Affinity" in plain terms
 
-How **close** you are to the author, learned from behavior: do you message them, like their stuff, view their profile, get tagged together? High affinity → their posts float up. It's why your feed is full of your 10 closest people even though you have 300 friends.
+> 💡 **Jargon:** **affinity** = a 0..1 score for how *close* you are to an author. It's the single biggest reason your feed looks nothing like a stranger's.
+
+Affinity is how **close** you are to the author, learned from behavior: do you message them, like their stuff, view their profile, get tagged together? High affinity → their posts float up. It's why your feed is full of your 10 closest people even though you have 300 friends.
+
+### Ranking features (illustrative weights)
+
+The real model is ML with hundreds of signals; for an interview you only need the **intuition** — a handful of features combined into a score. These weights are **illustrative**, not Facebook's actual numbers:
+
+| Feature | What it measures | Illustrative weight | Effect on score |
+| --- | --- | --- | --- |
+| **Affinity** | closeness to the author (messages, likes, tags, profile views) | ×3.0 | dominant — close friends float to the top |
+| **Recency** | how fresh the post is (time decay) | ×2.0 | newer beats older, all else equal |
+| **Engagement** | reactions/comments/shares so far | ×1.5 | "already popular" gets a boost |
+| **Content type** | photo/video usually > text > link | ×1.0–1.3 | richer media weighed slightly higher |
+| **Your history** | do you usually engage with this author/topic? | ×1.2 | personalized nudge |
+| **Negative signals** | "hide post", "see less", reported | ×↓ | actively demoted |
+
+**Numeric affinity example** — two candidate posts, same age and type, differ only by affinity:
+
+```
+score ≈ affinity × content_weight × time_decay
+
+Post A: from your sibling (you DM daily)   affinity 0.9, weight 1.0, decay 0.8 → 0.9 × 1.0 × 0.8 = 0.72
+Post B: from a distant acquaintance         affinity 0.1, weight 1.0, decay 0.8 → 0.1 × 1.0 × 0.8 = 0.08
+
+→ Post A scores ~9× higher, so it ranks far above Post B even though both are equally recent.
+```
+
+> ⚠️ **Pitfall:** don't try to explain the ML model internals — you'll go down a rabbit hole. Say "treat the scorer as a black box; I know the **features** (affinity, recency, engagement) and that it runs on a **bounded candidate set**." That's what's being tested.
 
 ---
 
@@ -563,7 +656,7 @@ List<Post> candidatesFor(long viewer) {
 
 It feels wasteful, but it's the only correct choice, because visibility **depends on the current state of two people's relationship**, which changes. If Bob unfriends Alice at 3pm, every FRIENDS-only post of Alice's must vanish from Bob's next read at 3:01 — with no rebuild of stored data. Checking on read makes revocation **instant**. The friend-graph lookups it needs are exactly what TAO's cache makes cheap (§5), so in practice it's fast.
 
-#### Q: What's the difference between "unfriend" and "block"?
+### Unfriend vs. block
 
 - **Unfriend** — you're no longer friends, so FRIENDS-scoped posts stop being visible between you. But you can still see each other's PUBLIC posts.
 - **Block** — a hard wall: the blocked person sees **none** of your content and effectively can't interact with you. That's why the `canView` check does the block test **first** — it overrides every scope.
@@ -642,17 +735,47 @@ class Comment {
 - **Lazy-loaded:** a post with 50,000 comments doesn't load all of them — you fetch the top few, and "view more replies" pulls the next branch on demand.
 - **Ranked:** top-level comments can be ordered by "top" (most liked) or "newest", just like the feed but smaller scale.
 
-#### Q: If I share a post, is it copied?
+### Sharing a post doesn't copy it
 
-No — a **share creates a new post that *references* the original** (stores its id). The original stays in one place; your share points at it. That way edits/deletes to the original are reflected, and you don't duplicate content (same spirit as storing post ids in feeds, §6).
+A **share creates a new post that *references* the original** (stores its id). The original stays in one place; your share points at it. That way edits/deletes to the original are reflected, and you don't duplicate content (same spirit as storing post ids in feeds, §6).
 
-#### Q: Why keep the exact `reactions` table if we also cache a count?
+### Why keep the exact `reactions` table if we also cache a count
 
 Two different jobs. The **count** is a fast display number (approximate, cached). The **`reactions` table** (keyed by `(user_id, post_id)`) is the exact record of *who* reacted — needed so you can **un-like** (toggle), so we don't double-count if you tap twice, and so we can recompute the true count if the cache is ever wrong.
+
+### Notifications fan-out (brief)
+
+Notifications are their own **fan-out** problem, but usually much smaller than the feed: a like/comment notifies **one** person (the author); a friend request notifies one; a group post might notify interested members. The pattern is the same event-driven pipeline:
+
+```
+REACTION / COMMENT / FRIEND_REQUEST event (Kafka)
+   → Notification Service consumer
+       → write a notifications row for the target user
+       → push to device (APNs/FCM) / websocket if online, else store for later
+```
+
+- **Coalescing:** high-volume targets get **grouped** notifications ("Alice and 45 others liked your post") instead of 46 pings — the notification analogue of async count aggregation.
+- **High-degree posts** (a page/celebrity post getting millions of reactions) do **not** notify per reaction; they aggregate to a single rolled-up notification, same celebrity-problem instinct as the feed (§6).
+- **Read state** (`is_read`) lives on the `notifications` row so the unread badge is a cheap count.
+
+> 💡 **Tip:** in the interview, one line is enough — "notifications reuse the Kafka event pipeline, write a per-user row, push if online, and **coalesce** high-volume events to avoid ping storms."
 
 ---
 
 ## 10. Data Model (all tables)
+
+### Database & storage choices (which DB, and why at scale)
+
+No single database is best for every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question for the friend graph is always *"can this tolerate a graph-native engine's throughput ceiling, or does it need boring, battle-tested horizontal scale?"* At ~1 trillion edges, the answer rules out a native graph DB.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Users, friendships, posts, reactions, comments (**source of truth**) | **Sharded MySQL, TAO-style graph cache on top** | ~3B users × ~300 edges ≈ 1 trillion friendship rows — plain, well-understood relational storage sharded by id, with a **read-through cache layer (TAO)** absorbing the read firehose (friend lists are read on every feed build). | A native graph DB (Neo4j) is optimized for deep multi-hop traversals (6-degrees-of-separation queries) Facebook rarely needs — mutuals/suggestions are just **2-hop set intersections**, which a KV-style cache over sharded MySQL handles fine. Neo4j's single-writer-per-cluster-node model and immature horizontal sharding story can't take a trillion-edge, millions-of-writes/sec workload; MySQL's operational maturity (backup, replication, tooling) wins at this scale. |
+| Precomputed News Feed | **Redis** (sorted sets) | Feed is read millions of times/sec and reordered constantly — `ZADD feed:{userId} score postId` gives an instant "top 20." It's derived/rebuildable from posts + the graph, so a fast, lossy cache is the right home. | Querying posts+friendships+privacy on every feed render doesn't survive Facebook's read volume; the feed is a CQRS read model, not a system of record. |
+| Search (people, posts, pages) | **Elasticsearch** | Full-text + faceted lookup over billions of posts/profiles needs an inverted index and relevance ranking. | MySQL `LIKE` scans can't rank or tokenize at this scale; ES is a purpose-built read model fed via CDC. |
+| Photos/videos | **Blob store + CDN** | Large immutable bytes, served from the edge close to the viewer. | Storing media in MySQL bloats rows/backups and kills cache locality — the `posts` row keeps only a `media_ref` pointer (§10 below). |
+
+**Why TAO-over-MySQL wins at this scale, and how it scales:** the friend graph and posts need durable, auditable storage, but the *access pattern* — read a user's own edges, or 2-hop friends-of-friends — needs sub-ms latency at trillions of edges, which MySQL alone can't give and a graph DB alone can't durably shard. TAO solves both: shard by **user/object id** (`shard = hash(user_id) % numShards`) so a user's friendships and objects co-locate on one shard for fast single-machine reads/writes, and put a huge **read-through cache** in front so the read:write ratio (feed builds hammer friend-list reads) never touches MySQL directly. Hot keys (celebrity/page profiles) are absorbed by the cache tier, not by resharding. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 CREATE TABLE users ( user_id BIGINT PRIMARY KEY, name TEXT, email VARCHAR(255) UNIQUE, created_at TIMESTAMP );
@@ -708,7 +831,7 @@ Don't memorize columns — understand **why each table exists** and the one clev
 | `blocks` | Hard walls | Checked first in `canView` |
 | feeds in **Redis** | Precomputed News Feeds | Not SQL at all — a **sorted set** of post ids per user, ordered by score/time |
 
-#### Q: Why is `friendship`'s primary key `(user_a, user_b)` and why store both directions?
+### Why `friendships`' primary key is `(user_a, user_b)`, storing both directions
 
 The PK `(user_a, user_b)` guarantees you can't have two rows for the same pair (no duplicate friendship). Storing **both directions** (a row for a→b *and* b→a) means "who are Alice's friends?" is a single indexed lookup on `user_a = Alice`, no matter which person originally sent the request. The alternative — store one row with `a < b` and query both `user_a` and `user_b` — saves space but makes every read do an OR/union. At Facebook's read-heavy scale, we happily pay double storage to make the read trivial.
 
@@ -721,7 +844,7 @@ SELECT user_b FROM friendships WHERE user_a = :alice AND status = 'ACCEPTED';
 
 That's **denormalization** — deliberately keeping a redundant copy for speed. Counting `SELECT COUNT(*) FROM reactions WHERE post_id = 99` on a post with 2M likes, on every feed render, would be brutal. So we keep a running number right on the post row (updated async, §9) and read it for free. The exact `reactions` rows remain the source of truth if we need to fix the count.
 
-#### Q: Why does the feed live in **Redis**, not a SQL table?
+### Why the feed lives in Redis, not a SQL table
 
 The feed is a **hot, throwaway, per-user list** read millions of times/sec and constantly reordered. That's exactly what an in-memory store like Redis is for. A **sorted set** (`ZADD feed:{userId} score postId`) keeps ids ordered by score/time and lets you grab "top 20" instantly. It's a **cache/materialized view** — if it's lost, we can rebuild it from posts + the graph.
 
@@ -729,7 +852,7 @@ The feed is a **hot, throwaway, per-user list** read millions of times/sec and c
 feed:42  →  { post_991: 1699999999, post_985: 1699999881, ... }   // Redis sorted set, score = time/rank
 ```
 
-#### Q: Why is `media_ref` just a string, not the image itself?
+### Why `media_ref` is just a string, not the image itself
 
 Databases are terrible at storing big binary blobs. The photo/video lives in **blob storage + CDN** (built for large files, served fast worldwide); the post row stores only a **reference** (a URL/key). Same principle as feeds storing ids: keep the heavy thing in one specialized place, point at it from everywhere else.
 
@@ -772,6 +895,56 @@ User → FeedSvc:
   privacy-filter → extract features → ML rank → hydrate content → paginate
 ```
 
+### Friend request — state machine
+
+Because friendship is **bidirectional**, a request has a small lifecycle. The `friendships` row's `status` column *is* the state machine:
+
+```
+                 send request
+   (none) ─────────────────────────► PENDING
+      ▲                                 │
+      │ decline / cancel                │ accept
+      │ (delete row)                    ▼
+      └──────────────────────────── ACCEPTED ──── unfriend ──► (none)
+                                        │
+                                     block (either side)
+                                        ▼
+                                     BLOCKED  (canView fails first, §8)
+```
+
+| Transition | Trigger | Effect |
+| --- | --- | --- |
+| none → PENDING | A sends request to B | one row `status=PENDING, requested_by=A` |
+| PENDING → ACCEPTED | B accepts | write **both** edges (A→B, B→A); invalidate both TAO friend lists; backfill feed |
+| PENDING → none | B declines / A cancels | delete the pending row |
+| ACCEPTED → none | either unfriends | delete **both** edges; invalidate both cached lists |
+| any → BLOCKED | either blocks | `blocks` row; `canView` denies first (§8) |
+
+### Friend request — sequence (send → accept → backfill)
+
+```
+A            GraphSvc        TAO/MySQL      Kafka        FeedSvc/Fan-out
+│ POST request │                │             │                │
+├─────────────►│ insert PENDING │             │                │
+│              ├───────────────►│             │                │
+│◄─ 200 ───────┤                │             │                │
+                    ...later, B accepts...
+B            GraphSvc        TAO/MySQL      Kafka        FeedSvc/Fan-out
+│ POST accept  │                │             │                │
+├─────────────►│ write BOTH edges (A→B, B→A) │                │
+│              ├───────────────►│             │                │
+│              ├─ invalidate friend lists(A,B)│                │
+│              ├─ FRIENDSHIP_ACCEPTED ───────►│                │
+│◄─ 200 ───────┤                │             ├── backfill ───►│  pull B's recent
+│              │                │             │                │  posts into A's feed
+│              │                │             │                │  (and A's into B's)
+```
+
+- **Backfill** = after acceptance, asynchronously merge each new friend's **recent** posts into the other's precomputed feed, so the feed isn't empty of the new friend until they next post. Alternatively, rely on **pull** to naturally include them on the next feed build (§6).
+- Only the **two** people whose relationship changed are touched — no global rebuild.
+
+> ⚠️ **Pitfall:** accept must write **both** edges and invalidate **both** cached lists atomically enough that you never get a half-friendship (A sees B, B doesn't see A). This is one of the few spots we want strong-ish consistency.
+
 ---
 
 ## 13. Consistency & Edge Cases
@@ -788,7 +961,85 @@ User → FeedSvc:
 
 ---
 
-## 14. Design Patterns (that can be used)
+## 14. Scaling & Failure
+
+- **Graph** sharded by id + **TAO-style read-through cache** (friend lists read on every feed build); MySQL durable backing.
+- **Feed** = hybrid fan-out + ML ranking on candidate sets; store ids, hydrate content, cache per user.
+- **Counters** (reactions/comments) async-aggregated; approximate cached values.
+- **Privacy** enforced on read (ACL/Chain) — never leak restricted posts.
+- **Media** → blob + CDN; posts store references.
+- Eventual consistency for feed/counts; strong only where needed (friendship state).
+
+---
+
+## 15. Interview Cheat Sheet
+
+> **"How is the friend graph stored?"**
+> "Sharded objects + typed associations behind a **read-through graph cache (TAO-style)** over MySQL — friend lists are read on every feed build so caching is essential. Sharded by id; mutuals = set intersection; friend suggestions = 2-hop friends-of-friends."
+
+> **"How is the News Feed built and ranked?"**
+> "Hybrid fan-out (push for normal friends, pull for high-degree pages), then a ranking pipeline: candidate generation (privacy-filtered) → feature extraction (affinity, recency, engagement) → ML scoring → rank + diversity + ads → cache. Ranking runs on bounded candidate sets."
+
+> **"How is privacy enforced?"**
+> "Each post has a scope (public/friends/custom/only-me); visibility is checked during **candidate generation and on fetch**, and blocked users are excluded — restricted posts never enter a feed."
+
+> **"Facebook vs Twitter?"**
+> "Bidirectional friend graph + heavy ML ranking merging friends/groups/pages, vs Twitter's unidirectional follows and more chronological feed. Same fan-out trade-offs + high-degree/celebrity problem."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Cross-shard friend read** (Alice on shard 7, Bob on shard 2) | "Is Alice friends with Bob?" reads Alice's edges on **her** shard — one lookup, because we store both directions and shard by user id. Mutuals = intersect two single-shard lists. No scatter-gather. |
+| **Stale TAO cache** (missed invalidation / replica lag) | Feed sees a slightly old friend list → tolerable (eventual). Privacy re-checks on read + short TTL heals it within seconds; **fail-closed** covers the gap. |
+| **Privacy leak on fan-out** | Never trust fan-out alone — filter by `canView` **during candidate generation on read** (§8), so a post you can't see never enters the pipeline even if it was fanned into your feed cache. |
+| **Celebrity / page fan-out** (100M followers post once) | Don't push 100M writes. Mark high-degree → **pull at read**; blend their recent posts into the candidate set for viewers currently online. |
+| **Negative-cache miss storm** (privacy probes on non-edges) | Cache the "not friends" answer too (negative cache + TTL), else millions of misses hit MySQL. |
+| **New friend, empty feed** | **Backfill** their recent posts async, or rely on pull next build — touch only the two changed users. |
+
+> **Ultimate layer model:** TAO cache = fast graph reads · hybrid fan-out = scalable feeds · candidate-gen privacy filter = never leak · async counters = no hot rows · Kafka = decouple everything.
+
+---
+
+## 16. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Facebook's answer is unusual — the **read path** is split: **feed freshness is AP**, but **privacy is correctness-first (fail-closed)**.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Privacy / visibility check (read)** | **Correctness-first, fail-closed** | A wrong "you can't see this" is a minor annoyance; a wrong "here you go" is a **data leak**. On any doubt (stale data, error, unknown scope) → **deny**. |
+| **Friendship state** (accept/unfriend/block) | **Strong-ish (CP-leaning)** | No half-friendships; a block must take effect promptly. Write both edges + invalidate both lists together. |
+| **News Feed freshness** | **AP (eventual)** | A post appearing a few seconds late is fine; the feed must stay available even when fan-out lags. |
+| **Counters** (likes/comments) | **Eventual, approximate** | ±150 on a million-like post is invisible to users; avoids the hot-row melt. |
+| **Search / suggestions** | **Eventual** | Slightly stale index/recommendations are acceptable. |
+
+- The subtle point: privacy and feed freshness **share the read path but pick opposite defaults**. The feed happily serves stale/approximate data for availability, yet the privacy filter layered on top refuses to be loose — it **fails closed**. You get a fast, available feed that is still never allowed to leak.
+- Everything is **eventually consistent across services** (Kafka/fan-out), with strong-ish consistency reserved for **friendship state** and correctness-first behavior for **privacy**.
+
+> 💡 **Jargon:** **fail-closed** = when unsure, default to **deny/off** (the safe state). Opposite of fail-open. Privacy checks fail closed on purpose.
+
+> One-liner: **"AP for feed freshness and counts; correctness-first (fail-closed) for privacy; strong-ish for friendship state."**
+
+---
+
+## 17. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min clarifying + estimating, then go deep on the **three distinctive parts** in this exact order: **social graph → hybrid feed → privacy filter.**
+
+1. **Clarify requirements** (functional + NFRs) — §2
+2. **Estimate scale** — prove the naive design is impossible (trillion edges, millions of reads/sec) — §3
+3. **APIs + high-level architecture** — §11, §4
+4. **Deep dive 1 — the social graph (TAO):** objects + associations, sharded MySQL + read-through cache, mutuals = set intersection, suggestions = 2-hop, invalidation + negative cache — §5
+5. **Deep dive 2 — the hybrid feed:** push for normal friends, pull for high-degree pages/celebrities, merge groups/pages into candidates, store ids + hydrate, then the ranking pipeline (affinity/recency/engagement) — §6, §7
+6. **Deep dive 3 — the privacy filter:** checked on read, **during candidate generation**, fail-closed — the leak-proofing that sets Facebook apart — §8
+7. **Address failures + edges** — celebrity fan-out, stale cache, counters, friend-request lifecycle — §12, §13, §14
+8. **Summarize tradeoffs** — §16
+
+> 🎤 **Lead with the distinctive parts:** say up front "vs Twitter, the crux is the **bidirectional graph**, the **hybrid ranked feed merging friends/groups/pages**, and **privacy enforced on every read**," then spend your time on those three. That framing signals you know what's actually hard here.
+
+---
+
+## 18. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -805,34 +1056,7 @@ User → FeedSvc:
 
 ---
 
-## 15. Scaling & Failure
-
-- **Graph** sharded by id + **TAO-style read-through cache** (friend lists read on every feed build); MySQL durable backing.
-- **Feed** = hybrid fan-out + ML ranking on candidate sets; store ids, hydrate content, cache per user.
-- **Counters** (reactions/comments) async-aggregated; approximate cached values.
-- **Privacy** enforced on read (ACL/Chain) — never leak restricted posts.
-- **Media** → blob + CDN; posts store references.
-- Eventual consistency for feed/counts; strong only where needed (friendship state).
-
----
-
-## 16. Interview Cheat Sheet
-
-> **"How is the friend graph stored?"**
-> "Sharded objects + typed associations behind a **read-through graph cache (TAO-style)** over MySQL — friend lists are read on every feed build so caching is essential. Sharded by id; mutuals = set intersection; friend suggestions = 2-hop friends-of-friends."
-
-> **"How is the News Feed built and ranked?"**
-> "Hybrid fan-out (push for normal friends, pull for high-degree pages), then a ranking pipeline: candidate generation (privacy-filtered) → feature extraction (affinity, recency, engagement) → ML scoring → rank + diversity + ads → cache. Ranking runs on bounded candidate sets."
-
-> **"How is privacy enforced?"**
-> "Each post has a scope (public/friends/custom/only-me); visibility is checked during **candidate generation and on fetch**, and blocked users are excluded — restricted posts never enter a feed."
-
-> **"Facebook vs Twitter?"**
-> "Bidirectional friend graph + heavy ML ranking merging friends/groups/pages, vs Twitter's unidirectional follows and more chronological feed. Same fan-out trade-offs + high-degree/celebrity problem."
-
----
-
-## 17. Final Takeaways
+## 19. Final Takeaways
 
 - Two hard parts: a **trillion-edge friend graph** (TAO-style read-through cache over sharded MySQL) + a **ranked News Feed**.
 - **Feed** = hybrid fan-out + **ML ranking pipeline** (candidates → features → score → rank) on bounded candidate sets; store ids, hydrate, cache.

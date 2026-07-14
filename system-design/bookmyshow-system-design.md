@@ -219,6 +219,20 @@ Client (App/Web) │   CDN        │  (posters, static seat-map layout)
 
 > **Per-show seat partitioning:** seats are naturally scoped to a `show_id`, which makes **sharding by `show_id`** clean (see §22).
 
+### Database & storage choices (which DB, and why at scale)
+
+No single database is best for every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question for the core data is always *"does this need strong consistency and transactions?"* For seats/bookings/payments the answer is an emphatic **yes**, which rules out an eventually-consistent NoSQL store as the source of truth.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Seats, bookings, payments (**source of truth**) | **RDBMS** (PostgreSQL/MySQL) | The whole design rests on the **atomic conditional `UPDATE ... WHERE status='AVAILABLE'`** and multi-row transactions (booking + seats + payment). ACID + row locks give this for free. | A NoSQL store (Cassandra/Dynamo) is **eventually consistent** with no cross-row transactions → you'd have to hand-build locking and reconciliation, and still risk double-booking. Not worth it when write volume is modest. |
+| Seat-map reads, hot-seat locks | **Redis** | Sub-ms reads for the seat map; `SET NX EX` gives a fast distributed lock that **absorbs contention** before it hits the DB (§12). | Hitting the RDBMS for every seat-map poll on a hot show melts it; Redis takes the read firehose. |
+| Movie/show search & discovery | **Elasticsearch** | Full-text + faceted filters (city, language, genre, time) — a read model rebuilt from the RDBMS via CDC. | RDBMS `LIKE`/multi-column filters don't scale to browse traffic; ES is the CQRS read side. |
+| Posters, static seat-map layout | **Blob store + CDN** (S3/CloudFront) | Large immutable bytes served from the edge, cheap and fast. | Storing images in the DB bloats it and kills cache locality. |
+| Events (notifications, invoices, analytics) | **Kafka** | Durable log decouples the booking write from downstream fan-out; paired with the outbox (§16). | Direct sync calls couple services and lose events on crash. |
+
+**Why the write volume lets RDBMS win:** bookings peak at only a few hundred/sec (§3) — trivial for one RDBMS primary. The hard part isn't throughput, it's **correctness on hot rows**, which is exactly what a relational engine's row locks solve. We scale reads with **replicas + Redis**, and scale writes by **sharding on `show_id`** (§21) — each show's seats live together, so a booking touches a single shard. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
+
 ---
 
 ## 7. Seat Booking Flow

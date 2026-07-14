@@ -1,6 +1,10 @@
 # Idempotency
 
+> **The core question:** *A client tapped "Pay", got a timeout, and retried. Did we just charge the customer twice?* Idempotency is how you answer **"no — charged exactly once"** with confidence, no matter how many times the request arrives.
+
 > **Definition:** Idempotency means doing the same operation multiple times has the same effect as doing it once.
+
+> 💡 **The one-line bridge (remember this):** you can't guarantee a message is *delivered* exactly once over a flaky network, so you accept **at-least-once** delivery — retries, duplicate events — and make your *processing* idempotent. The observable result is **effectively-once**: the world changes exactly once even though the request arrived twice. This same idea carries straight from HTTP retries → message queues → webhooks. (Full treatment in §10.)
 
 > **How to read this doc:** each section has the dense summary first, then a **deep dive** (annotated example code, and the exact confusions that trip up beginners). Skim the summaries for revision; read the deep dives to actually understand.
 
@@ -12,6 +16,7 @@
 - [2. Where It's Used](#2-where-its-used)
 - [2.5. HTTP Method Idempotency (REST semantics)](#25-http-method-idempotency-rest-semantics)
 - [2.6. Designing Naturally Idempotent Operations](#26-designing-naturally-idempotent-operations)
+- [2.7. When NOT to use an Idempotency-Key](#27-when-not-to-use-an-idempotency-key)
 - [3. Core Idea: The Idempotency Key](#3-core-idea-the-idempotency-key)
 - [4. High-Level Request Flow](#4-high-level-request-flow)
 - [5. Storage Design](#5-storage-design)
@@ -20,6 +25,7 @@
 - [8. Payload Consistency (Request Hash)](#8-payload-consistency-request-hash)
 - [9. Concurrency & Race Conditions](#9-concurrency--race-conditions)
 - [10. Crash & Failure Scenarios](#10-crash--failure-scenarios)
+- [10.5. Webhook / Async-Callback Idempotency](#105-webhook--async-callback-idempotency)
 - [11. TTL / Cleanup](#11-ttl--cleanup)
 - [12. Client (Frontend) Responsibilities](#12-client-frontend-responsibilities)
 - [13. Security Note](#13-security-note)
@@ -28,6 +34,7 @@
 - [16. Common Pitfalls](#16-common-pitfalls)
 - [17. Production-Grade Pattern](#17-production-grade-pattern)
 - [18. Interview Cheat Sheet](#18-interview-cheat-sheet)
+- [Final Takeaways](#final-takeaways)
 
 ---
 
@@ -222,6 +229,27 @@ Synthetic key:  Idempotency-Key = a UUID (means nothing; just a "same request?" 
 #### Q: When do I use which?
 
 If the client can supply a stable business id (e.g. it generates the `order_id`), lean on the **natural key** — it's simpler, no extra machinery. If the id is only known *after* the server creates the record (server-generated ids), you can't dedup on it up front, so you fall back to a **synthetic idempotency key** the client makes before sending. Payments APIs (Stripe, etc.) use synthetic keys for exactly this reason.
+
+---
+
+## 2.7. When NOT to use an Idempotency-Key
+
+An idempotency key is **machinery** — a durable stored record per request, a hash check, a TTL cleanup job. It earns its keep when a duplicate would *hurt*. When a duplicate is harmless (or impossible), skip the key.
+
+| Situation | Why you can skip the key |
+| --- | --- |
+| **Reads (`GET` / `HEAD` / `OPTIONS`)** | No side effects — repeating a read changes nothing. A key buys zero safety. |
+| **Naturally idempotent writes (`PUT`, absolute `SET`, upserts)** | The operation already converges to the same state on repeat (§2.6). The key would be redundant. |
+| **Ops where a duplicate is genuinely harmless** | E.g. writing the *same* value to a cache, appending to a content-keyed log. If re-running costs nothing, don't pay for dedup. |
+| **Analytics / fire-and-forget events at extreme scale** | Billions of low-value events (page views, metrics). A per-event idempotency record can cost more in storage than an occasional double-count is worth — dedup downstream, or just tolerate it. |
+
+> 💡 **Decision rule:** reach for an idempotency key only for **non-idempotent side effects that must happen once** (charge, create, ship). For everything else, prefer *designing* the op to be naturally idempotent (§2.6) — it's cheaper and simpler.
+
+> ⚠️ **"Harmless" is a business call, not a technical one.** A duplicate audit-log line looks harmless until compliance counts it; a duplicate notification looks harmless until the user gets two SMS charges. Confirm "a duplicate is fine here" with the domain — don't assume it.
+
+#### Q: Isn't it safer to just add a key everywhere?
+
+No — it adds real cost: a durable write on the hot path, a store to operate and monitor, a TTL cleanup job, and hashing on every request. At extreme scale that overhead is not free, and for operations that are already idempotent it protects against nothing. Idempotency keys are a **targeted tool for dangerous repeats**, not a blanket policy.
 
 ---
 
@@ -474,6 +502,47 @@ Because a matching key is supposed to mean "the exact same request." If the key 
 
 So the record can never be left half-true (e.g. `status` still `IN_PROGRESS` but a response present). Writing `status`, `response`, `order_id`, and `http_status` in **one** update keeps the record internally consistent — a retry always sees a complete, trustworthy record.
 
+### The `IN_PROGRESS` response policy: `409` vs `202` vs wait
+
+When a retry lands while the first copy is *still running*, you can't return a result yet — there isn't one. You have three choices for what to tell the caller:
+
+| Policy | Response | When to use it |
+| --- | --- | --- |
+| **Reject** | `409 Conflict` | Default and simplest. Says "a copy is in flight, retry shortly." Client backs off and retries/polls. |
+| **Accept + point to status** | `202 Accepted` + a status URL / job id | Long-running or async work. The client polls the status endpoint instead of blocking. |
+| **Synchronous wait** | block, then return the real result | Best UX (one call, one answer) but ties up a server thread/connection and needs a timeout. Use only for short work behind a bounded wait. |
+
+> 💡 **Pick `409` unless you have a reason not to.** It's stateless and cheap. Reach for `202` when the work is genuinely async, and only block synchronously for short operations where a bounded wait beats making the client poll.
+
+> ⚠️ Whatever you pick, **never start a second copy of the work** on an `IN_PROGRESS` hit — that's the exact duplicate you're trying to prevent. All three policies leave the original in-flight request untouched.
+
+### The idempotency record's state machine
+
+The stored record moves through a tiny lifecycle. `NEW` is the implicit *"key not found"* state; the first request atomically claims the key and drives it to a terminal state.
+
+```
+              first request claims the key (atomic SET NX / UNIQUE)
+   NEW  ─────────────────────────────────────────────────►  IN_PROGRESS
+ (no key)                                                        │
+                                                                 │ work finishes
+                                                   ┌─────────────┴─────────────┐
+                                                   ▼                           ▼
+                                               SUCCESS                      FAILED
+                                        (store full response)         (per your policy)
+                                                   │                           │
+                        retry ─────────────────────┘                           ▼
+                     (replay stored response,                       retry: allow re-attempt
+                      no re-processing)                             (overwrite) OR return
+                                                                    the failure consistently
+
+   retry while IN_PROGRESS ──►  409 / 202 / wait   (do NOT start a second copy)
+```
+
+- **`NEW → IN_PROGRESS`** — only the first of racing retries wins the atomic claim (§9).
+- **`IN_PROGRESS → SUCCESS`** — work done; store the full response so retries replay it.
+- **`IN_PROGRESS → FAILED`** — work failed; your retry policy decides whether the key may be reused.
+- **retry while `IN_PROGRESS`** — answered by the policy table above; never a second copy.
+
 ---
 
 ## 7. How Order Status is Maintained (Idempotency ≠ Order Lifecycle)
@@ -591,6 +660,8 @@ Normalized:
 
 5. **On retry:** if `incoming_hash != stored_hash` → return `400 Bad Request`.
 
+> ⚠️ **Hash only the *stable* business fields.** If the body carries volatile data — a client `timestamp`, a `nonce`, a retry counter — those change on every attempt and would make a legitimate retry look like a "different payload," triggering a spurious `400`. Exclude such fields from the canonical form *before* hashing.
+
 ### The fingerprint that catches key reuse
 
 The **request hash** is a fingerprint of the original request payload. If a later call reuses the key but the fingerprint doesn't match, the payload differs from what the key was first used for — so you reject it instead of returning the wrong stored result.
@@ -649,6 +720,8 @@ Request B → SET NX → FAIL ❌ → GET key → IN_PROGRESS → return 409
 When B retries later, status is `SUCCESS` → it gets the stored response. No duplicate.
 
 > **`SET NX` acts like a lock — only one request is allowed to proceed.**
+
+> ⚠️ **An `IN_PROGRESS` claim can get stuck.** If the request that won the `SET NX` crashes *before* writing `SUCCESS`, the key sits at `IN_PROGRESS` until its TTL expires — and until then, later retries keep getting `409`. That's exactly the crash case §10 solves: recover from the DB on retry, or let the TTL eventually free the key.
 
 **DB equivalent:** a `UNIQUE(idempotency_key)` constraint. First insert wins; others fail and fetch the existing record.
 
@@ -762,6 +835,43 @@ try {
 }
 ```
 
+### Worked example: the side effect succeeded but our write didn't
+
+The nastiest partial failure isn't "we crashed before finishing" — it's when an **irreversible external side effect already happened** and *then* our own bookkeeping failed:
+
+```
+1. store: IN_PROGRESS                                   ✅
+2. call payment provider → CHARGE ₹5,000 SUCCEEDS       ✅  (money moved — external, irreversible)
+3. write order row to our DB → FAILS (timeout / crash)  ❌
+   → provider thinks: PAID.   our DB thinks: no order.   💥 mismatch
+```
+
+Now a retry arrives. If we naively "process again," we call the provider a second time and **double-charge**. Two things save us:
+
+```java
+boolean firstTime = store.setIfAbsent(key, "IN_PROGRESS", hash, TTL);
+if (!firstTime) { /* replay or 409, as usual */ }
+
+// (1) Pass the SAME idempotency key to the external call. Stripe et al. dedup on it,
+//     so a retried charge returns the ORIGINAL charge instead of creating a new one.
+Charge c = provider.charge(amount, key);      // idempotent AT THE PROVIDER too
+
+try {
+    Order o = db.insertOrder(req, key);       // idempotency_key UNIQUE
+    store.set(key, "SUCCESS", http(201, o), o.id);
+    return http(201, o);
+} catch (DuplicateKeyException e) {
+    return http(201, db.findByKey(key));      // order already existed → replay
+}
+```
+
+1. **Propagate the idempotency key to the external call**, so *its* retry is deduped too — the charge happens once even if we call twice.
+2. **Reconciliation** for anything that still slips through: a background job compares *"provider says charged"* against *"we have an order"* and repairs the gap — create the missing order, or refund an orphaned charge.
+
+> ⚠️ You **cannot** wrap an external charge and your DB write in one transaction — the provider isn't in your database, so there's no atomic commit across both. That's why the idempotency key must reach *both* systems, and why a **reconciliation job** is the ultimate backstop for money-moving flows.
+
+> 💡 **Where possible, order the steps so the replayable record exists before the irreversible effect.** When a side effect is truly irreversible, make the downstream call itself idempotent (pass the key) so *"did this already happen?"* is answerable without guessing.
+
 #### Q: "At-least-once delivery + idempotent processing = effectively-once" — what does that mean?
 
 It's the whole payoff, in one line. Many systems (message queues like Kafka, HTTP clients with retries) promise only **at-least-once**: *"I'll deliver your message, but maybe more than once."* They refuse to promise "exactly once" because guaranteeing that across a network is extremely hard. So duplicates *will* happen. If your *processing* is **idempotent**, a duplicate delivery has no extra effect — so the observable outcome is as if it happened **exactly once**. That combined result is called **effectively-once** (or "exactly-once semantics").
@@ -773,6 +883,41 @@ delivery guarantee (hard to make exactly-once):  at-least-once  → duplicates h
 ```
 
 > Takeaway: you don't fight the network for "exactly-once delivery." You accept "at-least-once" and make your *code* idempotent — that's how real systems get exactly-once *outcomes*.
+
+---
+
+## 10.5. Webhook / Async-Callback Idempotency
+
+So far the *client* retried *us*. Webhooks flip the direction: an external provider (Stripe, a payment gateway, a shipping API) calls **you** back to say *"payment succeeded."* Those callbacks are delivered **at-least-once** too — the provider retries until you return `200`, so you *will* receive the same event more than once. Same problem, opposite direction: process each event **once**.
+
+The pattern has three parts:
+
+1. **Verify the signature first.** A webhook is a public URL, so *anyone* can POST to it. Providers sign each payload (typically an HMAC over the raw body with your webhook secret). Reject anything whose signature doesn't match *before* you look at the contents.
+2. **Dedup on the provider's `event_id`.** Every event carries a stable id (`evt_1abc...`). Treat it exactly like an idempotency key: record processed event ids in a dedup store with a `UNIQUE` constraint; a redelivery hits the constraint and is skipped.
+3. **Process, then acknowledge.** Do the work idempotently, then return `200`. If you crash before `200`, the provider redelivers — which is fine, because step 2 makes reprocessing a no-op.
+
+```java
+void onWebhook(HttpRequest req) {
+    if (!signatureValid(req.body, req.header("Stripe-Signature"), WEBHOOK_SECRET))
+        return http(400, "bad signature");           // step 1: authenticate the caller
+
+    String eventId = parse(req.body).id;              // e.g. "evt_1abc..."
+
+    boolean fresh = dedup.setIfAbsent(eventId, "PROCESSED", TTL);
+    if (!fresh) return http(200, "already handled");  // step 2: duplicate → ack, do nothing
+
+    handleEvent(parse(req.body));                     // step 3: idempotent processing
+    return http(200, "ok");
+}
+```
+
+> ⚠️ **Signature verification is not optional here.** Unlike a client idempotency key (which grants no power, §13), a webhook endpoint *acts* on what it receives — an unverified "payment succeeded" event is a forged-money exploit. Verify the signature, *then* dedup.
+
+> 💡 **Same mental model, both directions.** Outbound: *your* client sends an `Idempotency-Key` so the provider dedups. Inbound: the provider sends an `event_id` so *you* dedup. Both turn at-least-once delivery into effectively-once processing (§10).
+
+#### Q: Why dedup on `event_id` instead of hashing the event's contents?
+
+Because the `event_id` is the provider's stable, guaranteed-unique handle for that logical event — every redelivery of it shares the same id. Hashing the contents can also work, but ids are simpler, collision-free, and exactly what providers intend you to use. (Two *distinct* events could, in theory, carry identical bodies; their ids would still differ.)
 
 ---
 
@@ -1095,3 +1240,16 @@ If you get "design an idempotent payment/order API," walk it in this order — i
 #### Q: Simplest correct starting point if I'm unsure?
 
 *"A DB-based idempotency key with a unique constraint, storing the full response, with a TTL."* It's simple, strongly consistent, and covers the core cases — then you layer on Redis for speed at scale.
+
+---
+
+## Final Takeaways
+
+- **Idempotency makes retries harmless.** A request can arrive any number of times, but its real-world effect — the charge, the order, the booking — happens **exactly once**.
+- **You don't buy exactly-once *delivery*; you build exactly-once *outcomes*.** Accept at-least-once, make processing idempotent → **effectively-once**. The same idea covers HTTP retries, message queues, and webhooks (both directions — §10.5).
+- **Prefer naturally idempotent design first** (absolute `SET`, upserts, conditional writes, `PUT`). Reach for an explicit `Idempotency-Key` only when the side effect is non-idempotent *and* must happen once — and skip it entirely for reads and harmless repeats (§2.7).
+- **The client owns the key; the server enforces it.** One key per user intent, reused on every retry; the server dedups atomically (`SET NX` / `UNIQUE` constraint) so only the first of racing copies wins.
+- **Store the full response and replay it verbatim** — same body, same status — so a retry is indistinguishable from the original.
+- **Two systems can disagree.** The store (Redis) and the DB don't commit together; a `UNIQUE(idempotency_key)` on the real table is the ultimate backstop, and **reconciliation** catches money-moving flows that touch an external side effect.
+- **Idempotency is correctness, not security.** The key answers *"did I already do this?"*, never *"is this person allowed?"* — yet a webhook endpoint must still verify signatures before trusting an event.
+- **Give keys a TTL** matched to the realistic retry window (24–72h) — long enough to catch slow retries, short enough not to hoard state.

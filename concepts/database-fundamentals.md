@@ -1,6 +1,6 @@
 # Database Fundamentals
 
-> The "horizontal" knowledge interviewers cross-examine in almost every system design round: **SQL vs NoSQL, ACID vs BASE, replication, partitioning/sharding**.
+> Databases force you to trade off **correctness, speed, and scale** — here's the map.
 
 > **How to read this doc:** each section gives the dense summary first, then a **deep dive** (annotated SQL, and the exact confusions that trip people up while learning). Skim the summaries for revision; read the deep dives to actually understand.
 
@@ -11,11 +11,14 @@
 - [1. SQL vs NoSQL](#1-sql-vs-nosql)
 - [2. ACID vs BASE](#2-acid-vs-base)
 - [3. Transaction Isolation Levels](#3-transaction-isolation-levels)
+- [Locking & Deadlocks](#locking--deadlocks)
 - [4. Replication](#4-replication)
 - [5. CAP & PACELC](#5-cap--pacelc)
 - [6. Partitioning & Sharding](#6-partitioning--sharding)
+- [When NOT to shard](#when-not-to-shard)
 - [7. Connection Pooling](#7-connection-pooling)
 - [8. Normalization vs Denormalization](#8-normalization-vs-denormalization)
+- [Common Mistakes](#common-mistakes)
 - [9. Interview Cheat Sheet](#9-interview-cheat-sheet)
 - [10. Final Takeaways](#10-final-takeaways)
 
@@ -146,6 +149,14 @@ ACID suits a bank ledger (must be exact, right now). BASE suits something like a
 
 > Higher isolation = fewer anomalies but more locking / less concurrency.
 
+**First, the three anomalies the levels exist to prevent** — meet them before the table, because the table is just "which of these do I tolerate?":
+
+- **Dirty read** — you read a row another txn wrote but hasn't committed; if it rolls back, you acted on data that never existed.
+- **Non-repeatable read** — you read the **same row** twice in one txn and the value changed underneath you (someone updated + committed in between).
+- **Phantom read** — you run the **same query** twice and the *set* of matching rows changes (someone inserted a matching row).
+
+Now the levels, cheapest → safest, each stopping one more anomaly:
+
 | Level | Prevents | Still allows |
 | --- | --- | --- |
 | **Read Uncommitted** | — | dirty reads |
@@ -153,12 +164,9 @@ ACID suits a bank ledger (must be exact, right now). BASE suits something like a
 | **Repeatable Read** | non-repeatable reads | phantom reads |
 | **Serializable** | everything (acts serial) | lowest concurrency |
 
-**Anomalies:**
-- **Dirty read** — read uncommitted data from another txn.
-- **Non-repeatable read** — same row read twice gives different values.
-- **Phantom read** — same query returns different *set* of rows.
-
 > Default for Postgres = Read Committed; MySQL InnoDB = Repeatable Read.
+
+> ⚠️ **Read Uncommitted in production is almost always a bug.** It lets you act on data that may be rolled back a millisecond later. If you reached for it to "go faster," you want a better index or a read replica — not dirty reads.
 
 ### Isolation levels and the anomalies they stop
 
@@ -197,6 +205,49 @@ Because safety costs **concurrency**. Serializable makes transactions wait for e
 #### Q: Isolation vs the "Consistency" in ACID — same thing?
 
 Related but distinct. **Isolation** is specifically about *concurrent* transactions not corrupting each other's view. **Consistency** is the broader promise that constraints hold. Weak isolation can *lead* to inconsistency, which is why higher isolation exists.
+
+---
+
+## Locking & Deadlocks
+
+> Isolation levels are *policy*; **locks** are the *mechanism* the DB uses to enforce them. When you contend for the same row (a seat, an inventory count, a balance), you pick one of two strategies.
+
+### Pessimistic vs optimistic locking
+
+- **Pessimistic** — assume conflict is likely, so **grab the lock up front** and make everyone else wait. Use `SELECT ... FOR UPDATE`: the row is locked until you commit.
+- **Optimistic** — assume conflict is rare, so **don't lock**; instead detect a conflict at write time using a **version column** (or timestamp). If the version changed under you, your update fails and you retry.
+
+```sql
+-- Pessimistic: lock the row now; others block until COMMIT.
+BEGIN;
+SELECT * FROM seats WHERE seat_id = 'A1' FOR UPDATE;   -- row is locked
+UPDATE seats SET status = 'BOOKED' WHERE seat_id = 'A1';
+COMMIT;
+```
+
+```sql
+-- Optimistic: no lock; the WHERE clause is the guard.
+UPDATE seats SET status = 'BOOKED', version = version + 1
+WHERE seat_id = 'A1' AND version = 7;   -- succeeds only if nobody else changed it
+-- 0 rows affected → someone won the race → reload and retry.
+```
+
+> 💡 **Rule of thumb:** high contention on hot rows → **pessimistic** (avoid retry storms). Low contention / read-heavy → **optimistic** (no lock overhead). Pick based on how often you actually expect a collision.
+
+### Deadlocks and how to avoid them
+
+A **deadlock** is two transactions each holding a lock the other needs — both wait forever. Classic case: booking multiple seats.
+
+```
+Txn A locks seat A1, then wants A2
+Txn B locks seat A2, then wants A1
+→ each waits on the other → deadlock (the DB kills one with an error)
+```
+
+- **Fix: consistent lock ordering.** Always acquire locks in the *same* order (e.g. sort seat IDs before locking). Then two txns can never hold locks in a criss-cross pattern.
+- Keep transactions **short** (lock less, for less time) and always be ready to **retry** the victim the DB aborts.
+
+> This is exactly the seat-booking problem: see the [BookMyShow pessimistic-vs-optimistic locking](../system-design/bookmyshow-system-design.md#11-pessimistic-vs-optimistic-locking) and [multi-seat deadlock](../system-design/bookmyshow-system-design.md#13-multi-seat-booking--deadlocks) sections for the full pattern (including the Redis + DB hybrid at scale).
 
 ---
 
@@ -266,6 +317,8 @@ Many systems compromise: replicate synchronously to *one* follower, asynchronous
 - **Multi-leader** — several nodes accept writes (e.g. one per region for low latency). Fast globally, but two regions can edit the same thing → you need **conflict resolution**.
 - **Leaderless** (Dynamo/Cassandra) — *any* node takes writes; correctness comes from **quorums**: require `W + R > N` (writes acked by `W` nodes, reads from `R` nodes, `N` total copies) so read and write sets always overlap on at least one up-to-date node.
 
+> 💡 **Why `W + R > N` works:** if writes touch `W` nodes and reads touch `R` nodes out of `N`, and `W + R > N`, the two sets *must* share at least one node — so a read always sees at least one copy that has the latest write. With `N=3`, `W=2, R=2` is the common balanced choice.
+
 ---
 
 ## 5. CAP & PACELC
@@ -301,6 +354,12 @@ Network partition happening?
 ```
 
 > Key nuance beginners miss: **you only make this choice *during* a partition.** When the network is healthy, you can have both C and A.
+
+**Worked example — a booking system loses a network link between two availability zones (AZs):**
+
+- **If you chose CP:** the shard holding seat `A1` can't confirm no other AZ is booking it, so it **refuses the write** and returns an error. The user sees *"couldn't complete booking, try again."* Annoying, but **no double-booking** — the right call for seats and payments.
+- **If you chose AP:** each AZ keeps accepting bookings from its local copy. Both stay responsive, but two users in different AZs can book **the same seat**; you discover the conflict when the partition heals and must reconcile (cancel + refund one). Fine for a like-count, disastrous for a seat.
+- **Takeaway:** for money/inventory, prefer **CP** (a clear error beats a silent double-book). For feeds and browsing, prefer **AP** (stay up, reconcile later).
 
 #### Q: So what does PACELC add?
 
@@ -497,6 +556,20 @@ Because a join needs all the rows *in one place* to match them up. Within one DB
 
 ---
 
+## When NOT to shard
+
+> ⚠️ Sharding is a **one-way door**: it multiplies operational cost and permanently complicates every query. Exhaust the cheaper options first.
+
+Hold off on sharding when:
+
+- **You still have vertical headroom.** A bigger box (more RAM/CPU/NVMe) plus **read replicas** and a **cache** solves a huge fraction of "the DB is slow" problems — without touching your query layer.
+- **You need cross-shard queries or transactions.** If your workload is full of joins across entities, global aggregations, or multi-row transactions, sharding turns each into a scatter-gather or a saga. That pain often outweighs the scale benefit.
+- **The team is small.** Sharding adds resharding, rebalancing, hot-shard firefighting, and per-shard failure handling — real ongoing headcount cost.
+
+> 💡 **Order of operations for "the DB can't keep up":** (1) add indexes / fix queries → (2) cache hot reads → (3) read replicas → (4) vertical scale → (5) *then* shard. Sharding is the last resort, not the first reflex.
+
+---
+
 ## 7. Connection Pooling
 
 > A **connection pool** keeps a set of **reusable, already-open** DB connections. Requests **borrow → use → return** a connection instead of opening a new TCP connection each time.
@@ -571,6 +644,8 @@ Opening a fresh DB connection per request is expensive — each one is a real TC
 
 A connection pool avoids this by keeping a small set of already-open connections. A request **borrows one, uses it, and returns it** for the next request to reuse — no per-request setup cost.
 
+> ⚠️ **Create the pool once, at startup — never per request.** A pool built inside a request handler opens fresh connections every call (defeating the entire point) and leaks them under load until the DB hits `max_connections`. The pool is a long-lived, app-wide singleton.
+
 #### Q: If more connections = more parallelism, why not set the pool huge?
 
 Because the **database itself has a hard ceiling** (`max_connections`, often ~100–1000), and that ceiling is shared by *every* service and *every* shard connecting to it:
@@ -639,6 +714,19 @@ These are the concrete mechanisms behind ACID's **Consistency** — the DB *reje
 #### Q: When do I normalize vs denormalize?
 
 Default to **normalized** for transactional systems (orders, users, payments) where correctness matters and data changes often — one source of truth means no contradictions. Reach for **denormalized** in read-heavy or analytics/NoSQL scenarios where joins are expensive or impossible (e.g. across shards), and you'd rather store data pre-joined for fast reads. Summary: **normalize for correctness, denormalize for read speed.**
+
+---
+
+## Common Mistakes
+
+The failure modes that show up in real incidents (and interviews) far more often than exotic edge cases:
+
+- **Wrong shard key.** Picking a low-cardinality or monotonic key (e.g. a timestamp) piles all new writes onto one shard → a **hot shard** while the rest idle. Worse, if the key doesn't match your queries, *every* read becomes a scatter-gather. Choose **high cardinality + even access, aligned with your main query** (§6).
+- **Running analytics on the OLTP primary.** A heavy reporting query (`GROUP BY` over millions of rows) hogs CPU, locks, and buffer cache, and your customer-facing writes stall behind it. Send analytics to a **read replica** or a separate warehouse — never the transactional primary.
+- **Reading a replica right after a write.** Replication lag means the follower may not have your write yet → the user "loses" their own change (the read-your-writes bug, §4). For read-after-write, route that user to the **leader** for a short window.
+- **Sharding before exhausting vertical scale + caching.** Teams shard as a reflex and inherit permanent complexity. Add indexes, cache, and read replicas and scale the box up **first** (see [When NOT to shard](#when-not-to-shard)).
+- **Read Uncommitted in production.** Chasing throughput with dirty reads means acting on data that may roll back. Fix the query or add a replica instead (§3).
+- **A connection pool per request.** Building the pool inside the request path opens connections every call and leaks them until the DB is full. The pool is an **app-wide singleton created at startup** (§7).
 
 ---
 

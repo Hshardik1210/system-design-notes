@@ -12,7 +12,11 @@
 - [2. The Algorithms](#2-the-algorithms)
 - [3. Comparison](#3-comparison)
 - [4. Distributed Rate Limiting](#4-distributed-rate-limiting)
+- [Fail-open vs Fail-closed](#fail-open-vs-fail-closed)
+- [Limits Hierarchy and Tiers](#limits-hierarchy-and-tiers)
+- [Adaptive and Dynamic Rate Limiting](#adaptive-and-dynamic-rate-limiting)
 - [5. Responses & Headers](#5-responses--headers)
+- [Common Mistakes](#common-mistakes)
 - [6. Interview Cheat Sheet](#6-interview-cheat-sheet)
 - [7. Final Takeaways](#7-final-takeaways)
 
@@ -50,6 +54,14 @@ It's *who the limit counts against*. The limit is "100/min **per client**," not 
 
 The chosen field becomes the **key** for that client's private counter. This is why every algorithm below starts with a `key` like `user:123` — see the per-user keys discussion in §4.
 
+#### Q: Rate limiting vs throttling vs backpressure — same thing?
+
+Related, but distinct:
+
+- **Rate limiting** — a hard cap you set: *"at most N per window."* Over the cap → **reject** (429). It's an explicit policy, usually at the edge.
+- **Throttling** — *slowing* a client rather than cutting it off: delaying or queuing requests, or shrinking the allowed rate so they proceed more slowly. Often used loosely as a synonym for rate limiting; the nuance is "slow down" vs "reject."
+- **Backpressure** — a signal that flows **upstream from an overloaded component**: a full bounded queue, TCP flow control, or a lagging consumer telling its callers *"I'm saturated, send less."* Rate limiting is a limit *you impose*; backpressure is the system *reacting* to real load and pushing that pressure back toward the source.
+
 ---
 
 ## 2. The Algorithms
@@ -63,6 +75,8 @@ Count requests per fixed window (e.g. per minute); reset at the boundary.
 | Dead simple, low memory | **Boundary burst**: 2× limit possible across the edge of two windows |
 
 > **Boundary problem:** limit=100/min. 100 requests at 00:59 + 100 at 01:00 = 200 in ~1s.
+
+> ⚠️ **This is the motivator for sliding windows.** Fixed window honors "100/min" for each minute *individually*, but a rolling one-second view straddling the reset can see **2× the limit**. If bursty abuse matters, that's the reason to reach for a sliding window (or token bucket).
 
 ### A counter that resets every minute
 
@@ -306,6 +320,8 @@ The whole table collapses into a few instincts. Two axes matter: **do you want t
 - **Want to tolerate short spikes (typical API)?** → Token bucket. ← default choice.
 - **Need to force a calm, even output to protect something downstream?** → Leaky bucket.
 
+> 💡 **Default choice:** **token bucket at the API gateway, keyed by API key / user_id.** It's memory-light (two fields per client), tolerates the short bursts real clients naturally produce (a page firing 8 API calls on load), and still caps the long-run average. Reach for something else only with a specific reason — sliding-window counter for tighter accuracy, leaky bucket when a fragile downstream needs a smoothed constant rate.
+
 #### Q: Fixed window vs sliding window — what's the actual difference?
 
 They both cap "N per window," but they define *"the window"* differently:
@@ -389,6 +405,58 @@ It adds a **network hop** (~sub-millisecond, but not free). The trade-off:
 
 ---
 
+## Fail-open vs Fail-closed
+
+The limiter depends on Redis. **What happens when Redis is unreachable** — down, timing out, a network blip? Decide this *before* it happens, because the default (whatever your code does on an exception) is a real policy choice.
+
+- **Fail-open** — if the limiter can't reach Redis, **allow the request**. Availability wins: a limiter outage doesn't take down your API. Risk: for the duration there's *no* rate limiting, so you're exposed to abuse and overload.
+- **Fail-closed** — if the limiter can't reach Redis, **reject the request** (429/503). Protection wins: unmetered traffic never gets through. Risk: a limiter outage becomes an *API* outage — a dependency failure cascades into user-facing downtime.
+
+#### Q: Which do I pick?
+
+It depends on what the limit is protecting:
+
+- **Fail-open** for general public APIs where availability matters most and the backend can absorb a brief unmetered spike. A rate-limiter blip shouldn't 429 all your paying customers.
+- **Fail-closed** when the limit guards something that *must not* be overwhelmed — a fragile downstream, an expensive operation, or an abuse-sensitive endpoint (login, payments). Here letting traffic through unmetered is worse than a short outage.
+
+> 💡 **Common middle ground:** fail-open, but back it with a **local in-memory fallback limiter** so you still enforce a coarse (approximate, per-instance) cap during the Redis outage instead of dropping all limits. Pair it with **tight Redis timeouts** and a **circuit breaker** — a limiter that blocks 2s waiting on Redis is its own outage; fail fast to the fallback.
+
+---
+
+## Limits Hierarchy and Tiers
+
+Real systems don't have one limit — they have **layers**, and a request must clear **all** of them. Check the broadest/cheapest first and stop as soon as one is exceeded.
+
+| Scope | Example limit | Protects against |
+| --- | --- | --- |
+| **Global** | 1M req/s total | total infra capacity / catastrophic overload |
+| **Per-tenant** (org / customer) | 10k req/min per tenant | one customer starving all others (fair use) |
+| **Per-endpoint** | 100/min on `/search`, 5/min on `/export` | one expensive route melting shared resources |
+| **Per-user** (or API key / IP) | 100/min per user | one user abusing their tenant's share |
+
+The scope is encoded in the key: `rl:global`, `rl:tenant:42`, `rl:tenant:42:/export`, `rl:user:123`. Each is incremented, and the request is rejected the moment **any** one is over.
+
+### Tiered limits (free vs paid)
+
+Limits usually vary by **plan**: free = 60/min, pro = 1,000/min, enterprise = negotiated. Store the limit as an attribute of the plan / API key and look it up per request — don't hard-code it.
+
+Two **independent dimensions** are worth separating:
+
+- **Burst** — how many requests can fire *at once* (the token bucket's `capacity`).
+- **Sustained** — the long-run average allowed (the token bucket's `refill rate`).
+
+A plan is naturally expressed as both — e.g. *"burst 100, sustained 20/s."* Token bucket maps straight onto this (`capacity` = burst, `refillPerMs` = sustained), another reason it's the default.
+
+---
+
+## Adaptive and Dynamic Rate Limiting
+
+Static limits are set once and never move. **Adaptive** (dynamic) limiting adjusts the allowed rate at runtime based on the system's actual health — tightening when the backend is stressed, loosening when it has headroom.
+
+Signals you might feed in: backend CPU / latency, error rate, DB connection-pool saturation, or a downstream circuit breaker tripping. When p99 latency climbs past a threshold, the limiter lowers each client's effective rate (or the global cap) to **shed load before things fall over**; when the system recovers, it relaxes again. This is closely related to **load shedding** and AIMD-style congestion control. It's more complex and can be surprising to debug (limits move on their own), so most teams start static and add adaptation only where load is genuinely spiky and the backend fragile.
+
+---
+
 ## 5. Responses & Headers
 
 - Reject with **HTTP 429 Too Many Requests**.
@@ -413,6 +481,14 @@ X-RateLimit-Reset: 1710000060   ← the counter resets at this time
 #### Q: Why "fail fast" instead of just making requests wait in a line?
 
 Queuing every excess request means holding open thousands of connections and memory while they wait — which is itself a way to get overwhelmed (the queue becomes the bottleneck). **Failing fast** (instant 429) frees your server immediately and pushes the "waiting" back onto the client. The one exception is when queuing *is* the goal — a **leaky bucket** deliberately queues to smooth traffic — but that's a conscious traffic-shaping choice, not the default.
+
+---
+
+## Common Mistakes
+
+- **Forgetting the TTL on the Redis key.** A fixed-window / counter key without `EXPIRE` lives forever — you leak one key per user per window and Redis memory grows without bound. Always set the expiry (see the `expire` / `PEXPIRE` calls in §2 and §4).
+- **Keying by IP behind NAT / a shared proxy.** Thousands of users behind one corporate NAT, mobile carrier, or cloud egress share a single IP — you'll throttle them all together, or let one abuser exhaust the whole IP's budget. Prefer `user_id` / API key when the client is identified; treat per-IP as a coarse fallback for anonymous traffic only.
+- **Rate limiting *after* the expensive work.** Checking the limit deep in the request — after auth lookups, DB queries, downstream calls — means rejected requests still burned the resources you were trying to protect. Enforce at the **edge / gateway**, *before* the costly work.
 
 ---
 

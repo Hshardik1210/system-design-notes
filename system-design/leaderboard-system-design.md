@@ -21,9 +21,13 @@
 - [11. API Design](#11-api-design)
 - [12. Sequences](#12-sequences)
 - [13. Consistency & Edge Cases](#13-consistency--edge-cases)
-- [14. Design Patterns (that can be used)](#14-design-patterns-that-can-be-used)
-- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
-- [16. Final Takeaways](#16-final-takeaways)
+- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
+- [15. Consistency & CAP Tradeoffs](#15-consistency--cap-tradeoffs)
+- [16. Anti-cheat / Trusted Writes](#16-anti-cheat--trusted-writes)
+- [17. Advanced Scale & Cross-Region Topics](#17-advanced-scale--cross-region-topics)
+- [18. How to Drive the Interview (framework)](#18-how-to-drive-the-interview-framework)
+- [19. Design Patterns (that can be used)](#19-design-patterns-that-can-be-used)
+- [20. Final Takeaways](#20-final-takeaways)
 
 ---
 
@@ -73,6 +77,16 @@ That structure is a **Redis Sorted Set** (§6). Everything else is "how do we ke
 **Non-functional**
 - **Real-time** updates + reads (sub-ms); scale to **millions/billions** of players; highly available. **Eventual consistency** usually fine (rank lagging a moment is OK).
 
+### Non-Functional (NFRs)
+
+| NFR | Target / Note |
+| --- | --- |
+| **Consistency** | **Eventual** for the served rank (a 1–2s stale rank is fine — AP). **Strong/durable** for the score-of-truth in the DB (a scored point must never be lost — CP). See §15. |
+| **Latency** | Score update and rank/top-N read should feel instant — **sub-ms** in Redis (`O(log n)`). |
+| **Availability** | High for reads (top-N, my rank) — serve from replicas even if the primary blips. |
+| **Scale** | **Read-heavy** (everyone refreshes their rank) ≫ write-heavy; up to **100M+** players; spiky on events/tournaments. |
+| **Durability** | Every score change survives a Redis crash — the DB (+ `score_events`) is the truth, ZSET is rebuildable. |
+
 ### What "eventual consistency is fine" really means here
 
 For a bank balance, being off by even a moment is unacceptable. For a leaderboard, it's totally OK if your rank is a **second or two stale**.
@@ -105,13 +119,9 @@ one entry  ≈  userId (8 bytes) + score (8 bytes) + skip-list overhead  ≈  ~1
 
 1 GB fits comfortably in RAM on a single Redis node. That's why we can keep the *entire* live leaderboard in memory and answer every query in microseconds.
 
-#### Q: Reads are higher than writes — why does that matter?
+Reads being so much higher than writes matters because it tells us where to spend effort. Everyone constantly refreshes to check their rank (**reads**), far more often than they score (**writes**). So we optimize the read path hard: keep it in memory, **cache the top-N** (it barely changes), and add **read replicas** (copies of Redis that only serve reads). See §8.
 
-Because it tells us where to spend effort. Everyone constantly refreshes to check their rank (**reads**), far more often than they score (**writes**). So we optimize the read path hard: keep it in memory, **cache the top-N** (it barely changes), and add **read replicas** (copies of Redis that only serve reads). See §8.
-
-#### Q: When do these numbers force us to shard?
-
-Two triggers, and either one is enough:
+These numbers also tell us when to shard — two triggers, and either one is enough:
 
 - **Too big** — 100M+ players won't fit in one node's RAM → split across nodes.
 - **Too hot** — even if it fits, one node can't handle the *traffic* (updates + reads) → split the load.
@@ -143,9 +153,7 @@ This design keeps the same score in **two places on purpose**, each good at a di
 
 Redis is the fast serving copy that every read hits; the DB is the durable copy that survives restarts and is the source of truth if Redis is lost.
 
-#### Q: What does "write-behind" mean in this picture?
-
-When a player scores, we update the **fast** copy (Redis) immediately so everyone sees it, and we tell the **slow** copy (DB) to catch up **a moment later, in the background** — instead of making the player wait for the slow database.
+"Write-behind" is the name for exactly that pattern: when a player scores, we update the **fast** copy (Redis) immediately so everyone sees it, and we tell the **slow** copy (DB) to catch up **a moment later, in the background** — instead of making the player wait for the slow database.
 
 ```
 player scores → update Redis NOW (instant, visible)         ← what the user experiences
@@ -155,9 +163,7 @@ player scores → update Redis NOW (instant, visible)         ← what the user 
 
 This is safe precisely because a leaderboard tolerates being a moment behind (§2). We get **fast writes** *and* **durable truth** — the DB just lags slightly, which is fine.
 
-#### Q: What is "CQRS-ish" here in plain words?
-
-**CQRS = Command Query Responsibility Segregation** — a fancy way of saying "**use a different model for writing than for reading.**" Here: writes ultimately land in the DB (truth), but reads are served from Redis (a purpose-built *view* optimized for ranking). Same data, two shapes, each tuned for its job.
+In plain words, what's "CQRS-ish" mean here? **CQRS = Command Query Responsibility Segregation** — a fancy way of saying "**use a different model for writing than for reading.**" Here: writes ultimately land in the DB (truth), but reads are served from Redis (a purpose-built *view* optimized for ranking). Same data, two shapes, each tuned for its job.
 
 ---
 
@@ -199,6 +205,8 @@ In other words, the SQL approach recomputes the full ranking from scratch on eve
 ## 6. Redis Sorted Set (the core)
 
 A **sorted set (ZSET)** — backed by a **skip list + hash map** — keeps members ordered by score with `O(log n)` ops.
+
+> 💡 **tip** — jargon decoder for the `Z*` commands you'll say out loud: **ZSET** = Redis "sorted set" (`(member, score)` kept sorted automatically); **`ZINCRBY`** = "add N to a member's score" (atomic); **`ZREVRANK`** = "what position is this member, highest-first" (0-based). Say these by name in an interview — they signal you know the actual primitive, not just "use Redis."
 
 ```
 ZADD    leaderboard <score> <userId>        # add/update score          O(log n)
@@ -278,9 +286,7 @@ Because the set is already sorted, "grab the 11 people around position 45,212" i
 
 ### Q&A
 
-#### Q: Why a *sorted set* instead of a normal database or a sorted list?
-
-Because it's purpose-built for *exactly* our two operations and does both in `O(log n)`:
+Why a *sorted set* instead of a normal database or a sorted list? Because it's purpose-built for *exactly* our two operations and does both in `O(log n)`:
 
 | Operation | Plain DB / `ORDER BY` | Plain sorted array | **Redis ZSET** |
 | --- | --- | --- | --- |
@@ -290,18 +296,14 @@ Because it's purpose-built for *exactly* our two operations and does both in `O(
 
 A plain array is fast to *read* a rank but painfully slow to *update* (shift everything). A DB is fine to update one row but slow to rank. The ZSET is the rare structure that's fast at **both** — which is the whole point, since a leaderboard does both constantly.
 
-#### Q: What's this "skip list + hash map" under the hood?
-
-Redis stores a ZSET as **two structures working together**:
+Under the hood, what is this "skip list + hash map" combo? Redis stores a ZSET as **two structures working together**:
 
 - **Skip list** — keeps members in **sorted order**, so range/rank queries (top-N, "my rank", around-me) are `O(log n)`. Think of it as a sorted linked list with express lanes that let you jump ahead instead of stepping one-by-one.
 - **Hash map** — a plain `userId → score` lookup, so `ZSCORE` ("what's my score?") is instant `O(1)` without touching the sorted structure.
 
 You don't manage these — Redis keeps them in sync for you. You just call the `Z*` commands.
 
-#### Q: Rank is 0-based and highest-first — won't I show the wrong number?
-
-`ZREVRANK` returns `0` for the top player. Humans expect "#1". So the display layer does `humanRank = zrevrank + 1`. Also note **REV**: use `ZREVRANK`/`ZREVRANGE` for "highest score wins" (games), and the plain `ZRANK`/`ZRANGE` if lowest wins (e.g. fastest race time).
+One easy trap: rank is 0-based and highest-first, so won't the display show the wrong number? `ZREVRANK` returns `0` for the top player. Humans expect "#1". So the display layer does `humanRank = zrevrank + 1`. Also note **REV**: use `ZREVRANK`/`ZREVRANGE` for "highest score wins" (games), and the plain `ZRANK`/`ZRANGE` if lowest wins (e.g. fastest race time).
 
 #### Q: Is it really this simple? Where's the catch?
 
@@ -358,9 +360,7 @@ void rebuildLeaderboard() {
 }
 ```
 
-#### Q: What are AOF and RDB, and why do they matter if the DB is already truth?
-
-They're Redis's own **on-disk backups**, so it can recover *fast* without replaying the entire DB:
+Worth naming AOF and RDB directly, and why they matter even though the DB is already truth: they're Redis's own **on-disk backups**, so it can recover *fast* without replaying the entire DB:
 
 | | **RDB** (snapshot) | **AOF** (append-only file) |
 | --- | --- | --- |
@@ -385,6 +385,8 @@ That's why the score event is put on **Kafka** (a durable log) first, not just h
 | **Durability** | DB is truth; rebuild ZSET on cold start; AOF/RDB |
 | **Hot updates** | `ZINCRBY` atomic; batch write-behind |
 | **Read scale** | Redis replicas for read-heavy top-N; **cache top-N** (changes slowly) |
+
+> 💡 **tip** — **"approximate rank"** just means *"don't count every player above you exactly; estimate it from bucketed counts."* It's the single highest-signal phrase for the scale part of this interview — the top of the board stays exact (cheap merge), only the deep middle is approximated (where nobody can tell #45,207 from #45,213).
 
 **Approximate global rank (the key large-scale trick):**
 ```
@@ -481,12 +483,16 @@ This estimates rank from a handful of bucket totals instead of comparing against
 
 Rarely. The person at rank #45,213 does **not** care if the true number is #45,207 — it's meaningless precision. And the places where precision *does* matter — the **top of the board** — stay **exact**, because top-N is a cheap exact merge. So: exact where humans care (the top), approximate where they don't (the deep middle). Best of both.
 
-#### Q: Why cache the top-N and use read replicas?
-
-Two cheap, high-impact read optimizations:
+It's also worth caching the top-N and adding read replicas — two cheap, high-impact read optimizations:
 
 - **Cache top-N** — the top 10 changes *slowly* (the same champions sit there for a while), but *everyone* loads it. Cache it with a short TTL so you're not recomputing the same list for millions of viewers.
 - **Read replicas** — extra copies of Redis that only answer reads. Since reads vastly outnumber writes (§3), spread the read load across replicas while the primary handles updates.
+
+#### Q: Global, friends, or regional leaderboards — and is "rank" even the right metric?
+
+These are different products, so clarify which one up front. **Global** is the one giant ZSET we've been discussing. **Regional** is just *sharding by region* (§8) — one ZSET per region (`lb:region:in`), and "my regional rank" is a single-shard query, so it's actually *easier* than global rank. **Friends** is the odd one out: a friend leaderboard is tiny (tens of members) and *personalized per user*, so you don't keep a ZSET for it — you fetch each friend's score with `ZSCORE` (or `ZMSCORE`) from the global board and sort the small list in the app. Don't try to precompute a ZSET per friend-graph; there are too many overlapping sets.
+
+On the metric itself: **absolute rank** ("#45,213") is what `ZREVRANK` gives, but at scale a **percentile** ("top 5%") is often more meaningful and *much cheaper* — "top 5%" only needs `my_rank / total_count`, and both can be approximate. If the product shows "you're in the top 5%," you can serve it straight from the **bucket histogram** (§17) without ever computing an exact position. So: exact rank at the top, absolute-ish rank in the middle, and percentile/bucket badges for the long tail.
 
 ---
 
@@ -524,17 +530,26 @@ void onScore(String userId, long delta) {
 }
 ```
 
-#### Q: How do old daily boards get cleaned up — do we run a delete job?
+No cron job cleans up old daily boards — that's the beauty of **TTL** (time-to-live). When you create today's board, you tell Redis "delete this automatically after N days." Once nobody needs `lb:daily:2026-07-01` anymore, Redis **evicts it on its own**. Yesterday's boards quietly disappear; you never write cleanup code.
 
-No cron job needed — that's the beauty of **TTL** (time-to-live). When you create today's board, you tell Redis "delete this automatically after N days." Once nobody needs `lb:daily:2026-07-01` anymore, Redis **evicts it on its own**. Yesterday's boards quietly disappear; you never write cleanup code.
-
-#### Q: Why separate boards instead of filtering one big board by time?
-
-Because a sorted set only knows **(member, score)** — it has no notion of "when." To answer "today's top 10," a single board would have to store per-player timestamps and filter, which sorted sets can't do efficiently. Separate per-window boards keep each one a clean, fast, already-sorted list. The small cost — a few extra `ZINCRBY`s per score — is trivial.
+Why separate boards at all, instead of filtering one big board by time? Because a sorted set only knows **(member, score)** — it has no notion of "when." To answer "today's top 10," a single board would have to store per-player timestamps and filter, which sorted sets can't do efficiently. Separate per-window boards keep each one a clean, fast, already-sorted list. The small cost — a few extra `ZINCRBY`s per score — is trivial.
 
 ---
 
 ## 10. Data Model
+
+### Database & storage choices (which DB, and why at scale)
+
+No single store is best for every job here, so we use **polyglot persistence**: a purpose-built ranking structure for the hot path, and a plain durable DB behind it for truth. The deciding question is *"does this need to answer 'how many are ahead of me?' fast, or does it just need to never lose data?"* — those are different jobs, and §5 already showed a relational engine fails badly at the first one.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Live ranking (top-N, my rank, players around me) | **Redis Sorted Set** (skip list + hash map) | `ZADD`/`ZINCRBY`/`ZREVRANK`/`ZREVRANGE` are all **O(log n)** — it's a ranking-native structure that keeps members sorted automatically, so "my rank" is a position lookup, not a count. | A relational `SELECT COUNT(*)+1 WHERE score > mine` is **O(n)** per query (§5) — every rank check touches a huge, ever-changing chunk of rows. Fine at 100 players, hopeless at millions asking constantly. |
+| Durable score of truth | **RDBMS** (`scores` table), updated via write-behind | Survives a Redis crash/restart with zero data loss; the ZSET is rebuilt from this table on cold start. ACID semantics if a score change ever needs to be tied to other transactional data. | Redis alone loses everything on a crash (it's RAM) — acceptable for a *disposable* serving copy, not for the one place that must never lose a point. |
+| Score-change audit/replay | **RDBMS**, append-only (`score_events`) | Lets you recompute or roll back a score by replaying its history — the only way to catch cheating or fix a bug after the fact (§10). | Keeping only the current total (no log) answers "what's my score" but can never answer "how did I get here," and gives you no path to undo a bad write. |
+| Approximate global rank at huge scale | **In-memory score-bucket histogram** (its own small structure, not a DB) | `O(#buckets)` estimate — sum the counts of higher buckets + your exact position within your own — instead of an exact cross-shard count (§8). | An *exact* global rank across shards means asking every shard "how many of yours beat my score?" on every query — too costly to do for every rank check at scale. |
+
+**Why a sorted set beats SQL `ORDER BY` at scale — the throughput vs. correctness trade-off:** correctness here is cheap (`ZINCRBY` is atomic, single-threaded, no lost updates — §7) so the whole design budget goes into throughput: keep everything sorted **all the time** so a query never recomputes order from scratch. When one Redis node isn't big or fast enough, the natural **shard key is the score itself** (score-range/band sharding, §8) rather than `userId` — because bands are already ordered relative to each other, only your own band needs an exact rank, and the bands above/below are trivially "ahead of" or "behind" you with zero cross-shard comparison. The one genuinely hot key — the current #1 player everyone's watching — is absorbed by caching the top-N response and read replicas, not by further sharding (§8). (See [Databases — Deep Dive](../concepts/databases-deep-dive.md) for Redis sorted-set internals + cluster routing.)
 
 ```sql
 -- Durable backing store (source of truth)
@@ -550,6 +565,16 @@ CREATE TABLE score_events ( event_id BIGINT PRIMARY KEY, user_id BIGINT, delta B
 
 > **Stores to consider:** scores (durable), score_events (audit/rebuild), Redis ZSETs per window/region, score histogram (approx rank), cached top-N. Redis ZSET = serving; DB = truth.
 
+### Indexes that matter
+
+The DB is off the hot read path (Redis serves ranks), so its indexes are tuned for the **two DB workloads**: point lookups by user, and **bulk rebuild** of the ZSET.
+
+- `scores (user_id)` **PRIMARY KEY** — the durable current score; O(1) upsert on the write-behind path and per-user lookup.
+- `scores (updated_at)` — powers **incremental rebuild** ("re-ZADD only rows changed since the last checkpoint") and warm reload after a Redis blip, so you don't stream all 100M rows every time.
+- `score_events (user_id, at)` — the audit/replay path: fetch one player's history in time order to recompute or roll back a score (cheat investigation, §16). A plain PK on `event_id` can't answer "Alice's changes, oldest→newest" efficiently.
+
+> 💡 **tip** — none of these serve `top-N` / `my rank` — those never hit the DB. If an interviewer asks for a rank *index* on the SQL side, that's the trap from §5: a B-tree on `score` still makes "how many above me" an O(n) count. The index budget here is for **rebuild and audit**, not ranking.
+
 ### What each store is for
 
 Two SQL tables plus the Redis structures — each earns its place:
@@ -562,9 +587,7 @@ Two SQL tables plus the Redis structures — each earns its place:
 | **score histogram** | counts per score bucket | Powers **approximate global rank** at scale (§8) |
 | **cached top-N** | the current top 10 list | Serve the most-viewed query without recomputing |
 
-#### Q: Why keep BOTH a `scores` table (current) and a `score_events` log (history)?
-
-They answer different questions:
+Why keep BOTH a `scores` table (current) and a `score_events` log (history)? They answer different questions:
 
 - **`scores`** answers *"what is Alice's score right now?"* — one row, always current. Fast to read, easy to rebuild Redis from.
 - **`score_events`** answers *"how did Alice get here?"* — every +10, +300, etc. This is your safety net: if you suspect cheating or a bug, you can **replay the events** to recompute the true score, or roll back a bad one.
@@ -648,9 +671,7 @@ Follow a single "+300" from Alice, step by step:
 
 The key thing to notice: **step 2 is all the user waits for.** Everything durable (steps 3–4) happens *after* the response, in the background. That's why updates feel instant even though the durable DB is slower.
 
-#### Q: In cold start, why rebuild from the `scores` table and not replay every event?
-
-Because `scores` already holds each player's **final** number — one `ZADD` per user and you're done. Replaying `score_events` would mean re-applying millions of individual `+10`/`+300` changes to arrive at the same totals — far slower. You only replay events for **auditing or recovering from a bug**, not for routine restarts. (AOF/RDB is faster still, and is the first line of recovery.)
+In cold start, why rebuild from the `scores` table rather than replay every event? Because `scores` already holds each player's **final** number — one `ZADD` per user and you're done. Replaying `score_events` would mean re-applying millions of individual `+10`/`+300` changes to arrive at the same totals — far slower. You only replay events for **auditing or recovering from a bug**, not for routine restarts. (AOF/RDB is faster still, and is the first line of recovery.)
 
 ---
 
@@ -684,23 +705,145 @@ long compositeScore(long points, long timestampMs) {
 
 Now two players at 800 points are separated by *when* they hit 800 — deterministic and fair, still a single `ZADD`/`ZREVRANK`, no extra queries. The packed timestamp is just a tiebreaker so equal-point players still get a stable, fair order.
 
+> ⚠️ **pitfall** — **Redis ZSET scores are IEEE-754 doubles**, so only integers up to **2^53 (~9×10¹⁵)** are represented *exactly*. The naive composite `points * 1_000_000_000 + timestampMs` blows past 2^53 almost immediately (a 6-digit score × 10⁹ + a 13-digit epoch-ms already overflows), and beyond 2^53 Redis silently **rounds** — so two "different" composite scores can collapse to the *same* double and your tie-break (or even the ranking) becomes wrong. This is a classic interview trap. Safe encodings, pick one:
+>
+> ```java
+> // Option A — keep the composite WITHIN 2^53 by bounding each field's bits.
+> // e.g. 40 bits of points (~1.1e12 max) | 13 bits of inverted "seconds since epoch offset"
+> //   40 + 13 = 53 bits total → always exact. Use seconds (not ms) and a bounded range.
+> long safeComposite(long points, long tsSeconds) {
+>     long invTime = (1L << 13) - 1 - (tsSeconds % (1L << 13));  // 13-bit tiebreak
+>     return (points << 13) | invTime;                           // stays < 2^53
+> }
+>
+> // Option B (preferred, no bit-budget math) — score = points only,
+> // break ties in the MEMBER string, which has no float limit:
+> //   member = "<invertedTimestamp>:<userId>"  → lexicographic tie-break, exact forever.
+> ZADD game:leaderboard <points> "<invTs>:alice"
+> ```
+>
+> Rule of thumb: if your tiebreak needs full millisecond (or nanosecond) precision, **put it in the member, not the score** — the score stays a clean integer well under 2^53.
+
 ### Q&A on the other edge cases
 
-#### Q: A player is cheating / a score was wrong — can we roll it back?
-
-Yes — that's what the **`score_events` audit log** is for (§10). Because every change is recorded, you can subtract a fraudulent gain, or recompute a player's true score by replaying their legitimate events. Anomaly detection can flag suspicious jumps ("+1,000,000 in one second") for review.
+If a player is cheating or a score was wrong, rolling it back is exactly what the **`score_events` audit log** is for (§10). Because every change is recorded, you can subtract a fraudulent gain, or recompute a player's true score by replaying their legitimate events. Anomaly detection can flag suspicious jumps ("+1,000,000 in one second") for review.
 
 #### Q: What if someone reads their rank *during* an update?
 
 They might see a rank that's a heartbeat stale — and that's **fine** (§2). The number corrects itself within moments. We deliberately chose eventual consistency here because a perfectly-synchronized rank isn't worth the performance cost for a leaderboard.
 
-#### Q: What happens exactly at midnight when the daily board rolls over?
-
-Nothing dramatic — the key name simply changes (`lb:daily:2026-07-08` → `lb:daily:2026-07-09`). New scores flow into the new day's board; the old one keeps its final standings until its **TTL** expires and Redis deletes it (§9). Writes always target *all currently active windows*, so nothing is dropped during the switch.
+And exactly at midnight, when the daily board rolls over? Nothing dramatic — the key name simply changes (`lb:daily:2026-07-08` → `lb:daily:2026-07-09`). New scores flow into the new day's board; the old one keeps its final standings until its **TTL** expires and Redis deletes it (§9). Writes always target *all currently active windows*, so nothing is dropped during the switch.
 
 ---
 
-## 14. Design Patterns (that can be used)
+## 14. Interview Cheat Sheet
+
+> **"How do you get 'my rank' fast?"**
+> "A **Redis sorted set** (skip list) — `ZREVRANK` gives rank in `O(log n)`, `ZREVRANGE` gives top-N and 'players around me', `ZSCORE` is O(1). A relational `COUNT(*) WHERE score > mine` is O(n) per query and doesn't scale."
+
+> **"How is it durable?"**
+> "Redis is the serving layer with **write-behind** to the DB (source of truth); `ZINCRBY` is atomic. On cold start, rebuild the ZSET from the `scores` table; Redis AOF/RDB speeds recovery."
+
+> **"How do you scale to hundreds of millions of players?"**
+> "**Shard** leaderboards by region/game/score-band and merge top-N. Exact global rank across shards is expensive → use **approximate rank via a score-bucket histogram** (count higher buckets + position within your bucket). Cache top-N and use read replicas."
+
+> **"Ties / windows?"**
+> "Ties: order by score then member, or pack a timestamp into the score. Windows: separate ZSETs per day/week with TTL; a score update increments all active windows."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Composite tie-break score overflows float64** | ZSET scores are doubles (exact only < 2^53). Bound the composite's bits, or put the tiebreak in the **member string** — never blindly `points*1e9 + ms` (§13). |
+| **Client sends a huge `+1,000,000` delta** | Never trust the client delta. Server validates the *event* against authority, computes the delta itself, then `ZINCRBY` (§16). |
+| **Exact global rank across shards** | Too costly per query — estimate with a **bucket histogram** (higher-bucket counts + exact within your bucket); top-N stays an exact merge (§8). |
+| **One superstar player hammered on a single shard** | Hot *read* key → **cache their card + top-N** and serve from read replicas; sharding doesn't help a single hot member (§17). |
+| **Redis dies / cold start at 100M rows** | Rebuild from `scores` (one `ZADD`/user, not event replay); AOF/RDB reloads faster; use `scores(updated_at)` for **incremental** catch-up (§7, §17). |
+| **"Top 5%" instead of a rank number** | Serve a **percentile** from `my_rank / total` or the histogram — cheaper and often more meaningful than an absolute rank (§8). |
+| **Reader sees a rank mid-update** | Fine — eventual consistency; a 1–2s stale rank self-corrects (§15). |
+
+---
+
+## 15. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" For a leaderboard the answer is a clean **split by data**.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Served rank / top-N / around-me** (Redis) | **AP** (eventual) | A rank that's **1–2s stale is fine** — nobody notices #480 vs #482 for a heartbeat. Keep serving reads from replicas even if the primary blips; availability > perfect freshness. |
+| **Score-of-truth** (`scores` + `score_events` in the DB) | **CP** (durable/strong) | A scored point must **never be lost or double-counted**. Write-behind is async, but the durable write itself is atomic and authoritative. |
+| **Cross-window / cross-region aggregation** | **Eventual** | Merging shards or regions lags slightly; that's acceptable for a global view. |
+
+- The ZSET is a **disposable, fast view**; if it's briefly behind the DB (or a replica lags the primary), the number self-heals — that's the *gift* of §2 that makes write-behind (§7) safe.
+- The DB row is the **serializable source of truth**: rebuild the ZSET from it on cold start, and reconcile from `score_events` if you ever suspect drift.
+
+> One-liner: **"Eventual consistency on the rank you *show*, strong durability on the score you *store*."**
+
+---
+
+## 16. Anti-cheat / Trusted Writes
+
+> ⚠️ **pitfall** — the #1 leaderboard security bug: the client `POST`s a **delta** and the server blindly `ZINCRBY`s it. Then anyone with the API can send `{ delta: 1_000_000_000 }` and top the board. **Never trust a client-supplied score or delta.**
+
+The fix is to make the **server the authority** on how many points an action is worth. The client reports *what happened* (an event); the server *decides* the delta:
+
+```java
+// ❌ WRONG — client dictates the score change
+void addScore(String userId, long delta) {       // delta came straight from the client
+    redis.zincrby("game:leaderboard", delta, userId);   // trivially cheatable
+}
+
+// ✅ RIGHT — client reports an EVENT; server validates + prices it
+void onGameEvent(String userId, GameEvent ev) {
+    if (!auth.isSessionValid(userId, ev.matchId())) reject("bad session");
+    if (!validator.isPlausible(userId, ev)) reject("impossible event");   // rate/anomaly checks
+    long delta = scoring.pointsFor(ev);           // SERVER decides the value, not the client
+    redis.zincrby("game:leaderboard", delta, userId);
+    kafka.send("score_events", new ScoreEvent(userId, ev, delta));        // audit trail
+}
+```
+
+Layers that make writes trustworthy:
+
+- **Authenticate + authorize** the event (valid session, the user actually played that match).
+- **Server-side scoring** — the delta is computed from the validated event, so the client can never inflate it.
+- **Plausibility / rate limits** — reject "impossible" jumps (finished a level in 0.1s, +1M in one second); flag suspicious patterns for review.
+- **Audit + replay** — every applied delta lands in `score_events` (§10), so a fraudulent gain can be **subtracted** or a true score **recomputed** by replaying only legitimate events.
+- **Idempotency** — dedupe by `(matchId, eventId)` so a retried event isn't counted twice.
+
+> 💡 **tip** — say it in one line: *"The client sends an authenticated **event**, the server **validates and prices** it, then `ZINCRBY`s the server-computed delta — and every change is logged for rollback."* This turns a naive `POST /scores {delta}` into a defensible design.
+
+---
+
+## 17. Advanced Scale & Cross-Region Topics
+
+Short, high-signal follow-ups that separate a solid answer from a great one.
+
+- **Percentile / bucket rank at the long tail (t-digest / histogram).** For "top 5%" or "you beat 92% of players," an exact position is wasteful. Keep a **score histogram** (or a **t-digest** for smooth quantiles): rank ≈ Σ counts of higher buckets, and percentile = that over the total. `O(#buckets)` regardless of player count — the same structure behind approximate global rank (§8).
+- **Cross-region / multi-DC Redis.** Players in different regions hit their **local** Redis (low latency); each region owns a regional ZSET. A **global** board is built by periodically merging regional top-Ns + a merged histogram — the global view is **eventually consistent** (§15). Don't try to keep one synchronously-replicated global ZSET across DCs; the write latency and conflict cost aren't worth it for a board that tolerates staleness.
+- **Hot user on a single shard.** A superstar everyone watches is a hot **read** key, not a write-scaling problem — sharding by score/user doesn't help a *single* member. Absorb it by **caching that player's card and the top-N** (short TTL) and serving from **read replicas**, exactly like the top-N cache (§8).
+- **Rebuild-time SLA at 100M rows.** A full cold-start `ZADD` of 100M members is minutes, not seconds. Bound it with: **AOF/RDB** reload first (fastest path, §7); **incremental rebuild** using `scores(updated_at)` so you only re-add what changed since the last checkpoint (§10); **parallel/pipelined `ZADD`** across shards; and serving stale-but-up read replicas while the primary warms. State the SLA explicitly ("board readable within N minutes of total Redis loss, seconds for a single-node restart").
+
+---
+
+## 18. How to Drive the Interview (framework)
+
+> Use this progression so you never freeze — each step is motivated by why the previous one breaks. Spend ~5 min framing (1–3), then go deep on the ranking engine.
+
+1. **Clarify requirements + NFRs** — global vs friends vs regional? absolute rank vs percentile? real-time? (§2, §8)
+2. **Estimate scale** — read-heavy ≫ writes; does it fit in RAM? when to shard? (§3)
+3. **Start naive on purpose: SQL `COUNT(*) WHERE score > mine`** — show you know it's O(n) per query and melts at millions. This motivates everything after. (§5)
+4. **Introduce the ZSET** — skip list + hash map; `ZINCRBY` / `ZREVRANK` / `ZREVRANGE` all `O(log n)`; "my rank" becomes a position lookup, not a count. (§6)
+5. **Make it durable** — Redis serves, DB is truth (write-behind), atomic `ZINCRBY`, rebuild on cold start. (§7)
+6. **Scale out: shard** — by score-band (ordered → easy global rank) or hash; merge top-N. (§8)
+7. **Approximate rank** — exact top-N, histogram-estimated deep middle; percentiles for the tail. (§8, §17)
+8. **Address the sharp edges** — ties + float precision (§13), anti-cheat trusted writes (§16), consistency split (§15), cross-region + rebuild SLA (§17).
+
+> 🎤 **Lead with the crux:** "Ranking is an ordered-set problem, not a relational one — so the heart is a Redis sorted set, and the interesting part is scaling and approximating rank." Then walk the progression above.
+
+---
+
+## 19. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -715,29 +858,16 @@ Nothing dramatic — the key name simply changes (`lb:daily:2026-07-08` → `lb:
 
 ---
 
-## 15. Interview Cheat Sheet
-
-> **"How do you get 'my rank' fast?"**
-> "A **Redis sorted set** (skip list) — `ZREVRANK` gives rank in `O(log n)`, `ZREVRANGE` gives top-N and 'players around me', `ZSCORE` is O(1). A relational `COUNT(*) WHERE score > mine` is O(n) per query and doesn't scale."
-
-> **"How is it durable?"**
-> "Redis is the serving layer with **write-behind** to the DB (source of truth); `ZINCRBY` is atomic. On cold start, rebuild the ZSET from the `scores` table; Redis AOF/RDB speeds recovery."
-
-> **"How do you scale to hundreds of millions of players?"**
-> "**Shard** leaderboards by region/game/score-band and merge top-N. Exact global rank across shards is expensive → use **approximate rank via a score-bucket histogram** (count higher buckets + position within your bucket). Cache top-N and use read replicas."
-
-> **"Ties / windows?"**
-> "Ties: order by score then member, or pack a timestamp into the score. Windows: separate ZSETs per day/week with TTL; a score update increments all active windows."
-
----
-
-## 16. Final Takeaways
+## 20. Final Takeaways
 
 - Ranking is an **ordered-set** problem → **Redis sorted set** (`ZADD`/`ZINCRBY`/`ZREVRANK`/`ZREVRANGE`), all `O(log n)`.
 - The relational `COUNT` approach is O(n) per query — doesn't scale.
 - **Redis serves, DB is truth** (write-behind, atomic ZINCRBY); rebuild ZSET on cold start.
 - **Shard** by region/score-band + **approximate rank** (bucket histogram) at massive scale; cache top-N.
 - **Time-windowed** boards = per-window ZSETs with TTL.
+- **Consistency split:** eventual on the rank you *show* (AP), durable on the score you *store* (CP).
+- **Trusted writes:** never trust a client delta — validate the event server-side, then `ZINCRBY`; log every change for rollback.
+- Watch the **float64 (2^53)** limit on composite tie-break scores; put fine-grained tiebreaks in the member.
 - Patterns: Sorted Set, Write-Behind, Strategy, Sharding, CQRS/Materialized View, Cache-Aside.
 
 ### Related notes

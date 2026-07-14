@@ -20,9 +20,14 @@
 - [10. Data Model](#10-data-model)
 - [11. Sequences](#11-sequences)
 - [12. Consistency & Failure](#12-consistency--failure)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
-- [15. Final Takeaways](#15-final-takeaways)
+- [13. Interview Cheat Sheet](#13-interview-cheat-sheet)
+- [14. API Design](#14-api-design)
+- [15. Consistency & CAP Tradeoffs](#15-consistency--cap-tradeoffs)
+- [16. Reliability & Observability](#16-reliability--observability)
+- [17. Click Attribution & Conversion Funnel](#17-click-attribution--conversion-funnel)
+- [18. How to Drive the Interview (framework)](#18-how-to-drive-the-interview-framework)
+- [19. Design Patterns (that can be used)](#19-design-patterns-that-can-be-used)
+- [20. Final Takeaways](#20-final-takeaways)
 
 ---
 
@@ -182,10 +187,7 @@ Clicks ─► API ─► Kafka (log) ───────┼─ Lane B (ad 456)
                                     └─ Lane C (ad 789) ─► Counter 3 ─┘
 ```
 
-#### Q: Are counting machines just Kafka consumers in a loop? What triggers the write?
-
-- **Yes** — a counting machine = a Kafka consumer running in a loop.
-- **The write is triggered by TIME, not by hitting a count.** The consumer groups clicks by *which minute they belong to*. When the clock rolls past 2:05 (minute "done"), it writes "ad 123, 2:05, 50,000" — whether that's 50,000 or 3 or 2M. Count = whatever it happened to be; **time** triggers the write. (This "group by minute" = **windowing**, see §6.)
+Yes — a counting machine is literally just a Kafka consumer running in a loop. What's worth calling out is *when* it writes: the write is triggered by **time, not by hitting some count**. The consumer groups clicks by *which minute they belong to*. When the clock rolls past 2:05 (minute "done"), it writes "ad 123, 2:05, 50,000" — whether that's 50,000 or 3 or 2M. Count = whatever it happened to be; **time** triggers the write. (This "group by minute" = **windowing**, see §6.)
 
 #### Q: Won't different instances each write their own row for the same ad at 2:05?
 
@@ -367,16 +369,16 @@ aggregate: count(clicks), unique_users (HyperLogLog), sum(revenue)
 → emit rollup per window → upsert into OLAP store
 ```
 
+> 💡 **First jargon — window.** A **window** is just a *time bucket* we add clicks into. **Tumbling** = back-to-back buckets that never overlap (a click lands in exactly one). **Sliding** = overlapping buckets, so one click can be counted in several. **Session** = a bucket that grows while a user keeps clicking and closes after a gap of silence. Deep dive below.
+
 - **Event time vs processing time:** aggregate by **event time** (when the click happened, from the event's timestamp), not arrival time — else late events land in the wrong bucket.
-- **Watermarks:** track "we've probably seen all events up to time T" → know when to **close/emit** a window.
-- **HyperLogLog** for cheap approximate unique counts (distinct users) without storing every id.
+- **Watermarks:** track "we've probably seen all events up to time T" → know when to **close/emit** a window. (💡 First jargon — **watermark**: a moving "we're confident everything older than this has arrived" marker; full mechanics in §7.)
+- **HyperLogLog (HLL):** cheap *approximate* unique counts (distinct users) without storing every id. (💡 First jargon — a **sketch**: a tiny fixed-size summary that answers "how many distinct?" with a small error instead of a giant exact id set. See the Q below.)
 - **Roll up** minute → hour → day for cheaper long-range queries.
 
 ### Counters, not event lists
 
-#### Q: Are the 50k (or millions of) events held in memory as an ArrayList?
-
-**No — the most important optimization.** We do **not** keep events. We keep only a **running count**.
+A natural question when picturing "50,000 clicks in memory": are those 50k (or millions of) events held as an `ArrayList`? **No — and this is the most important optimization in the whole design.** We do **not** keep events. We keep only a **running count**.
 
 ```
 click for ad 123 arrives → counter[123] = counter[123] + 1 → THROW AWAY the click
@@ -394,9 +396,7 @@ In memory is a tiny **map (dictionary)**, not an ArrayList of events:
 
 Each entry = **one integer**. 50,000 clicks or 50 million clicks for one ad = still one integer. **Memory scales with the number of ads/combos, NOT the number of clicks.** When the minute closes, write out the handful of counters and clear them.
 
-#### Q: If we only keep a counter, how do we know which click is from which country?
-
-The country becomes **part of the key**. We don't keep one counter per ad — we keep one per **combination** we care about:
+If we only keep a single counter, how do we know which click came from which country? The country becomes **part of the key**. We don't keep one counter per ad — we keep one per **combination** we care about:
 
 ```
 key = (ad_id, minute, country)
@@ -412,9 +412,7 @@ key = (ad_id, minute, country)
 
 A click bumps the **matching** counter. "Clicks from India?" → read the India bucket. "Total?" → sum India+US+UK = 50,000. Still no individual events stored, just finer-grained counters. (The country/campaign fields were added at ingestion — see §5 "enrich".)
 
-#### Q: So `(ad_id, minute, country, campaign, ...)` creates a row per combo?
-
-**Yes — one row per unique combination.**
+Push this further and `(ad_id, minute, country, campaign, ...)` creates **one row per unique combination** that actually occurred:
 
 ```
 ad_id | minute | country | campaign | clicks
@@ -524,6 +522,40 @@ long minute = System.currentTimeMillis() / 60_000;
 
 Event time keeps history accurate — and creates the puzzle: *if a 2:05 click can arrive at 2:08, when is it safe to declare 2:05 done?* → **watermarks** (§7).
 
+### Tumbling vs sliding vs session (deep dive)
+
+All three chop the never-ending click stream into buckets; they differ in **whether buckets overlap** and **what closes them**.
+
+```
+TUMBLING (2-min):  |__2:00–2:02__||__2:02–2:04__||__2:04–2:06__|     ← back-to-back, no overlap
+SLIDING  (5-min,   |___2:00–2:05___|
+          step 1):     |___2:01–2:06___|
+                           |___2:02–2:07___|                        ← overlapping, one click ∈ many
+SESSION:           |click click click|·····gap·····|click click|    ← closes after inactivity
+```
+
+| Property | **Tumbling** | **Sliding** | **Session** |
+| --- | --- | --- | --- |
+| Buckets overlap? | No | **Yes** | No (activity-defined) |
+| A click counted in… | exactly 1 window | **N windows** (size ÷ step) | 1 session |
+| State/memory | 1 open window per key | **N open windows per key** (size ÷ step) | 1 per active key, unbounded gap timers |
+| Closed by | clock crossing the boundary | clock advancing the slide step | a **gap of silence** (e.g. 30 min idle) |
+| Best for | per-minute/hour counts, **billing** | **smooth "last-N-min" trend lines** on dashboards | user-journey analytics (a browsing session) |
+
+- **Tumbling** is the default for counting and billing: every click belongs to exactly one bucket, so `sum(buckets)` = total, with no double counting. This is the window used everywhere else in this doc.
+- **Sliding** answers *"how many clicks in the **last** 5 minutes, refreshed every minute?"* — a moving average that doesn't reset to zero on a boundary. The cost: each click falls into **multiple** overlapping windows, so the processor holds **several open windows per key at once** (size ÷ step = 5 windows for a 5-min/1-min slide) → more state and more emits.
+- **Session** has no fixed size; it grows while a user keeps clicking and closes after an inactivity **gap**. Great for "clicks per browsing session," irrelevant for per-minute ad counts.
+
+> ⚠️ **Pitfall — don't bill off a sliding window.** Overlapping windows count the same click multiple times *by design*. Summing sliding windows over-counts; use **tumbling** (disjoint) for anything that feeds money.
+
+#### Q: When does Nike want a sliding window instead of tumbling?
+
+When Nike's team is watching a **live campaign trend** and a tumbling minute-count looks jumpy. A tumbling per-minute chart resets to 0 every minute, so a burst that straddles 2:04:59–2:05:01 gets split across two bars and the line flickers. A **sliding** "clicks in the last 5 minutes, updated every minute" gives a **smooth moving line** that reacts quickly without the sawtooth — perfect for "is my ad heating up right now?" So: **tumbling for the invoice** (exact, disjoint, per-minute rollups), **sliding for the dashboard trend** (smooth, overlapping, last-N-minutes). The difference in cost is state: sliding keeps *size ÷ step* windows open per key simultaneously, so it uses more memory and emits more often than tumbling's single open window.
+
+#### Q: HyperLogLog counts uniques with an *error* — how is that ever OK?
+
+For "unique users who clicked," storing every `user_id` in a set is enormous (billions of ids). **HyperLogLog** is a tiny fixed-size **sketch** (a few KB) that estimates the distinct count from the *pattern of hash values* it has seen, with a small, tunable error — typically **±1–2%**. That's completely fine for a dashboard tile that says "≈ 2.0M unique users this hour": nobody makes a decision differently at 2.00M vs 2.02M, and you saved gigabytes of memory. The catch: **HLL is approximate, so it never touches billing.** Money needs an **exact** `COUNT(DISTINCT click_id)`, which the nightly batch computes over the raw S3 log (§9). Rule of thumb: **approximate (HLL) for freshness on dashboards; exact for the invoice.** It's the same fast-approx-now / slow-exact-later split that runs through the whole design.
+
 ---
 
 ## 7. Exactly-Once, Dedup & Late Events
@@ -539,6 +571,8 @@ Billing can't over/under-count.
 | **Fraud/bots**                                      | Filtering stage (rate limits, ML) **before** counting                                                                                |
 | **Reprocessing**                                    | Raw events in S3 → **replay** to rebuild aggregates if logic changes / a bug is found                                                |
 
+
+> 💡 **First jargon — checkpoint & 2PC sink.** A **checkpoint** is a periodic snapshot of the processor's in-memory counts *bundled with the exact Kafka offset* it had read to, so a crash can resume without losing or re-counting (deep dive below). A **two-phase-commit (2PC) sink** makes the *output* write and the offset commit succeed-or-fail together, so the DB never gets a half-written result. Together they give **exactly-once**.
 
 ### Watermarks & late events
 
@@ -1011,6 +1045,20 @@ clicks → ingest (enrich, fraud) → Kafka → stream aggregator → OLAP → d
 
 ## 10. Data Model
 
+### Database & storage choices (which DB, and why at scale)
+
+No single store handles the firehose, the counting, *and* the analytics well, so this is a textbook case for **polyglot persistence**. The deciding question at each stage is *"am I appending a firehose, holding hot compute state, or answering a GROUP BY/SUM over billions of rows?"* — each answer points to a different storage engine.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Raw click firehose (ingest) | **Kafka**, partitioned by `ad_id` | An append-only log absorbs millions of writes/sec with no locking, buffers bursts, and lets the stream processor replay if it crashes or falls behind (§4). | Writing every click as a row-store RDBMS `INSERT`/`UPDATE` can't sustain 115k+/sec, and updating one `count` column per ad turns a viral ad into a single hot-row lock contention nightmare (§1). |
+| Stream-processor working state (dedup ids, open-window counters) | **Embedded keyed state store** (RocksDB, inside Flink) | Lives right next to the compute — no network hop per event — and is checkpointed alongside the Kafka offset for exactly-once (§7). | A remote DB for this state would add network latency to *every single event*, becoming the bottleneck the whole pipeline is designed to avoid. |
+| Pre-aggregated rollups (dashboards, ad-hoc analytics) | **OLAP / columnar store** (Druid / ClickHouse / BigQuery) | Columnar layout means "SUM clicks GROUP BY ad, hour" reads only the `clicks` column across billions of rows — sub-second (§10 sidebar). | A row-store RDBMS (Postgres) has to walk full rows to compute the same aggregate — great for "fetch this one row," bad for "summarize a billion of them." |
+| Billing source of truth (exact totals) | **RDBMS**, fed by nightly batch reconciliation from S3 | Billing needs an **exact** `COUNT(DISTINCT click_id)` and transactional overwrite semantics for money — a one-time batch write, not a hot path. | The streaming OLAP numbers are approximate on purpose (HyperLogLog, salted partials, allowed-lateness cutoffs) — fine for a live dashboard, not provably correct for an invoice (§9). |
+| Raw event archive (ground truth, replay) | **S3 / data lake** | Cheap, permanent, and replayable — the batch reconciliation job and any bug-fix reprocessing both read from here (Event Sourcing, §9). | Kafka retention is bounded and comparatively costly for "keep every click forever" — S3 is built for exactly that at a fraction of the cost. |
+
+**Why columnar OLAP wins the aggregate-serving fight, and why NOT a row-store for the click firehose:** the throughput vs. correctness trade-off here splits cleanly by stage. The firehose (Kafka) optimizes for *raw append throughput* — correctness (exactly-once, dedup) is handled downstream, not by the log itself. The OLAP store optimizes for *read throughput on summaries* — it's fed by upserts keyed on `(ad_id, window_start, granularity)` (the natural partition/shard key), so a query for "ad 123's clicks this hour" touches a tiny, columnar-compressed slice instead of scanning raw events. Hot ads are handled *before* they ever reach the store, via key salting (§8) — the storage layer never sees a single-row bottleneck the way a row-store `UPDATE count=count+1` would. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md) for the full OLTP-vs-OLAP and row-vs-column comparison.)
+
 ```sql
 -- Aggregates (served to dashboards/billing) — OLAP store
 CREATE TABLE click_aggregates (
@@ -1082,25 +1130,7 @@ Nightly batch over S3 raw events → recompute exact per-ad totals → compare w
 
 ---
 
-## 13. Design Patterns (that can be used)
-
-
-| Pattern                                 | Where                                             | Why                           |
-| --------------------------------------- | ------------------------------------------------- | ----------------------------- |
-| **Producer-Consumer**                   | Ingest → Kafka → stream processors                | Absorb + parallelize firehose |
-| **Windowed Aggregation (stream)**       | Tumbling/sliding windows by event time            | Core rollup                   |
-| **Idempotency / Dedup**                 | `click_id` dedup in processor                     | No double-count               |
-| **CQRS + Materialized View**            | Pre-aggregated rollups vs raw events              | Fast queries                  |
-| **Lambda / Kappa**                      | Batch+stream vs stream-only                       | Accuracy vs freshness         |
-| **Event Sourcing**                      | Raw event log as truth; replay to rebuild         | Reprocessing/audit            |
-| **Sketch / Probabilistic (HLL)**        | Approx unique counts                              | Cheap cardinality             |
-| **Sharding / Partitioning (+ salting)** | Kafka + store partitioned by ad_id; salt hot keys | Scale + skew                  |
-| **Watermark**                           | Handle late/out-of-order events                   | Correct windows               |
-
-
----
-
-## 14. Interview Cheat Sheet
+## 13. Interview Cheat Sheet
 
 > **"How do you count clicks at millions/sec?"**
 > "Ingest into Kafka (partitioned by ad_id), aggregate with a stream processor (Flink) into **event-time tumbling windows** (per-minute), write rollups to an **OLAP store** (Druid/ClickHouse) for dashboards, and archive raw events to S3. You never recount raw events per query — you pre-aggregate."
@@ -1119,7 +1149,183 @@ Nightly batch over S3 raw events → recompute exact per-ad totals → compare w
 
 ---
 
-## 15. Final Takeaways
+## 14. API Design
+
+> Two surfaces with opposite shapes: a **write firehose** (ingest, must be idempotent + batched) and an **analytical read** (aggregate query, an OLAP `GROUP BY`). Keep them separate.
+
+### Ingest — `POST /clicks` (batched, idempotent)
+
+SDKs **batch** clicks to cut request overhead (§5). Each event carries a client-generated `click_id` (the dedup key, §7) and an **event timestamp**. The whole request also carries an `Idempotency-Key` header so a network retry of the *batch* doesn't create phantom events.
+
+```
+POST /v1/clicks
+Header: Idempotency-Key: <uuid-per-batch>
+```
+
+```json
+{
+  "events": [
+    { "click_id": "c-8f3a...", "ad_id": 123, "event_ts": "2026-07-14T14:05:03.412Z",
+      "user_id": "u-77", "ip": "49.36.x.x", "campaign_id": 77, "device": "android" },
+    { "click_id": "c-9b1c...", "ad_id": 123, "event_ts": "2026-07-14T14:05:03.998Z",
+      "user_id": "u-88", "ip": "182.71.x.x", "campaign_id": 77, "device": "ios" }
+  ]
+}
+```
+
+```json
+// 202 Accepted — the API appends to Kafka and returns fast; counting happens off-path
+{ "accepted": 2, "rejected": 0, "batch_id": "b-2271" }
+```
+
+- **202, not 200** — ingestion only *durably logs* to Kafka (§4); it does not wait for counting. Fire-and-forget from the client's view.
+- **Idempotent two ways:** the batch `Idempotency-Key` collapses duplicate *HTTP* retries; the per-event `click_id` collapses duplicate *events* deep in the processor (§7). Belt and suspenders.
+- **`event_ts` is the client's event time** — the whole windowing model (§6) buckets on this, not on arrival time.
+
+> ⚠️ **Pitfall — never trust the client's count.** Accept raw events (or edge *partial counts*, §8), never a client-asserted total for billing — a malicious SDK could inflate it. The server is the counting authority.
+
+### Query — `GET /aggregates` (OLAP read)
+
+Dashboards read pre-aggregated rollups from the OLAP store (§10) — never raw clicks.
+
+```
+GET /v1/aggregates?ad_id=123&from=2026-07-14T14:00Z&to=2026-07-14T15:00Z&granularity=MINUTE
+    &group_by=country            (optional drill-down)
+```
+
+```json
+{
+  "ad_id": 123,
+  "granularity": "MINUTE",
+  "series": [
+    { "window_start": "2026-07-14T14:05:00Z", "clicks": 50000, "unique_users": 41200, "revenue": 250000.00,
+      "by_country": { "IN": 30000, "US": 15000, "UK": 5000 } },
+    { "window_start": "2026-07-14T14:06:00Z", "clicks": 47310, "unique_users": 39050, "revenue": 236550.00 }
+  ],
+  "approximate": true
+}
+```
+
+- **`granularity` maps to the rollup tier** (`MINUTE`/`HOUR`/`DAY`) — pick the coarsest that answers the query so a month-long range reads few rows (§6 roll-ups).
+- **`unique_users` is HLL-approximate** — hence `"approximate": true`. The billing surface (a separate, authenticated `GET /billing/...`) serves the **exact**, reconciled numbers (§9), not this endpoint.
+- **Read path is cache-friendly** — closed windows are immutable, so responses cache well; only the currently-open window changes.
+
+---
+
+## 15. Consistency & CAP Tradeoffs
+
+> The recurring theme — **accuracy vs freshness** — is really a CAP choice made *per surface*. The live dashboard picks availability; billing picks consistency (after reconciliation).
+
+| Surface | Choice | Why |
+| --- | --- | --- |
+| **Live dashboard** (streaming rollups) | **AP** (available + eventual) | A number that's a few seconds stale or ±1–2% off (HLL, allowed-lateness cutoff, salted partials) is fine — advertisers want *"is my campaign working right now?"*, answered instantly. Never block the dashboard for exactness. |
+| **Billing** (post-reconciliation totals) | **CP-ish** (consistent, correct) | The invoice must be **provably right**: exact `COUNT(DISTINCT click_id)`, all late events present, fraud removed. It's produced by a nightly batch over the S3 ground truth (§9), so it trades freshness (a day late) for correctness. |
+| **Downstream** (alerts, analytics) | **Eventual** | Async, retryable; a little lag is acceptable. |
+
+**Formalizing accuracy vs freshness:** they are two ends of one dial, and *no single number can max both* at scale.
+
+- **Freshness path** (streaming, §6/§7): optimizes latency. Accepts small errors — HLL uniques, stragglers dropped at the watermark, tiny crash-edge gaps. Powers the dashboard.
+- **Accuracy path** (batch reconciliation, §9): optimizes correctness. Sees 100% of the data with the day closed, no shortcuts. Powers billing and **overwrites** the dashboard number as the source of truth.
+
+The system is **eventually consistent end-to-end** (streamed number now → exact number after reconciliation), but **strongly consistent at the invoice** once the batch has run. Exactly-once (§7) is what makes the *streaming* number trustworthy enough to show, and reconciliation is what makes the *billed* number trustworthy enough to charge.
+
+> One-liner: **"Fresh-but-approximate for the dashboard (AP), exact-but-delayed for the invoice (CP) — reconciliation is the bridge between them."**
+
+---
+
+## 16. Reliability & Observability
+
+> A streaming pipeline fails *silently* — it keeps emitting numbers that are quietly wrong (behind, or missing data). The job of observability here is to **catch "quietly wrong" before it hits an invoice.**
+
+| Signal | What it means | Alert when |
+| --- | --- | --- |
+| **Consumer lag** (Kafka) | how many messages the processor is *behind* the tail of the log | lag grows unboundedly → processor can't keep up → dashboards go stale |
+| **Watermark age** | `now − watermark` — how far behind event-time we are | age keeps rising → windows never finalize → memory grows, billing stalls |
+| **Reconciliation delta** | `abs(streamed − exact)` per ad from the nightly batch (§9) | delta exceeds a threshold (e.g. >2%) → the streaming layer is drifting; investigate dedup/late-event handling |
+| **Checkpoint success/duration** | are exactly-once snapshots (§7) completing? | checkpoints failing/slowing → a crash would lose or double-count |
+| **Fraud rate** | share of clicks dropped by the filter (§5) | sudden spike → attack in progress or a broken filter |
+
+### Backpressure — when Flink falls behind Kafka
+
+The whole point of Kafka is to **absorb bursts** so the processor never has to (§5). If the stream processor slows (a hot key, a GC pause, an undersized cluster), it simply **reads slower** — Kafka keeps buffering, and **consumer lag** rises. Kafka is the shock absorber; lag is the gauge on it.
+
+```
+clicks → Kafka (buffers, retains) → processor reads at its own pace
+         └── if processor slows, lag ↑ but nothing is dropped (bounded by retention)
+```
+
+- **Don't drop or block ingestion** when the processor is behind — that's what the log is *for*. Let lag build, alert on it, and **scale out** the processor (add tasks/partitions) or **salt** the offending hot key (§8).
+- **The real danger is retention:** if lag grows so large that unread events age past Kafka's retention window, they're gone. So the alert on **rising lag** is really an early warning that you must scale before hitting the retention cliff.
+- **Reprocess safety net:** even worst case, raw events are in S3 (§9), so a bad window can be rebuilt.
+
+Also standard: **no single point of failure** (replicated Kafka, multi-instance processor with checkpoint-based failover, replicated OLAP), **dead-letter topic** for un-parseable events, and the **late-event correction topic** (§7) as a catch-all.
+
+---
+
+## 17. Click Attribution & Conversion Funnel
+
+> Counting clicks is step one. Advertisers ultimately care about the **funnel**: impression → click → purchase. Attribution ties a later purchase back to the click that caused it.
+
+```
+IMPRESSION (ad shown) ──► CLICK (user taps) ──► CONVERSION (purchase / signup)
+   billions/day            millions/day            thousands/day
+   (CTR = clicks ÷ impressions)   (CVR = conversions ÷ clicks)
+```
+
+- **Impression → click** gives **CTR** (click-through rate); **click → conversion** gives **CVR** (conversion rate). Both are just *ratios of two counts* — the same windowed-aggregation machinery, keyed by ad/campaign.
+- **Attribution** = when a purchase happens minutes or days later, credit it to the originating click. Done by carrying the `click_id` (or a click token) through to the conversion event, then **joining** conversions back to clicks — typically in the **batch layer** (§9), because the conversion can arrive long after the click's window closed (a classic very-late event).
+- **Why it matters for fraud (§5):** "many clicks, **zero** conversions" is one of the strongest fraud signals — you can only see it once you have the funnel, which is why that check lives in the offline layer, not the real-time filter.
+- **Attribution windows:** conversions are usually credited only if they happen within a window after the click (e.g. 7 days). This is another **event-time + lateness** problem, solved with the same tools as click windowing — just at a coarser timescale.
+
+---
+
+## 18. How to Drive the Interview (framework)
+
+> Lead with the core challenge — *count a firehose correctly under duplicates, lateness, and skew* — then spend most of your time on the streaming deep-dives. Spend ~5 min on 1–4, then go deep.
+
+1. **Clarify requirements** (functional + NFRs; call out **billing = accurate**, **dashboards = fresh**) — §2
+2. **Estimate scale** (clicks/sec, raw vs aggregate storage) — §3
+3. **Define APIs** (idempotent batched ingest + OLAP aggregate query) — §14
+4. **High-level pipeline + data model** (Kafka → stream processor → OLAP; S3 archive) — §4, §10
+5. **Deep dive: the hard part** → **windowing, event time, watermarks, dedup, exactly-once** — §6, §7
+6. **Deep dive: skew + accuracy** → **hot-key salting**, **Lambda/Kappa reconciliation** — §8, §9
+7. **Address consistency + reliability** → **AP dashboard / CP billing**, consumer lag, backpressure — §15, §16
+8. **Summarize tradeoffs** → accuracy vs freshness — §15, §13
+
+> 🎤 **Land the framing early:** "You never store-and-recount raw clicks; you pre-aggregate as a stream into event-time windows, and split into a fast approximate path for dashboards and a slow exact path for billing." Everything else hangs off that sentence.
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Processor crashes mid-window** | In-memory counts are lost, but the last **checkpoint** bundled counts + Kafka offset (§7). On restart, restore counts and **rewind Kafka to the saved offset** → resume exactly-once; the open window is rebuilt from replay. No under/over-count. |
+| **Duplicate `click_id` after dedup TTL expired** | The dedup set only remembers ids for a bounded window (§7). A duplicate arriving *after* TTL slips past dedup → tiny over-count on the **dashboard**. Acceptable for freshness; the **batch reconciliation** does an exact `COUNT(DISTINCT click_id)` over all of S3 and corrects it for **billing**. Set TTL > realistic retry delay to make this vanishingly rare. |
+| **Hot key salted, but billing needs the real per-ad total** | Stage-1 counts the salted slices `(ad-0…ad-9)`; a **stage-2 combiner strips the salt and sums** the partials back into the true `ad_id` count (§8). Billing always reads the **combined** number, never a single salted slice. |
+| **Late event arrives after the window was billed** | Don't mutate a billed count. Route it to the **correction/late-event topic** (§7); the nightly reconciliation folds it into the exact total (§9). |
+| **Dashboard number ≠ invoice number** | Expected by design — dashboard is streamed/approximate, invoice is reconciled/exact. Surface both, and alert if the **reconciliation delta** is unusually large (§16). |
+| **A field like `user_id` sneaks into the aggregation key** | Cardinality explodes to ~one row per click, defeating pre-aggregation (§6). Keep only **low-cardinality** dimensions in the key; use **HLL** for unique-user counts instead. |
+
+---
+
+## 19. Design Patterns (that can be used)
+
+
+| Pattern                                 | Where                                             | Why                            |
+| ---------------------------------------- | -------------------------------------------------- | ------------------------------ |
+| **Producer-Consumer**                   | Ingest → Kafka → stream processors                | Absorb + parallelize firehose  |
+| **Windowed Aggregation (stream)**       | Tumbling/sliding windows by event time            | Core rollup                    |
+| **Idempotency / Dedup**                 | `click_id` dedup in processor                     | No double-count                |
+| **CQRS + Materialized View**            | Pre-aggregated rollups vs raw events              | Fast queries                   |
+| **Lambda / Kappa**                      | Batch+stream vs stream-only                       | Accuracy vs freshness          |
+| **Event Sourcing**                      | Raw event log as truth; replay to rebuild         | Reprocessing/audit             |
+| **Sketch / Probabilistic (HLL)**        | Approx unique counts                              | Cheap cardinality              |
+| **Sharding / Partitioning (+ salting)** | Kafka + store partitioned by ad_id; salt hot keys | Scale + skew                   |
+| **Watermark**                           | Handle late/out-of-order events                   | Correct windows                |
+
+
+---
+
+## 20. Final Takeaways
 
 - **Pre-aggregate as a stream** into event-time windows; serve rollups from an **OLAP store** — never recount raw per query.
 - **Kafka (partition by ad_id) → Flink windowed aggregation → OLAP**; archive raw to **S3** (reprocess/audit).

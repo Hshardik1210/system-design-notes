@@ -20,9 +20,13 @@
 - [10. API Design](#10-api-design)
 - [11. Sequences](#11-sequences)
 - [12. Edge Cases](#12-edge-cases)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
-- [15. Final Takeaways](#15-final-takeaways)
+- [13. Interview Cheat Sheet](#13-interview-cheat-sheet)
+- [14. Group Lifecycle, Partial Payments & Multi-Currency](#14-group-lifecycle-partial-payments--multi-currency)
+- [15. Scaling, Sharding & Caching](#15-scaling-sharding--caching)
+- [16. Consistency & CAP Tradeoffs](#16-consistency--cap-tradeoffs)
+- [17. How to Drive the Interview (framework)](#17-how-to-drive-the-interview-framework)
+- [18. Design Patterns (that can be used)](#18-design-patterns-that-can-be-used)
+- [19. Final Takeaways](#19-final-takeaways)
 
 ---
 
@@ -65,6 +69,8 @@ sum =            0    ✅  always
 ```
 
 If the numbers ever add up to anything other than 0, there's a **bug** — money leaked or got invented. This "sum must be 0" is called the **money-conservation invariant**, and it's the single most important correctness check in the whole system. It's the same principle accountants call **double-entry bookkeeping**: every debit has a matching credit.
+
+> 💡 **Double-entry ledger** = every change records *two* equal-and-opposite sides (one person owes more, another is owed more), so money is never created or destroyed. It's the built-in guarantee that everyone's balances always sum to 0.
 
 #### Q: Why not just store "Alice paid ₹900" and figure it out later?
 
@@ -123,7 +129,7 @@ That's exactly what a plain relational database (Postgres/MySQL) with **ACID tra
 
 > **Rule of thumb:** reach for Kafka/streams when the challenge is *volume*; reach for an ACID SQL database when the challenge is *correctness of money*. Splitwise is firmly the second kind.
 
-#### Q: What do all those "services" actually do?
+### What each service actually does
 
 Each service has one job:
 
@@ -297,13 +303,13 @@ class SplitStrategyFactory {
 }
 ```
 
-#### Q: Why the "give the leftover paise to one person" dance?
+### Why the "give the leftover paise to one person" dance
 
-Because **some totals don't divide cleanly.** ₹100 ÷ 3 = ₹33.333... You can't pay a third of a paisa. If you round each share to 33.33, three people only cover ₹99.99 — a phantom ₹0.01 vanishes. Over millions of expenses those lost paise add up and break the "sum = 0" rule. The fix: round everyone down, then **deterministically** dump the tiny remainder onto one person. Total stays exact, and it's predictable (not random), so it's auditable.
+**Some totals don't divide cleanly.** ₹100 ÷ 3 = ₹33.333... You can't pay a third of a paisa. If you round each share to 33.33, three people only cover ₹99.99 — a phantom ₹0.01 vanishes. Over millions of expenses those lost paise add up and break the "sum = 0" rule. The fix: round everyone down, then **deterministically** dump the tiny remainder onto one person. Total stays exact, and it's predictable (not random), so it's auditable.
 
-#### Q: Is the payer's own share a debt they owe themselves?
+### The payer's own share is not a debt they owe themselves
 
-**No.** In the ₹900 equal-split dinner, Alice paid and her own share is ₹300 — but she doesn't *owe herself*. Only the **other** participants create debts: Bob owes Alice 300, Carol owes Alice 300. When we update balances (§6), we skip the payer's own split.
+In the ₹900 equal-split dinner, Alice paid and her own share is ₹300 — but she doesn't *owe herself*. Only the **other** participants create debts: Bob owes Alice 300, Carol owes Alice 300. When we update balances (§6), we skip the payer's own split.
 
 ---
 
@@ -411,7 +417,7 @@ class BalanceSheet {
 }
 ```
 
-#### Q: Where are balances actually *stored* — a table or computed on the fly?
+### Where balances are actually stored — a table or computed on the fly
 
 **Both are valid; pick based on read speed.**
 
@@ -436,6 +442,8 @@ Bob owes Alice 300, Carol owes Bob 300
 ```
 
 **Algorithm (greedy min-cash-flow):** compute each person's net balance, then repeatedly match the biggest creditor with the biggest debtor (max-heaps) and settle the smaller amount until all are zero. (Full annotated Java in the deep dive below.)
+
+> 💡 **Greedy debt simplification** = at each step, settle the biggest debtor against the biggest creditor. It's "greedy" because every step makes the locally-largest dent, zeroing out at least one person per payment.
 
 **Worked example:**
 ```
@@ -524,15 +532,15 @@ step 1: biggest creditor Alice(+300), biggest debtor Dave(300)
 heaps empty → done.  Result: 1 payment.  ✅
 ```
 
-#### Q: Why heaps (priority queues) instead of just looping a list?
+### Why heaps (priority queues) instead of just looping a list
 
-Because at each step we need the **current largest** creditor and debtor, and those change after every payment. A heap gives us "give me the max" in `O(log n)` instead of re-scanning the whole list each time. It's the same reason the Ad-Click leaderboard-style problems reach for heaps.
+At each step we need the **current largest** creditor and debtor, and those change after every payment. A heap gives us "give me the max" in `O(log n)` instead of re-scanning the whole list each time. It's the same reason the Ad-Click leaderboard-style problems reach for heaps.
 
 #### Q: "Optimal is NP-hard" — so is greedy actually wrong?
 
 Greedy isn't guaranteed to find the *theoretical minimum* number of payments in every case (that problem is NP-hard — related to the subset-sum/partition problem). But it always produces a **valid** settlement with **at most n−1 payments** for n people, which is more than good enough in practice. Interviewers just want you to (a) know it's the greedy heap approach and (b) acknowledge that true optimality is NP-hard, so greedy is the pragmatic answer.
 
-#### Q: Does simplification lose the original "who owed whom" info?
+### Simplification does not lose the original "who owed whom" info
 
 The *simplified payments* are just a **suggestion for settling up** — a convenience view. The underlying `expenses`/`expense_splits` history is never thrown away, so you can always see the real story of who paid for what. Simplify is a projection on top, not a replacement.
 
@@ -548,6 +556,8 @@ The *simplified payments* are just a **suggestion for settling up** — a conven
 | **Money conservation** | Validate splits sum to total; balanced updates → Σ balances = 0 (invariant check) |
 | **Rounding** | Distribute leftover cents deterministically so totals are exact |
 | **Edit/delete expense** | Reverse the original split's balance effect (compensating entries), then apply the new one — never mutate history silently |
+
+> 💡 **Idempotency** = doing the same operation twice has the same effect as doing it once. A unique **`Idempotency-Key`** per "Add expense" tap makes network retries safe — one tap, one expense, no matter how many times it's resent.
 
 ### What can go wrong when two things happen at once
 
@@ -612,7 +622,7 @@ The classic fix costs nothing: **always acquire locks in the same order** — e.
 
 Mobile networks retry. If Bob taps "Add expense" and his phone resends the request (bad signal), you'd record the **same dinner twice** — doubling everyone's debt. The client generates **one unique `idempotency_key`** per user action and sends it with every retry. The server stores it with a `UNIQUE` constraint: the first request succeeds; any retry with the same key is recognized as "already done" and skipped. One tap = one expense, no matter how many times it's sent.
 
-#### Q: How do you edit or delete an expense without corrupting balances?
+### How to edit or delete an expense without corrupting balances
 
 **Never quietly rewrite history.** Instead, **reverse then reapply** (compensating entries, like the Command pattern's undo):
 
@@ -632,6 +642,18 @@ This keeps the full history (who changed what, when) *and* keeps balances correc
 ---
 
 ## 9. Data Model (all tables)
+
+### Database & storage choices (which DB, and why at scale)
+
+There's really only one deciding question here — *"does this need transactions and a strict money-conservation invariant?"* — and for expenses/splits/balances the answer is yes, which settles the whole store choice before scale even enters the conversation. There isn't much polyglot spread in this system; the interesting decision is *why we don't need one*.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Users, groups, expenses, splits, settlements, balances (**everything**) | **RDBMS** (Postgres/MySQL), ACID | Adding an expense touches **multiple pair-balance rows plus the audit rows in one go** — it must be all-or-nothing, or the "Σ balances = 0" invariant breaks (a lost update = money silently vanishing, §8). ACID transactions + row locks are exactly this guarantee, built in. | A NoSQL store (Cassandra/Dynamo) has no cross-row transactions — you'd have to hand-build the atomic multi-balance update and the deadlock-avoidance ordering (§8) yourself, for a system that isn't even write-heavy (§3) enough to need NoSQL's scale. |
+| `balances` table specifically (denormalized pairwise net) | Same RDBMS, updated **in the same transaction** as the expense | Reads dominate (people check balances constantly) — a denormalized row per pair gives an instant `SELECT`, and because it's written in the same ACID transaction as `expense_splits`, it can never disagree with the history it's derived from. | Pure compute-on-read (summing `expense_splits` every time) is also correct and avoids denormalization drift entirely, but doesn't scale to "check my balance" being a constant, high-frequency read for large groups — the summary table is a performance choice, not a correctness one. |
+| Activity log / notifications | Async, off the transactional path (Kafka/outbox, or a simple queued job) | Telling members "an expense was added" doesn't need to block the balance-update transaction, and losing/delaying a notification is harmless — unlike losing a balance update. | Doing it synchronously inside the expense transaction couples notification latency/failures to money correctness for no benefit. |
+
+**Why RDBMS wins outright at this scale:** Splitwise's write volume is a trickle — a few expenses per person per day (§3), nowhere near the throughput that would justify NoSQL's availability/scale trade-offs. The entire design optimizes for **correctness of money**, not raw volume, so there's no reason to give up ACID. **Scaling**, when it's needed, is a **shard by `group_id`**: nearly every operation (add expense, view balances, simplify debts) is scoped to one group, so a group's rows — expenses, splits, balances — can live together on one shard with no cross-shard transaction ever required. Hot groups (a huge shared house or shared trip) are rare and small in absolute row count compared to, say, a viral social post, so this shard key doesn't create the kind of skew a system like Ad-Click worries about. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 CREATE TABLE users ( user_id BIGINT PRIMARY KEY, name TEXT, email VARCHAR(255) UNIQUE );
@@ -664,6 +686,14 @@ CREATE TABLE activity_log ( id BIGINT PRIMARY KEY, group_id BIGINT, type VARCHAR
 ```
 
 > **Tables to consider:** users, groups, group_members, expenses, expense_splits, balances (denormalized pairs), settlements, activity_log. Balances derivable from splits+settlements or denormalized for read speed.
+
+### Indexes that matter
+
+- `balances (group_id)` — render a group's entire "who owes whom" in one scan; also the natural shard key (§15).
+- `balances (user_low, user_high, group_id)` **PK** — O(1) lookup of a single friendship's net.
+- `expenses (group_id, created_at DESC)` — powers the **activity feed** ("recent expenses in this group") without a full-table sort.
+- `expenses (idempotency_key)` **UNIQUE** — dedup retried "Add expense" taps (§8).
+- `settlements (group_id, created_at DESC)` — recent paybacks in the same group feed.
 
 ### What each table is *for*
 
@@ -707,7 +737,7 @@ SELECT
 FROM balances WHERE group_id = 42;
 ```
 
-#### Q: Why the `NUMERIC(12,2)` type for money instead of a plain number?
+### Why `NUMERIC(12,2)` for money instead of a plain number
 
 `NUMERIC`/`DECIMAL` stores **exact decimal values** (12 total digits, 2 after the point) — no floating-point drift. `NUMERIC(12,2)` holds up to ₹9,999,999,999.99 with paise precision. Using `FLOAT`/`DOUBLE` here would slowly corrupt totals; for money, always use fixed-precision `NUMERIC` (or integer paise).
 
@@ -719,6 +749,8 @@ Because `balances` is only a **running total** — it can't tell you *why* Bob o
 
 ## 10. API Design
 
+> Keep it RESTful; highlight the **`Idempotency-Key`** on the expense/settlement write paths.
+
 ```
 POST /v1/groups { name, memberIds }
 POST /v1/expenses (Idempotency-Key) { groupId, amount, paidBy, splitType, splits:[{userId, share}] }
@@ -729,6 +761,69 @@ GET  /v1/groups/{id}/simplify           → minimized settle-up transactions
 POST /v1/settlements { groupId, fromUser, toUser, amount }
 GET  /v1/groups/{id}/activity
 ```
+
+### The write path — `POST /v1/expenses`
+
+The one endpoint that **must be idempotent**: a retried "Add expense" tap must never record the dinner twice (§8).
+
+```
+POST /v1/expenses
+Header: Idempotency-Key: <uuid>          # one per user action, resent on every retry
+Body:
+{
+  "groupId":   42,
+  "amount":    900.00,
+  "currency":  "INR",
+  "paidBy":    1,
+  "splitType": "EQUAL",                    # EQUAL | EXACT | PERCENT | SHARES
+  "splits":    [ {"userId":1}, {"userId":2}, {"userId":3} ]   # extra fields vary by type
+}
+→ 201 { "expenseId": 8891, "balancesUpdated": true }
+```
+
+- `EXACT` splits carry `amount`; `PERCENT` carries `percent`; `SHARES` carries `shares`. The server **validates they sum to the total** (or to 100% / whole shares) before recording — otherwise `422` (money would leak).
+
+### Recording a settlement — `POST /v1/settlements`
+
+```
+POST /v1/settlements
+Header: Idempotency-Key: <uuid>
+Body: { "groupId": 42, "fromUser": 2, "toUser": 1, "amount": 300.00, "currency": "INR" }
+→ 201 { "settlementId": 551, "newPairBalance": 0.00 }
+```
+
+A settlement is a **real payment that reduces a debt** (Bob actually paid Alice back) — it writes to the ledger, it is not a suggestion. Partial amounts are allowed (§14).
+
+### The simplify response shape — `GET /v1/groups/{id}/simplify`
+
+Read-only: it **computes** the fewest payments; it does **not** change any balance until each one is actually recorded via `POST /v1/settlements`.
+
+```
+GET /v1/groups/42/simplify
+→ 200
+{
+  "payments": [
+    { "from": 3, "to": 1, "amount": 300.00 },   # "Carol pays Alice 300"
+    { "from": 2, "to": 1, "amount": 100.00 }
+  ],
+  "currency": "INR",
+  "transactionCount": 2                          # always ≤ n-1
+}
+```
+
+### Error cases
+
+| Case | Status | Meaning |
+| --- | --- | --- |
+| Splits don't sum to total (or % ≠ 100) | `422 Unprocessable` | money would leak — reject before recording |
+| Retry with a seen `Idempotency-Key` | `200` (same result) | replay the stored response, don't re-record |
+| Payer/participant not a group member | `409 Conflict` | can't split with a non-member |
+| Edit/delete an already-settled expense | `409 Conflict` | reverse-and-reapply would reopen a closed debt — require an explicit adjustment |
+| Group / expense not found | `404` | — |
+
+#### Q: Why is `/simplify` a GET but recording a payment a POST?
+
+Because they do fundamentally different things. `GET /simplify` is **read-only advice** — "here are the fewest transfers that would square everyone up." It derives a suggestion from the current balances and changes **nothing**, so it's safe to call repeatedly and can even be cached. `POST /settlements` **records a real-world event** — Bob actually paid Alice ₹300 — which mutates the ledger and must be idempotent (a double-tap shouldn't log the payment twice). Rule of thumb: **GET never changes money; POST does.**
 
 ---
 
@@ -769,7 +864,126 @@ GET /simplify → compute net balances → greedy max-creditor/max-debtor matchi
 
 ---
 
-## 13. Design Patterns (that can be used)
+## 13. Interview Cheat Sheet
+
+> **"How do you track who owes whom?"**
+> "Each expense records who paid and per-person shares (**Strategy** for the split type, validated to sum to the total, with deterministic rounding). Update **pairwise net balances** as balanced entries — a **double-entry ledger** where all balances net to zero. A user's total = sum of their pair balances."
+
+> **"How do you minimize settle-up payments?"**
+> "Compute each person's net balance (paid − owed; creditors +, debtors −, Σ = 0). **Greedily** match the biggest creditor with the biggest debtor (max-heaps), settle the min of the two, repeat until all are zero — ≤ n−1 transactions. Optimal min-cash-flow is NP-hard, so greedy is the practical answer."
+
+> **"Correctness under concurrency?"**
+> "Update all affected pair balances in **one ACID transaction**, lock pairs in a consistent order to avoid deadlocks, use an **idempotency key** on expense creation, and validate splits sum to the total (invariant: Σ balances = 0). Edits/deletes reverse then reapply."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What to do |
+| --- | --- |
+| **Multi-currency expense** | Store each expense in its **own currency**; keep balances per-currency, or convert to a group **base currency** at the FX rate *frozen at expense time*. Never silently mix currencies in one sum. |
+| **Edit / delete an expense** | **Reverse** the original splits (compensating entries), then **reapply** the new ones — one ACID txn, history kept, Σ = 0 preserved. Never mutate balances in place. |
+| **User leaves a group with a non-zero balance** | Block the exit (or mark them **inactive but retained**) until their net is 0 — you can't drop a row money depends on without breaking Σ = 0. |
+| **Partial settlement** | Bob owes 300 but pays 100 → record a 100 settlement; `balance(Bob,Alice)` drops to 200. Debts are amounts, not all-or-nothing. |
+| **Rounding (33.33 × 3)** | Deterministically dump the leftover paise on one person so the total is exact and auditable. |
+| **Duplicate "Add expense" tap** | `Idempotency-Key` + `UNIQUE` constraint → one expense; retries replay the same result. |
+
+---
+
+## 14. Group Lifecycle, Partial Payments & Multi-Currency
+
+> These are the follow-ups that separate "I can split a bill" from "I understand money over time."
+
+### Adding / removing a member mid-trip
+
+- **Add a member:** insert into `group_members`. They only share in **expenses added after** they join — past expenses are untouched (their share of those is zero).
+- **Remove a member:** only clean if their **net balance is 0**. Otherwise they can't just vanish — the group's Σ = 0 invariant would break.
+
+> ⚠️ **Pitfall: never hard-delete a member (or user) who has a non-zero balance.** The balance rows reference them; dropping the row leaks money. Settle first, or mark them **inactive** and keep the row for audit.
+
+### Exiting with an outstanding balance
+
+Two honest options, both preserve the invariant:
+
+1. **Settle up first** — the leaving member pays/receives their net, balance hits 0, then they leave.
+2. **Transfer the debt** — someone in the group absorbs it (recorded as a settlement + a new expense), so the leaver's net becomes 0 while the total stays conserved.
+
+### Partial payments
+
+A settlement doesn't have to clear the whole debt. Bob owes Alice 300 but only pays 100 today:
+
+```
+before: balance(Alice,Bob) = +300   (Bob owes Alice 300)
+POST /settlements { from: Bob, to: Alice, amount: 100 }
+after:  balance(Alice,Bob) = +200   (200 still owed)
+```
+
+Debts are **amounts**, so a payment simply reduces the number — no special "fully paid" state is needed.
+
+### Multi-currency & FX
+
+> 💡 **FX (foreign exchange) = converting one currency to another at a rate.** Rates move, so *when* you convert matters.
+
+- Store every expense in the **currency it was paid in** (`currency` column) — never lose the original.
+- To show a single "you owe" number, convert to a **base currency** using the FX rate **frozen at expense time** (store the rate on the row). Re-fetching today's rate would make old balances drift every day.
+- Simplest correct model: keep **balances per currency** and convert only for display. Cross-currency settlement is then an explicit, user-confirmed conversion.
+
+---
+
+## 15. Scaling, Sharding & Caching
+
+> Splitwise isn't a throughput problem (§3) — but interviewers still want to hear a clean scaling story.
+
+### Shard by `group_id`
+
+Almost every operation — add expense, view group balances, simplify — is **scoped to one group**. So a group's `expenses`, `expense_splits`, `balances`, and `settlements` can all live on the **same shard**, and no operation ever needs a cross-shard transaction.
+
+- **Hot groups are cheap.** A "huge shared house" is still a handful of members and a few expenses a day — nothing like a viral post's hot partition, so `group_id` doesn't create dangerous skew.
+
+### Read scaling
+
+- **Read replicas** for balance/activity reads (people check "how much do I owe?" constantly, but those reads tolerate mild staleness).
+- **Optional Redis** for **hot balance reads** — cache a group's or user's net so the common "open the app" read is sub-ms. Invalidate on any expense/settlement write (writes are rare, so invalidation is cheap).
+
+> 💡 Reads dominate here, so denormalized balances (§6) + replicas + a thin cache is plenty. Keep **writes on the primary** — money correctness needs the ACID path.
+
+### The cross-group "you owe across groups" query
+
+`GET /v1/users/{id}/balances` must sum a user's net **across every group they're in** — which, under `group_id` sharding, means touching **multiple shards** (a scatter-gather).
+
+- Keep it cheap by maintaining a small **per-user rollup** (net owed / net owing) updated on each write, or fan out the per-group reads and sum in the service.
+- This is the one query that crosses the shard boundary — call it out, because it's the natural consequence of choosing `group_id` as the shard key.
+
+---
+
+## 16. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?"
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Expense / settlement writes** | **CP** (strong consistency) | money must be exact — a lost update breaks Σ = 0. Correctness > availability. |
+| **Balance reads** | **CP-ish** (primary or fresh replica) | usually fine slightly stale, but never *wrong* — read-your-own-writes right after adding an expense. |
+| **Activity feed / notifications** | **AP** (eventual) | "Alice added an expense" arriving a few seconds late is harmless. |
+
+- Money writes go to a **single source-of-truth** RDBMS row inside an ACID transaction — serializable behavior on the affected pair balances **without** a global lock.
+- The system is **eventually consistent across services** (activity log and notifications are async), but **strongly consistent on the ledger**.
+
+> One-liner: **"Strong consistency where money is involved, eventual consistency for the feed and notifications."**
+
+---
+
+## 17. How to Drive the Interview (framework)
+
+> Splitwise is an **OOD + algorithm hybrid** — drive it in three deliberate beats so you never freeze.
+
+1. **OOD / splits first** — model `User`, `Group`, `Expense`, `Split`, and the **Strategy** for split types (equal/exact/percent/shares). Validate each split **sums to the total**. This shows you can structure code.
+2. **Ledger / double-entry second** — every expense and settlement is a **balanced update** to pairwise balances; Σ across everyone is always 0. Call out ACID transactions, consistent lock order, and the idempotency key for correctness.
+3. **Simplify algorithm third** — compute each person's **net**, then greedily match the biggest creditor with the biggest debtor (heaps) for ≤ n−1 payments; note that true optimality is NP-hard.
+
+> 🎤 **Lead with the core challenge:** "the crux is keeping the money ledger correct (it must always net to zero), then minimizing settle-up transactions." Then spend your time on split modeling → double-entry updates → greedy simplification, in that order.
+
+---
+
+## 18. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -785,20 +999,7 @@ GET /simplify → compute net balances → greedy max-creditor/max-debtor matchi
 
 ---
 
-## 14. Interview Cheat Sheet
-
-> **"How do you track who owes whom?"**
-> "Each expense records who paid and per-person shares (**Strategy** for the split type, validated to sum to the total, with deterministic rounding). Update **pairwise net balances** as balanced entries — a **double-entry ledger** where all balances net to zero. A user's total = sum of their pair balances."
-
-> **"How do you minimize settle-up payments?"**
-> "Compute each person's net balance (paid − owed; creditors +, debtors −, Σ = 0). **Greedily** match the biggest creditor with the biggest debtor (max-heaps), settle the min of the two, repeat until all are zero — ≤ n−1 transactions. Optimal min-cash-flow is NP-hard, so greedy is the practical answer."
-
-> **"Correctness under concurrency?"**
-> "Update all affected pair balances in **one ACID transaction**, lock pairs in a consistent order to avoid deadlocks, use an **idempotency key** on expense creation, and validate splits sum to the total (invariant: Σ balances = 0). Edits/deletes reverse then reapply."
-
----
-
-## 15. Final Takeaways
+## 19. Final Takeaways
 
 - Expense → **split (Strategy; must sum to total, deterministic rounding)** → update **pairwise net balances** (double-entry, Σ = 0).
 - **Debt simplification** = greedy max-creditor ↔ max-debtor matching with heaps (min-cash-flow is NP-hard) → ≤ n−1 payments.

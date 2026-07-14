@@ -4,6 +4,10 @@
 
 > **How to read this doc:** dense summary first, then a **deep dive**. Each section opens with the tight interview-style summary; a deep-dive subsection follows with annotated example code and the exact confusions beginners hit. Skim the summaries for revision; read the deep dives to actually *get* it.
 
+> 💡 **The mental model most modern apps actually use (a *hybrid*):** a **short-lived JWT access token** (sent on every API call, expires in ~minutes) **+ a server-stored refresh token** (long-lived, revocable) that silently mints new access tokens. So real-world "JWT" is rarely *purely* stateless — the per-request check is stateless, but a small stateful piece (the refresh token) stays on the server to enable **logout / revocation**. §2–§7 teach the two *pure* models (session vs JWT) so you understand the trade-off; **§8 combines them into this hybrid — what you'll usually build.**
+
+> ⚠️ **Don't over-learn "JWT = fully stateless."** A purely stateless JWT can't be revoked before it expires; that's exactly why production systems pair it with a server-side refresh token. Keep this hybrid in the back of your mind while reading the pure-JWT deep dive below.
+
 ---
 
 ## Contents
@@ -12,6 +16,7 @@
 - [2. Session-Based Authentication (stateful, classic)](#2-session-based-authentication-stateful-classic)
 - [3. Token-Based Authentication (JWT, stateless)](#3-token-based-authentication-jwt-stateless)
 - [4. Session vs JWT](#4-session-vs-jwt)
+- [When to use Session vs JWT vs OAuth/OIDC](#when-to-use-session-vs-jwt-vs-oauthoidc)
 - [5. JWT Anatomy — `header.payload.signature`](#5-jwt-anatomy--headerpayloadsignature)
 - [6. JWT Validation (step by step)](#6-jwt-validation-step-by-step)
 - [7. Session Validation (step by step)](#7-session-validation-step-by-step)
@@ -25,6 +30,7 @@
 - [15. Sample Code (Node.js / Express)](#15-sample-code-nodejs--express)
 - [16. Auth System Design (API Gateway + Redis + JWT)](#16-auth-system-design-api-gateway--redis--jwt)
 - [17. OAuth2, OIDC & SSO ("Login with Google")](#17-oauth2-oidc--sso-login-with-google)
+- [Common Mistakes](#common-mistakes)
 - [18. Interview Cheat Sheet](#18-interview-cheat-sheet)
 - [19. Final Takeaways](#19-final-takeaways)
 
@@ -86,6 +92,16 @@ You *could*, but: (1) the browser would have to **store your raw password** to r
 - Login = `hash(input_password, stored_salt) == stored_hash` (constant-time compare).
 - Add **rate limiting / lockout** on the login endpoint to slow brute-force, and ideally **MFA** for sensitive systems.
 
+### MFA / 2FA and step-up auth
+
+> Passwords alone are weak. A second factor massively raises the bar — worth knowing at a high level.
+
+- **TOTP** (Google Authenticator / Authy): server and app share a secret at setup; the app derives a **6-digit code from the current time** (30s window). No network needed — the server recomputes and compares. Still *phishable* (a user can be tricked into typing the code into a fake site).
+- **WebAuthn / passkeys** (FIDO2, security keys, Face ID/Touch ID): public-key crypto **bound to the site's origin**, so it's **phishing-resistant** — the credential simply won't work on a look-alike domain. The current gold standard.
+- **Step-up auth:** don't demand MFA on *every* action. Require it only for **sensitive ones** (change password, wire money, delete account); normal browsing rides the existing session/token, and risky actions trigger a fresh re-auth.
+
+> **Account lifecycle (one line):** *password reset* and *email verification* work the same way — email the user a **single-use, short-expiry, random token** (a link); clicking it proves control of the inbox. Treat these tokens like passwords: store only a hash, expire them fast, and invalidate after one use.
+
 ### How the session cookie works
 
 On login the server generates a **random session id** (say `abc123`) and stores a record keyed by it: `abc123 → {user_id: 7, expiry, ...}`. It sends the id back to the client as a cookie. On every later request the server reads the cookie, looks the id up in its store, and recovers who you are. The session id itself carries no meaning — all the real info lives in the **session store** (Redis/DB). Delete the record and the id is instantly worthless (that's **logout**).
@@ -114,6 +130,20 @@ GET /profile
 POST /logout
    redis.del("abc123")                   # instantly revoked everywhere
 ```
+
+#### Cookie security flags (one-pager)
+
+> Three flags decide how safe any auth cookie (session id or refresh token) is. Set all three.
+
+| Flag | What it does | Protects against | Note |
+| --- | --- | --- | --- |
+| **`HttpOnly`** | JS (`document.cookie`) can't read the cookie | **XSS** stealing the cookie | stops it being *read*, not being *sent* |
+| **`Secure`** | cookie only sent over HTTPS | network sniffing / MITM | always on in production |
+| **`SameSite=Lax`** | sent on top-level navigations, not cross-site sub-requests | most **CSRF**, while normal links still work | good default |
+| **`SameSite=Strict`** | never sent on *any* cross-site request | **CSRF** (strongest) | can log users out when they arrive via external links |
+| **`SameSite=None`** | always sent cross-site (**requires** `Secure`) | — (needed for cross-domain APIs) | re-opens CSRF → add a CSRF token |
+
+> 💡 **CSRF implication:** `SameSite=Lax`/`Strict` blocks most CSRF for free. If you must use `SameSite=None` (cross-domain cookies), you're back to needing an explicit **CSRF token**. A token sent in an `Authorization` header isn't auto-attached by the browser, so it sidesteps CSRF entirely (full XSS-vs-CSRF treatment in §12).
 
 #### Q: If the cookie is stolen, can't someone reuse it?
 
@@ -221,6 +251,21 @@ Often **both, layered**: a JWT **access token** for speed on every API call, plu
 
 ---
 
+## When to use Session vs JWT vs OAuth/OIDC
+
+> One consolidated decision table. The **"do NOT"** column is where most real decisions actually get made.
+
+| Approach | Reach for it when | Do **NOT** use it when |
+| --- | --- | --- |
+| **Server sessions** | you need **instant revocation** / high security (banking, admin panels), a single app/monolith, or a small fleet sharing one store | you run **many stateless services at scale** where a per-request store lookup becomes a bottleneck |
+| **Pure JWT** (access token only) | short-lived, stateless per-request checks across **microservices**; a gateway verifying tokens it didn't mint | you need **guaranteed instant logout** — a pure JWT stays valid until it expires |
+| **JWT + refresh token** (the usual hybrid) | **most modern apps**: JWT speed on every call **plus** a revocable server-side refresh token for logout / long sessions | ultra-high-security flows needing *sub-second* global revocation — lean toward plain sessions |
+| **OAuth2 / OIDC** | **third-party login** ("Login with Google"), delegated/scoped access to another service's API, or SSO across many apps | **first-party** auth where you own the users and passwords — don't bolt on an external IdP you don't need |
+
+> 💡 **Quick rule:** *needs instant revoke / banking* → **sessions**; *microservices at scale* → **JWT + refresh**; *"let users log in with another account" / SSO* → **OIDC**.
+
+---
+
 ## 5. JWT Anatomy — `header.payload.signature`
 
 A JWT is just a string with **3 base64 parts** separated by dots:
@@ -288,6 +333,10 @@ RS256:  verify(token, PUBLIC_KEY)            # verifiers can check but never min
 ```
 
 > **Why it matters:** in a microservices setup you don't want to hand the signing secret to every service. With **RS256**, the auth service holds the private key; the gateway/services hold only the **public key** (often fetched from a **JWKS** endpoint, `/.well-known/jwks.json`). This is also what lets third parties (e.g. Google) verify tokens they didn't issue.
+
+#### Q: Why would I ever need asymmetric keys (RS256/JWKS)?
+
+With **HS256 there's one shared secret that both signs and verifies** — so *every* service that checks a token must hold that secret, and anyone holding it can also **forge** tokens. Fine for one app; dangerous across many. **RS256 splits the key:** the auth server keeps the **private** key (the only thing that can *mint* tokens), while every gateway/microservice gets only the **public** key — enough to *verify*, useless for forging. Services fetch that public key from the auth server's **JWKS** endpoint (`/.well-known/jwks.json`), which also lets keys **rotate** without redeploying everyone. This is exactly why "Login with Google" works: Google signs the ID token with *its* private key, and your app verifies it with Google's public key — you can check it, but you could never fake a Google token.
 
 ### Reading a JWT's three parts
 
@@ -610,6 +659,8 @@ Later, attacker reuses A → not found → reject + (optionally) revoke the whol
 | **Cookie** (`HttpOnly`, `Secure`, `SameSite`) | ✅ JS can't read it | ⚠️ **Cookies auto-sent → CSRF** | mitigate CSRF with `SameSite=Strict/Lax` + CSRF token |
 | **In-memory** (JS variable) | ⚠️ medium (lost on refresh) | ✅ None | common for the **access** token; pair with a refresh token in an HttpOnly cookie |
 
+> ⚠️ **Never put a refresh token in `localStorage`.** It's readable by any JavaScript on the page, so a *single* XSS bug = full account takeover (the attacker mints access tokens forever). Refresh tokens belong in an `HttpOnly` cookie.
+
 - **XSS** (cross-site scripting): attacker runs JS in *your* page → reads anything JS can reach → defend by **not** putting tokens where JS can read them (`HttpOnly` cookie) + sanitizing input + CSP.
 - **CSRF** (cross-site request forgery): attacker's site triggers a request to *your* site and the browser **auto-attaches your cookie** → defend with **`SameSite` cookies + CSRF tokens**. (Token-in-`Authorization`-header is naturally CSRF-safe because it isn't auto-sent.)
 
@@ -901,6 +952,23 @@ They sound alike but answer different questions:
 - **Authorization (authz) = "what are you allowed to do?"** — checking permissions **after** we know who you are (is this user an admin? can they delete this file?).
 
 Mnemonic: **authN = wh*o*** (i**N**dentity), **authZ = privilege*Z*/permissions**. Order matters: you authenticate **first** (establish identity), then authorize (check rights). A JWT's *signature check* is authn; reading `role: admin` from it to gate an action is authz. And note the naming quirk this section hinges on: **OAuth2 is fundamentally an *authoriZation* framework** (delegating limited, scoped access), while **OIDC bolts *authenticatioN* on top** (the ID token that says *who* you are).
+
+---
+
+## Common Mistakes
+
+> ⚠️ These are the auth bugs that show up in real breaches and interview follow-ups. Each maps back to a concept above.
+
+| Mistake | Why it's wrong | Do instead |
+| --- | --- | --- |
+| **Long-lived access tokens** (hours/days) | a stolen JWT **can't be revoked** → the attacker rides it until it expires | 10–15 min access token + a revocable refresh token (§8) |
+| **Refresh token in `localStorage`** | any XSS reads it → full account takeover | `HttpOnly` + `Secure` + `SameSite` cookie (§12) |
+| **Checking the refresh token on every API request** | re-exposes a password-like secret **and** adds a DB lookup → kills statelessness *and* security | validate the access token per request; touch the refresh token only at `/refresh` (§11) |
+| **Skipping `aud` / `iss` validation** | a token minted for App A gets replayed against App B, or a token from any issuer is accepted | validate `exp`, `nbf`, `iss`, **and** `aud` — not just the signature (§6) |
+| **One shared HS256 secret across all services** | any service (or a leak from any one of them) can **forge** tokens for everyone | RS256: auth server signs with a private key, services verify with the public key (§5) |
+| **Treating base64 as encryption** | claims are plainly readable → secrets/PII leak to anyone holding the token | JWT proves *integrity*, not *confidentiality*; never put secrets in the payload (§5) |
+
+> 💡 **The pattern:** almost every mistake here is either *"I made a revocable thing un-revocable"* (long-lived tokens) or *"I put a secret where it can be read"* (localStorage, base64, one shared secret).
 
 ---
 

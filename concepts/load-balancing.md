@@ -10,10 +10,14 @@
 
 - [1. Why Load Balance?](#1-why-load-balance)
 - [2. L4 vs L7 Load Balancing](#2-l4-vs-l7-load-balancing)
+- [The Full Request Path](#the-full-request-path)
 - [3. Algorithms](#3-algorithms)
 - [4. Health Checks & Failover](#4-health-checks--failover)
 - [5. Session Stickiness](#5-session-stickiness)
 - [6. Where LBs Sit & High Availability](#6-where-lbs-sit--high-availability)
+- [Slow Start and Ramp-Up](#slow-start-and-ramp-up)
+- [Cross-Zone, Circuit Breaking, and Long-Lived Connections](#cross-zone-circuit-breaking-and-long-lived-connections)
+- [Common Mistakes](#common-mistakes)
 - [7. Interview Cheat Sheet](#7-interview-cheat-sheet)
 - [8. Final Takeaways](#8-final-takeaways)
 
@@ -86,6 +90,38 @@ Reading and parsing every request costs time and CPU — an L7 LB must decrypt a
 
 ---
 
+## The Full Request Path
+
+Before diving into algorithms and health checks, it helps to see the **whole path** a request travels. Most real systems chain several balancing layers, each doing a different job:
+
+```
+Client
+  │   1. resolve name → IP of the nearest healthy region
+  ▼
+DNS / GeoDNS ──────────────────────────────────────────────
+  │   picks the REGION (no connection yet — just an address)
+  ▼
+L4 load balancer   (e.g. AWS NLB, LVS) ────────────────────
+  │   spreads raw TCP/UDP connections — fast, content-blind
+  ▼
+L7 load balancer   (e.g. ALB, NGINX, Envoy) ───────────────
+  │   reads HTTP: routes /api → svc-A, /images → svc-B,
+  │   terminates TLS, applies stickiness
+  ▼
+Backend server     (one healthy instance from the target pool)
+```
+
+- **DNS / GeoDNS** chooses the *region* — it hands back an address, no connection is made yet.
+- **L4** spreads raw connections cheaply and can front many L7s.
+- **L7** makes the smart per-request decision (path / host / header routing, TLS, cookies).
+- The **backend** finally serves the request.
+
+Not every system has all four layers — a small app might be just `DNS → one L7 → backends`. But knowing the full chain lets you say *which* layer does *what*, and where each decision is made.
+
+> 💡 **tip** Each hop should be independently health-checked and redundant. A balancing layer with no failover doesn't remove the single point of failure — it just relocates it (see §6).
+
+---
+
 ## 3. Algorithms
 
 | Algorithm | How | Best for |
@@ -151,6 +187,12 @@ The catch with plain hashing: if a server is removed, `hashCode % N` changes for
 
 **Random + "two choices" — pick two servers at random, route to the less loaded one.** Surprisingly close to optimal and dirt cheap, because it avoids every request rushing to the single least-loaded server at once.
 
+**Least Response Time — fewest active connections *and* lowest recent latency.** Least Connections only counts *how many* requests a server is handling, not how *fast*. Least Response Time also factors in each backend's recent response time, so a server with few connections that's responding slowly (GC pause, hot disk, a noisy neighbour) gets less traffic than its connection count alone would suggest. Best when latency matters and backends aren't perfectly uniform.
+
+**Weighted Least Connections — least connections, scaled by capacity.** Plain Least Connections assumes every server is equally powerful. The weighted variant divides each server's active connections by its weight (capacity), so a box twice as large can hold twice as many connections before it counts as "as busy" as a smaller one. It combines the "uneven request cost" logic of Least Connections with the "uneven server size" logic of Weighted Round Robin.
+
+> 💡 **tip** The "smart" algorithms (Least Response Time especially) need the LB to track live per-backend metrics. That bookkeeping is cheap on one LB, but when you run an HA pair/cluster each LB only knows the connections *it* routed — so two LBs can both think a backend is idle and pile on. Round robin has no such coordination problem.
+
 #### Q: Round Robin vs Least Connections — which is the default?
 
 - **Round Robin** if requests are short and uniform and servers are identical (each request takes about the same time). Simple, no bookkeeping.
@@ -194,6 +236,10 @@ health_check:
 ```
 
 Why a **threshold** (3 misses) instead of reacting to one? A single missed probe might just be a momentary blip — you don't want to yank a healthy backend over one hiccup (flapping). Requiring several misses in a row means "genuinely down," not "momentary hiccup."
+
+> ⚠️ **pitfall** A **shallow** `/health` that returns 200 whenever the process is running keeps a backend in rotation even when its DB pool is exhausted or a downstream is unreachable — every routed request then fails. Make critical checks **deep** (probe real dependencies), but keep them cheap and cache the result briefly so the probe itself doesn't hammer the DB.
+
+> 💡 **tip** Tune thresholds to avoid **flapping**. Too sensitive (1 miss → DOWN) yanks healthy backends on a blip; too lax (30 misses) keeps feeding a dead one. A few consecutive misses on a short interval is the usual balance.
 
 **Connection draining = don't cut off in-flight requests.** When you retire a backend (deploy/restart), you don't drop its current connections. You **stop routing new** requests to it, let its in-flight requests finish, *then* take it out. In-flight requests complete; no request is interrupted.
 
@@ -241,6 +287,10 @@ Ways to make it sticky:
 Sticky (fragile):     client → MUST return to server-B (only B has the session)
 Stateless (robust):   client → ANY server works; all read the session from shared Redis / the JWT
 ```
+
+> 💡 **tip** **Prefer stateless over sticky sessions.** Keep app servers stateless (session in Redis / a JWT) so any server can serve any request. Stickiness only exists to paper over servers hoarding local state — avoid it for anything new.
+
+> ⚠️ **pitfall** **Sticky sessions + rolling deploy = mass logouts.** A rolling deploy restarts backends one by one; every user pinned to a restarting server loses their local session. With a shared session store it's a non-event. If you *must* be sticky, drain connections and externalize the session first.
 
 #### Q: If stateless is better, why does stickiness still exist?
 
@@ -295,6 +345,49 @@ So "the load balancer" is usually a *highly-available cluster*, not a lone box �
 #### Q: How does the standby actually take over the VIP?
 
 The two LBs health-check each other (protocols like VRRP / keepalived). When the standby stops hearing heartbeats from the active one, it **claims the VIP** — it starts answering for that address. Because clients only ever talk to the VIP, the swap is invisible to them; in-flight users just continue against the same address.
+
+---
+
+## Slow Start and Ramp-Up
+
+When a fresh backend joins the pool (after a deploy, an autoscale event, or a recovery), it usually **isn't ready for its full share of traffic yet**:
+
+- **Cold caches** — its in-memory / local caches are empty, so early requests miss and fall through to the DB, making them slow.
+- **Cold runtime** — JITs (JVM, etc.) are slow until hot paths compile; connection pools and lazy singletons aren't initialized yet.
+- **Thundering herd on join** — a "least connections" LB sees the new server at **zero** connections and floods it with the next burst, overwhelming a node that isn't warm.
+
+**Slow start** fixes this: the LB ramps the new backend's weight up **gradually** (e.g. 0 → 100% over 30–60s) so it warms caches, pools, and hot paths under light load before taking a full share.
+
+> ⚠️ **pitfall** Without slow start, autoscaling can make latency *worse* exactly when you add capacity: each new node gets slammed cold, spikes latency/errors, and can even fail its health checks and get pulled — a flap loop. Ramp-up plus a warm-up delay before the node is marked healthy avoids it.
+
+---
+
+## Cross-Zone, Circuit Breaking, and Long-Lived Connections
+
+A few real-world concerns that surface once the basics are in place.
+
+**Cross-zone / cross-AZ balancing — a latency and cost trade-off.** In a multi-AZ deployment, an LB node in AZ-A can route to backends in AZ-B ("cross-zone"). Enabling it spreads load *evenly* across all backends regardless of zone, but every cross-zone hop adds a little latency and, on some clouds, **inter-AZ data-transfer cost**. Keeping traffic zone-local is cheaper and faster but risks imbalance when zones have unequal backend counts. Usual answer: balance zone-locally when zones are evenly sized, enable cross-zone when they aren't (or to survive a whole zone draining).
+
+**Circuit breaking and retry storms.** When a backend starts failing, naive **retries multiply load** — each client retry adds traffic to an already-struggling pool, causing more failures, triggering more retries: a **retry storm** that turns a small blip into an outage. Defenses at the LB / client:
+
+- **Circuit breaker** — after N failures to a backend, stop sending it requests for a cooldown, then probe cautiously before restoring it.
+- **Retry budgets / caps** — allow retries only up to a small % of traffic, never unbounded.
+- **Backoff + jitter** — spread retries out in time instead of synchronized hammering.
+
+> ⚠️ **pitfall** Retries and health checks interact badly: aggressive retries keep a dying backend (and its dependencies) *looking* busy long enough to drag down healthy peers. Cap retries and let the circuit breaker shed load.
+
+**gRPC / WebSocket — long-lived connections need connection-aware balancing.** Plain L4 balances *connections*, but gRPC/HTTP-2 and WebSockets hold **one long-lived connection** that carries many requests. An L4 LB pins that whole connection to a single backend, so a client that opens one connection and streams thousands of gRPC calls loads exactly one backend — and new backends added later get **no** traffic from existing connections. You need **L7 / connection-aware** balancing that spreads *per request or stream* (an L7 that understands HTTP-2 multiplexing, or client-side / service-mesh balancing) so calls fan out across backends even over a persistent connection.
+
+---
+
+## Common Mistakes
+
+- **Shallow health checks.** `/health` returns 200 whenever the process is up, so a backend that can't reach its DB/cache stays in rotation and swallows requests doomed to fail. Make critical checks deep (but cheap).
+- **Sticky sessions across a rolling deploy.** Restarting pinned backends logs users out. Externalize session state (Redis/JWT) so any server can take over.
+- **Health-check flapping with no thresholds.** Reacting to a single missed probe pulls healthy backends on a momentary blip and thrashes the pool. Require several consecutive misses (and a couple of good replies to re-add).
+- **Health checks that don't hit real dependencies.** A probe that only pings the web layer misses what actually breaks (DB, downstream service). If the request path depends on it, the check should touch it.
+- **No slow start.** New / autoscaled backends get full traffic cold, spike latency, and can flap. Ramp them up.
+- **Unbounded retries.** Retrying failures without caps or backoff turns a blip into a retry storm. Use circuit breakers + retry budgets.
 
 ---
 

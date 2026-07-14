@@ -26,10 +26,13 @@
 - [16. API / Protocol](#16-api--protocol)
 - [17. Sequences](#17-sequences)
 - [18. Consistency & Correctness](#18-consistency--correctness)
-- [19. Design Patterns (that can be used)](#19-design-patterns-that-can-be-used)
-- [20. Scaling & Failure](#20-scaling--failure)
-- [21. Interview Cheat Sheet](#21-interview-cheat-sheet)
-- [22. Final Takeaways](#22-final-takeaways)
+- [19. Scaling & Failure](#19-scaling--failure)
+- [20. Interview Cheat Sheet](#20-interview-cheat-sheet)
+- [21. Consistency & CAP Tradeoffs](#21-consistency--cap-tradeoffs)
+- [22. How to Drive the Interview (framework)](#22-how-to-drive-the-interview-framework)
+- [23. Reliability & Observability](#23-reliability--observability)
+- [24. Design Patterns (that can be used)](#24-design-patterns-that-can-be-used)
+- [25. Final Takeaways](#25-final-takeaways)
 
 ---
 
@@ -54,7 +57,7 @@ Break it into three jobs:
 
 Everything else in this doc — ticks, presence, groups, encryption — is a refinement on those three jobs.
 
-#### Q: Why is this harder than a normal website with a database?
+### Why this is harder than a normal website with a database
 
 A normal website is **pull**: your browser asks the server for a page, the server answers, done. Chat is **push**: the server has to reach *out* to your phone at a random moment (when someone messages you), and your phone might be asleep, on a train, or dead. Holding a live connection open to hundreds of millions of phones — and remembering which server each one is on — is the whole ballgame.
 
@@ -62,14 +65,27 @@ A normal website is **pull**: your browser asks the server for a page, the serve
 
 ## 2. Requirements
 
+> 💡 **Always start the interview here.** Clarifying scope out loud — and naming what you're *deferring* — frames every later decision and reads as senior.
+
 **Functional**
 - 1:1 and **group** messaging; real-time delivery.
 - **Delivery receipts** (sent ✓, delivered ✓✓, read ✓✓ blue), **typing**, **presence** (online/last-seen).
 - **Offline** users get messages on reconnect; **history sync across multiple devices**.
 - Media (images/video/docs/voice); **end-to-end encryption**.
 
-**Non-functional**
-- **Low latency** (<100ms in-region), **reliable** (no loss), **ordered per conversation**, **highly available**, huge scale (billions msg/day), **multi-device**, **secure**.
+### Non-Functional (NFRs)
+
+| NFR | Target / Note |
+| --- | --- |
+| **Consistency** | **Ordered per conversation** (via per-conversation `seq`, §8) and **no message loss** (persist-before-ack, §6). *Global* ordering across conversations is neither needed nor scalable. |
+| **Availability** | **High** — the connection/send path stays up under node loss (reconnect + resync). Presence can be stale (AP); the durable message write favors consistency (CP, §21). |
+| **Latency** | In-region delivery **<100–200ms** end-to-end for online users; "sent ✓" should feel instant (it's just the durable write). |
+| **Durability** | An accepted message must **never be lost** — persisted before the ack, retained until every device has it. |
+| **Scale** | Billions of msgs/day (~1.15M msg/sec avg, 2–3× peaks), hundreds of millions of concurrent connections, multi-device per user. |
+
+### Out of scope (state assumptions)
+
+- **Voice/video calls** (a separate real-time media/WebRTC problem), **server-side full-text search** (impossible under true E2E — nothing readable to index, §12), and **message edit/delete-for-everyone** (mention, then defer). Call these out, then focus on messaging.
 
 ---
 
@@ -115,7 +131,7 @@ A normal web request (REST) is one-shot: the client sends a request, gets one re
 
 That always-open connection is exactly what chat needs, because messages arrive at *unpredictable* times and the **server** must be able to initiate (push to you), not just answer when asked.
 
-#### Q: WebSocket vs. polling — why not just ask the server every few seconds?
+### WebSocket vs. polling — why not just ask the server every few seconds
 
 **Polling** = your phone asks "any new messages?" every, say, 3 seconds.
 
@@ -183,9 +199,9 @@ public class WebSocketGateway {
 - The **registry** entry (in Redis, shared) = what other nodes read to find this user (§5).
 - **Heartbeats + TTL:** mobile networks die silently (subway, dead battery) — no "goodbye" packet. So each entry expires after ~60s unless the phone keeps pinging. No ping → entry vanishes → the user is treated as offline.
 
-#### Q: Why can't I just move a connection to a different, less-busy server?
+### Why you can't just move a connection to a different, less-busy server
 
-Because the open socket is a physical thing pinned to one machine's memory and network card — you can't move a live connection to another machine. That's why we **balance by connection count** (send new connections to emptier nodes) and, on deploy, **drain gracefully** (stop accepting new connections, let existing ones migrate as clients reconnect) instead of yanking them.
+The open socket is a physical thing pinned to one machine's memory and network card — you can't move a live connection to another machine. That's why we **balance by connection count** (send new connections to emptier nodes) and, on deploy, **drain gracefully** (stop accepting new connections, let existing ones migrate as clients reconnect) instead of yanking them.
 
 ---
 
@@ -246,11 +262,11 @@ public class GatewayBusListener {
 }
 ```
 
-#### Q: Bus (pub-sub) vs. direct RPC — which one?
+### Bus (pub-sub) vs. direct RPC — which one
 
 Both are shown in the table above. The **bus** (Kafka/Redis pub-sub) decouples nodes: A doesn't need to know B's address or whether B is healthy — it just publishes "for gateway-B" and B picks it up. **Direct RPC** (A calls B's IP directly) is a hop faster but couples A to B's location and liveness. Most designs pick the bus for resilience at scale; a latency-obsessed design might RPC within a region.
 
-#### Q: What if the recipient reconnects to a *different* server mid-message?
+### What if the recipient reconnects to a different server mid-message
 
 That's exactly why the registry has a **short TTL and heartbeats** (§4). If Bob's phone hops from B to D, the old entry expires and a new one ("Bob is on D") appears within seconds. If a message is published to B just as Bob leaves, B's push fails — the message is still safely stored (§6 persists first), so Bob gets it on resync (§9). Nothing is lost.
 
@@ -321,9 +337,9 @@ Walk the numbered steps: **(1)** persist the message, **(2)** ack the sender, **
 
 "At-least-once" means we'd rather deliver a message **twice** than risk delivering it **zero** times. So on a flaky network the sender's app may resend, and the server may re-push. To stop you from *seeing* a message twice, every message carries a **`message_id` (a UUID the sender generates once)**. The server and the receiving app both check "have I already got this id?" and ignore repeats. Net effect: sent at-least-once on the wire, shown **exactly once** on your screen. This is the `store.exists(...)` check above and the client-side dedup.
 
-#### Q: Why does the sender get a ✓ so fast, before the recipient has it?
+### Why the sender gets a ✓ so fast, before the recipient has it
 
-Because the ✓ only means "**the server has safely stored it**" — not "delivered." Delivery to the other person is a separate, slower step (they might be offline). That's the whole point of the different ticks in §7: ✓ = stored, ✓✓ = on their device, blue = they read it.
+The ✓ only means "**the server has safely stored it**" — not "delivered." Delivery to the other person is a separate, slower step (they might be offline). That's the whole point of the different ticks in §7: ✓ = stored, ✓✓ = on their device, blue = they read it.
 
 ---
 
@@ -381,9 +397,18 @@ public class ReceiptService {
 
 No — that gap is the whole point. **✓✓** means the message *arrived on the device* (the app received it in the background, phone buzzed). **Blue** means the human actually *opened the chat and looked*. Your phone can receive 20 messages while in your pocket (all ✓✓) without you reading any of them (none blue yet). That's why "delivered" is reported automatically by the app on receipt, while "read" waits for you to open the conversation.
 
-#### Q: What if I turn off read receipts?
+### What happens if you turn off read receipts
 
 Then the client simply **doesn't send the "read" receipt** — the message still gets delivered (✓✓) and rendered, but no blue tick is ever emitted, so the sender never learns you read it. It's purely a client choice about whether to send that one little receipt message.
+
+#### Q: Is delivery at-least-once or exactly-once? How do I get "in-order, no duplicates"?
+
+The wire is **at-least-once** — true **exactly-once delivery is impossible** over an unreliable network (the sender can never be sure its ack wasn't the thing that got lost, so it must be allowed to retry). We *simulate* exactly-once at the application layer with two independent guarantees:
+
+- **No duplicates** → **idempotent dedup by `message_id`** (the UUID the sender minted once). The server ignores a re-send of an id it already stored; the receiving app ignores a re-push of an id it already rendered. Retries are therefore free.
+- **In order** → **per-conversation `seq` + per-partition ordering** (§8, §9). All of one conversation's messages live on one partition (`partition by conversation_id`), so they're written and read back in a single monotonic `seq` order; the client renders by `seq` and buffers gaps.
+
+> 💡 Put together: **at-least-once transport + idempotent apply + per-conversation ordering = "exactly-once, in-order" from the user's point of view.** You never *achieve* exactly-once on the wire; you make duplicates harmless and order deterministic.
 
 ---
 
@@ -422,9 +447,9 @@ class ConversationView {
 }
 ```
 
-#### Q: Why per-conversation ordering, not one global order for everything?
+### Why per-conversation ordering, not one global order for everything
 
-Because you only care that **one chat** reads in order — messages within your conversation with Alice must line up. You do **not** care whether your message to Alice is "before" or "after" someone else's unrelated message to Bob. Enforcing a single global counter across billions of messages would need one coordination bottleneck for the whole planet — impossible to scale, and pointless. Per-conversation `seq` keeps ordering exactly where it matters and lets different conversations run fully in parallel.
+You only care that **one chat** reads in order — messages within your conversation with Alice must line up. You do **not** care whether your message to Alice is "before" or "after" someone else's unrelated message to Bob. Enforcing a single global counter across billions of messages would need one coordination bottleneck for the whole planet — impossible to scale, and pointless. Per-conversation `seq` keeps ordering exactly where it matters and lets different conversations run fully in parallel.
 
 #### Q: Two people send at "the same time" — whose message is first?
 
@@ -510,15 +535,15 @@ public class SyncService {
 - **Why LSM / write-optimized?** Chat is a firehose of *writes* (100B messages/day). Wide-column stores use LSM trees, which turn writes into fast sequential appends — ideal for this.
 - **`last_delivered_seq` per device** is a cursor marking how far that device has received. Each of your devices (phone, laptop) has its own cursor, so each catches up independently (§13).
 
-#### Q: Where do offline messages actually "queue"? Is there a separate queue table?
+### Where offline messages actually "queue"
 
-Usually **no separate queue** — the "undelivered queue" is just a *view* of the message store: for a given device, it's `messages WHERE seq > that device's last_delivered_seq`. The messages are already stored durably (§6 persists before ack), so "undelivered" simply means "the device's bookmark hasn't reached them yet." Deliver = push them + advance the bookmark.
+Usually **no separate queue** table — the "undelivered queue" is just a *view* of the message store: for a given device, it's `messages WHERE seq > that device's last_delivered_seq`. The messages are already stored durably (§6 persists before ack), so "undelivered" simply means "the device's bookmark hasn't reached them yet." Deliver = push them + advance the bookmark.
 
 #### Q: WhatsApp deletes messages after delivery — so where's my history?
 
 On your **devices**, not the server. Because WhatsApp is end-to-end encrypted (§12), the server can't read your messages and deletes the ciphertext once every device has received it. Your chat history lives in your phone's local database (and encrypted backups). Slack/Messenger are different: they keep history **server-side** (so you can search it and load it on any fresh device), which is why they need a much bigger store plus a search index.
 
-#### Q: What's the push notification for if the message is already stored?
+### What the push notification is for if the message is already stored
 
 The stored message just sits there silently — the phone won't know to reconnect and grab it. The push notification (APNS on iOS, FCM on Android) is the external nudge: it wakes the phone/app enough to alert the user and trigger a reconnect + resync. Without it, an offline user wouldn't see the message until they happened to open the app.
 
@@ -578,15 +603,15 @@ public void deliverGroupMessage(GroupMessage gm) {
 | **Fan-out on read** | 1 write | scan the shared group log | large groups |
 | **Hybrid** | small→write, large→read | either | real systems |
 
-#### Q: Why not always fan-out on write? It makes reads so fast.
+### Why not always fan-out on write, since it makes reads so fast
 
-Because for a **10,000-member** group, one message would trigger 10,000 writes/pushes — and if 50 people are chatting, that's half a million deliveries a second for a single group. The sender would be blocked forever and the store would melt. So for big groups we **write once** to the group log and let members pull. Real systems go **hybrid**: fan-out on write for small groups (fast, cheap enough), fan-out on read for large ones.
+For a **10,000-member** group, one message would trigger 10,000 writes/pushes — and if 50 people are chatting, that's half a million deliveries a second for a single group. The sender would be blocked forever and the store would melt. So for big groups we **write once** to the group log and let members pull. Real systems go **hybrid**: fan-out on write for small groups (fast, cheap enough), fan-out on read for large ones.
 
-#### Q: Never block the sender — what does that mean?
+### "Never block the sender" — what that means
 
 The sender should get their ✓ the instant the message is **stored**, not after all N members receive it. So fan-out happens **asynchronously and in batches** *after* acking the sender. Whether a group has 3 or 3,000 members, the sender's "sent" is equally fast; the deliveries fan out in the background.
 
-#### Q: How do groups stay in order if everyone's sending?
+### How groups stay in order if everyone's sending
 
 Same trick as 1:1 (§8), but the **`seq` is per-group**, assigned by the group's coordinator/partition. Everyone's messages funnel through that one sequencer, so every member ends up displaying the identical order. And encrypted groups use **Sender Keys** (§12) so the sender encrypts the message **once** rather than N times — otherwise big-group encryption would be as expensive as the naive fan-out.
 
@@ -640,11 +665,11 @@ public class PresenceService {
 
 The subtle part: mobile connections die **silently** (subway, dead battery) with no "goodbye" packet, so we can't rely on `markOffline` being called. The **TTL is the safety net** — if heartbeats stop, the `presence:` key simply expires on its own within 30s and the user flips to offline automatically.
 
-#### Q: Why Redis and not the main database for presence?
+### Why Redis and not the main database for presence
 
-Because presence is **high-churn and disposable**. Millions of people flip online/offline constantly — that's a storm of tiny, short-lived writes. A durable SQL database would choke and it'd be pointless to persist "online" (it's stale in seconds). Redis is in-memory, blazing fast, and has **TTL built in** (the auto-expiry above). We only persist the occasional `last_seen` value durably.
+Presence is **high-churn and disposable**. Millions of people flip online/offline constantly — that's a storm of tiny, short-lived writes. A durable SQL database would choke and it'd be pointless to persist "online" (it's stale in seconds). Redis is in-memory, blazing fast, and has **TTL built in** (the auto-expiry above). We only persist the occasional `last_seen` value durably.
 
-#### Q: What's the N² storm, and why "fan out only to interested parties"?
+### What the N² storm is, and why we "fan out only to interested parties"
 
 Imagine 100 million people come online at 8am. If we notified **every contact of every user**, that's each person's presence change pushed to hundreds of contacts × millions of people = a catastrophic flood (roughly N² messages). Instead, we only tell the people who are **actually looking right now** — someone with your chat open, or viewing your contact. Everyone else finds out your status lazily, the next time they open your chat. Same idea for **typing indicators**: a pure ephemeral "Bob is typing…" event pushed only to whoever's in that chat, and **never stored** at all.
 
@@ -674,6 +699,49 @@ WhatsApp uses the **Signal protocol** — the server **routes ciphertext it cann
 - **Group encryption = Sender Keys:** each member generates a *sender key*, distributes it (pairwise-encrypted) to the group once; then encrypts each group message **once** with its sender key → recipients decrypt with the stored sender key. Avoids encrypting N times per message.
 - **Trade-off:** true E2E makes **server-side search/history impossible** (server can't read content) → history lives on devices; multi-device needs careful key sharing (§13).
 
+### The pieces in plain language (analogies)
+
+The jargon is the scary part; the ideas are simple. First encounter with each term below gets an everyday analogy:
+
+- **Prekeys** 💡 — think of a stack of **pre-addressed, sealed envelopes** you leave at the front desk (the server). Anyone can grab one and send you a secret message *even while you're asleep* — they don't need you online to start a conversation. Each envelope is single-use.
+- **X3DH** (Extended Triple Diffie-Hellman) 💡 — the **handshake that agrees on a shared secret** without ever sending it. Like two people mixing paints: each keeps a private color, they exchange public colors, and both mix to the *same* final shade — but an eavesdropper who saw only the public colors can't reproduce it. It combines several key pairs (identity + prekeys) so a session can be set up from just the recipient's published bundle.
+- **Double Ratchet** 💡 — a **key that changes with every single message**, like a rotating one-time pad. Two "ratchets" click forward (one per message, one per reply) so each message uses a fresh key. Result: **forward secrecy** (stealing today's key can't decrypt yesterday's messages) and **break-in recovery** (it self-heals on the next exchange).
+- **Sender Keys** 💡 — for groups: instead of re-encrypting a message once *per member*, you hand each member a **shared group "decoder" key** (delivered privately, once), then broadcast **one** ciphertext everyone can open. Like giving each guest a copy of the same house key rather than escorting each one in individually.
+
+#### Q: If it's end-to-end encrypted, what can the server *still* see?
+
+Plenty of **metadata**, just not content. The server routes ciphertext, so it can see **who is talking to whom, when, how often, message sizes/timing, who's in which group, online/last-seen, and IP/device info** — everything except the actual words, which only the endpoints can decrypt. ⚠️ E2E protects *message content*, not *the fact that you messaged someone*. That metadata is exactly what powers routing, receipts, and presence — and it's the honest caveat to state in an interview.
+
+#### Q: What happens if a user's one-time prekeys run out?
+
+Prekeys are consumed one-per-new-session, so a popular account can exhaust the uploaded batch before the client re-uploads more. To avoid ever being un-messageable, each device also publishes a **signed "last-resort" prekey** that the server can hand out **repeatedly** when the one-time stack is empty. A session can still be established; it's just slightly weaker (that one key is reused until the client tops up its batch). Clients replenish the one-time prekeys whenever they come online, so the shared stack normally stays full.
+
+#### Q: In a group, how do we avoid N separate encryptions per message (Sender Keys)?
+
+Naively, encrypting a group message means running the pairwise (Double Ratchet) encryption **once for every recipient** — a 256-member group = 256 encryptions per message. **Sender Keys** fix this: each sender generates one **sender key** and distributes it **once** to every member over the existing pairwise-encrypted channels. After that, the sender encrypts each message **a single time** with its sender key and the server fans out that **one** ciphertext to everyone. The expensive per-member work happens once at setup, not on every message.
+
+### Group membership changes → Sender Key rotation
+
+When the group roster changes, sender keys must be re-managed so the right people (and only them) can read new traffic:
+
+- **Add a member** → each existing member sends **their current sender key** to the new member (pairwise-encrypted). The newcomer can now decrypt subsequent messages — but **not** past ones (it never had the earlier keys), which is the desired behavior.
+- **Remove a member** ⚠️ → every remaining member must **rotate (regenerate) their sender key** and redistribute it to the *remaining* members. Otherwise the removed member, who still holds the old sender key, could keep decrypting new messages. This "rotate on removal" step is the group-chat equivalent of changing the locks when someone leaves.
+
+### Design fork — server-side (Slack) vs E2E (WhatsApp)
+
+Whether the server can read content is the single biggest fork in this design. It's worth stating explicitly which product you're building:
+
+| Aspect | **E2E (WhatsApp/Signal)** | **Server-side encryption (Slack/Messenger default)** |
+| --- | --- | --- |
+| Who can read content | **Only the endpoints** | Server can (encrypted at rest, but service holds keys) |
+| Server-side search | ❌ Impossible (nothing readable) | ✅ Full-text search index |
+| History on a fresh device | From device transfer / encrypted backup | ✅ Loads from server instantly |
+| Message store retention | **Delete ciphertext once delivered** to all devices → tiny | **Retain full history** → big store + search index |
+| Multi-device | Hard — per-device keys + key sharing (§13) | Easy — server just serves history to any device |
+| Compliance/moderation | Limited (can't scan content) | Server-side scanning possible |
+
+> 💡 The trade is **privacy vs. features**: E2E buys ironclad confidentiality but forfeits server-side search, easy multi-device, and cheap history restore. Name the product early so the interviewer knows which set of constraints you've signed up for.
+
 ---
 
 ## 13. Multi-Device Sync
@@ -689,6 +757,27 @@ A user has phone + laptop + tablet — all must show the same conversations.
 | **Send from any device** | Message also delivered back to the sender's **other devices** (self-fan-out) to keep them in sync |
 
 > **Interview point:** multi-device turns 1:1 into **device-level fan-out** — encrypt/deliver per device, sync read state, and keep each device's Signal session. It's why E2E multi-device is genuinely hard.
+
+### Linking a new device (the sequence)
+
+Each device is its **own** Signal identity, so linking a laptop isn't "log in" — it's "enroll a new endpoint and catch it up":
+
+```
+1. LINK        laptop shows a QR; phone scans it → authenticates the new device to the account
+2. REGISTER    laptop generates its own identity key + prekeys → uploads them to the server
+               → other people's clients now encrypt to this device too (per-device fan-out)
+3. HISTORY     recent history transferred to the laptop (encrypted device-to-device,
+               or restored from an encrypted backup) — the server never sees plaintext
+4. SELF-FANOUT from now on, every NEW message (sent to OR by any of the user's devices) is
+               also encrypted + delivered to all the user's OTHER devices → they stay in sync
+5. READ STATE  last_read_seq syncs across devices so unread badges match everywhere
+```
+
+The key mental shift: a "user" is really a **set of devices**, and every message the user is party to must be fanned out to **each** of those devices (each with its own encrypted copy).
+
+#### Q: My phone is off — can my laptop still receive messages?
+
+Yes, on WhatsApp's modern **multi-device** design: each linked device holds its **own** Signal session and is a first-class endpoint, so senders encrypt directly to the laptop's keys and the server routes to it independently. The phone does **not** have to relay. (Older "companion mode" tethered everything to the phone — if the phone was offline, linked devices couldn't sync. The move to independent per-device sessions is exactly what removed that limitation.) Whichever devices are offline just **resync from their own `last_delivered_seq`** (§9) when they reconnect.
 
 ---
 
@@ -742,6 +831,19 @@ CREATE TABLE blocked_users ( user_id BIGINT, blocked_id BIGINT, PRIMARY KEY (use
 
 > **Tables to consider:** users, devices, prekeys, conversations, conversation_members, messages, message_receipts, group_metadata, blocked_users. Connection/presence = Redis; media = blob/CDN.
 
+### Database & storage choices (which DB, and why at scale)
+
+No single database fits every job here, so we use **polyglot persistence** — pick the store that matches each data type's access pattern. The deciding question for the message data is *"is this a write-heavy, append-only firehose, or a low-volume relational lookup?"* Messages are the firehose; everything else is a lookup.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Messages (the firehose) | **Wide-column** (Cassandra/ScyllaDB) | Partition by `conversation_id`, cluster by `seq` → "give me everything after seq X" is one contiguous range scan on one partition; the LSM-tree write path absorbs ~1.15M msg/sec of pure appends (§3). | An RDBMS row-store chokes on this write volume — every insert also maintains B-tree indexes, and once one table gets this hot, vertical scaling runs out. Wide-column's horizontal partitioning is built for exactly this shape. |
+| Users, devices, prekeys, conversations, conversation_members, message_receipts, group_metadata | **RDBMS** (PostgreSQL/MySQL) | Low-volume, relational lookups with joins ("who's in this group," "what's my last-read seq") — a normal transactional model is simplest here, and none of it sees firehose write pressure. | Forcing everything into wide-column just for consistency loses real joins/transactions on data that's naturally relational and doesn't need write-scale. |
+| Connection registry + presence | **Redis** | High-churn, ephemeral, TTL-based (§4, §11) — millions of connect/disconnect/heartbeat events per second that are stale within seconds. In-memory + built-in expiry is exactly the shape needed. | A durable DB would be pointless write load for data nobody needs to recover, and it can't auto-expire cheaply at this churn rate. |
+| Media (images/video/voice) | **Blob store + CDN** (S3/CloudFront) | Large binary payloads served from the edge, keeping big bytes off the message-store hot path. | Storing media bytes in the message store would bloat partitions and wreck the append-only write pattern that makes wide-column fast. |
+
+**Why wide-column wins for messages at this scale:** the access pattern is always "append the newest message" and "range-scan everything after seq X for one conversation" (§9) — never an ad-hoc filter across conversations. That maps perfectly onto **partition by `conversation_id`, cluster by `seq`**: writes land on the tail of one partition (a cheap LSM append) and catch-up reads are a contiguous scan. Scale further by adding nodes — conversations spread across the cluster by partition key, so one hot group chat is isolated to its own partition instead of contending with the rest of the table. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
+
 ### A tour of the tables
 
 Here's what each table stores and the one detail that makes it tick:
@@ -777,7 +879,19 @@ WHERE  m.conversation_id = 7
   AND  m.seq > cm.last_read_seq;   -- everything after where they last read
 ```
 
-#### Q: Why is `messages` a wide-column table but the rest look like normal SQL?
+### Block / unblock (using `blocked_users`)
+
+Blocking is a **routing filter**, not a delete. **Block** = insert `(user_id, blocked_id)`; **unblock** = delete that row. On the send path, before routing a message from A to B, the server checks "has B blocked A?" — if so it silently **accepts and drops** it: A still sees a single ✓ (it was stored), but it's never delivered, so no ✓✓ ever appears and B is never notified. That asymmetry is deliberate — the blocker's privacy is preserved and the blocked user isn't told they've been blocked.
+
+```java
+if (blockedUsers.isBlocked(/* blocker= */ recipientId, /* blocked= */ senderId)) {
+    return new Ack(clientMsgId, seq, "SENT");   // accept + drop; never route to B
+}
+```
+
+⚠️ Enforce blocking **server-side**, not just by hiding messages on the client — otherwise a modified client could bypass it. Presence/typing to the blocked party are suppressed the same way.
+
+### Why `messages` is a wide-column table but the rest look like normal SQL
 
 `messages` is the **firehose** — billions of writes a day, and the hot query is always "give me a conversation's messages after seq X." Partitioning by `conversation_id` and sorting by `seq` makes that a single contiguous read, and wide-column stores (Cassandra/HBase) absorb massive write volume via LSM trees. The other tables (`users`, `devices`, membership) are **low-volume, relational lookups** — a normal relational model is clearer there. The SQL shown is illustrative; a real deployment mixes a wide-column store for `messages` with a relational/KV store for the metadata.
 
@@ -846,24 +960,7 @@ ChatSvc → range scan messages WHERE conversation_id=? AND seq>42 → stream �
 
 ---
 
-## 19. Design Patterns (that can be used)
-
-| Pattern | Where | Why |
-| --- | --- | --- |
-| **Observer / Pub-Sub** | Route messages/presence to subscribers | Decouple sender from recipients |
-| **Publish-Subscribe (broker)** | Kafka/Redis bus between gateways | Route across gateway nodes |
-| **Mediator** | Chat Service coordinates sender↔recipient gateways | Central routing |
-| **Registry** | Connection registry (user/device → node) | Locate recipients |
-| **Strategy** | Group fan-out (write/read/hybrid) | Swap per group size |
-| **State** | Message status (SENT→DELIVERED→READ) | Guarded transitions |
-| **Command** | Client actions (send/receipt/typing) as typed frames | Uniform protocol |
-| **Proxy** | Gateway proxies client ⇄ backend | Connection handling |
-| **Ports & Adapters** | Push (APNS/FCM), blob store, message store | Swap providers |
-| **Producer-Consumer** | Offline queue + delivery workers | Buffer + async deliver |
-
----
-
-## 20. Scaling & Failure
+## 19. Scaling & Failure
 
 - **Gateways** scale horizontally; Redis **connection registry** so any node can route; ~1M conns/node.
 - **Inter-gateway routing** via pub-sub bus; sender's node publishes, recipient's node pushes.
@@ -875,7 +972,7 @@ ChatSvc → range scan messages WHERE conversation_id=? AND seq>42 → stream �
 
 ---
 
-## 21. Interview Cheat Sheet
+## 20. Interview Cheat Sheet
 
 > **"How does a message reach an online recipient across servers?"**
 > "Sender's gateway hands it to the Chat Service, which persists it (durability first) and acks 'sent'. It looks up the recipient in a Redis **connection registry** (user/device → gateway node) and routes the message over an **inter-gateway pub-sub bus** to the recipient's node, which pushes it down their WebSocket. Offline → keep in store + push notification, deliver on reconnect."
@@ -895,9 +992,94 @@ ChatSvc → range scan messages WHERE conversation_id=? AND seq>42 → stream �
 > **"Huge group messages?"**
 > "Hybrid fan-out (read-fan-out for large groups), async + batched; per-group seq for order; Sender Keys so encryption is once, not per member."
 
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Celebrity / 100k-member group blasts a message** | Never fan-out-on-write to 100k inboxes synchronously → **read-fan-out**: write once to the group log, members pull on catch-up; **async + batched** nudges; the group's partition is a **hot partition** → isolate it (dedicated/partitioned sequencer) and cache recent messages. Encrypt **once** via Sender Keys (§12). |
+| **User offline for a week, then reconnects** | No loss — messages sat durably in the store. Client sends its `last_delivered_seq` per conversation; server does a **range scan for `seq > cursor`** and streams the backlog in order (§9), then advances the cursor. A big backlog is just a bigger contiguous scan. |
+| **Lost / changed device (re-install)** | New device = **new Signal identity**: it uploads fresh identity key + prekeys, so **sessions reset** and the contact's **safety number changes** (the "security code changed" warning ⚠️). History isn't on the server (E2E) → restore from encrypted backup / device transfer (§13). |
+| **Duplicate delivery on retry** | Harmless by design — **dedup by `message_id`** (§6): the server skips storing an id it already has (idempotent ack) and the receiving app skips rendering an id it already showed. At-least-once wire, exactly-once on screen (§7). |
+| **Recipient hops gateways mid-send** | Registry entry has a **short TTL + heartbeats** (§4); a push to the stale node fails, but the message is already persisted → delivered on resync. Nothing lost (§5). |
+
+> **Ultimate layer model:** persist-before-ack = no loss · `message_id` dedup = no duplicates · per-conversation `seq` = order · registry + bus = routing · Signal/Sender Keys = privacy.
+
 ---
 
-## 22. Final Takeaways
+## 21. Consistency & CAP Tradeoffs
+
+> Interviewers love: "Where do you choose consistency vs availability?" Chat's answer differs per data type.
+
+| Path | Choice | Why |
+| --- | --- | --- |
+| **Message accept (durable write)** | **CP** (consistency/durability) | **Persist before ack** (§6) — we'd rather reject/retry a send than acknowledge a message we might lose. Durability wins over raw availability on the write. |
+| **Ordering within a conversation** | **Strong, per-conversation** | A single monotonic `seq` per conversation (§8) gives one definite order; no global order (unnecessary and unscalable). |
+| **Message delivery / offline sync** | **Eventually consistent** | At-least-once + dedup + resync-from-cursor (§7, §9) — a device converges to the full, in-order history whenever it reconnects. |
+| **Presence / typing** | **AP** (availability + eventual) | High-churn, disposable, TTL-based in Redis (§11). Stale "online/last-seen" for a few seconds is fine; never block messaging on presence. |
+| **Receipts (✓✓ / blue)** | **Eventual** | Receipts are just tiny messages flowing back (§7); they converge but aren't on the critical send path. |
+
+- The message write is **strongly consistent and durable at the store**; everything user-visible around it (delivery, receipts, presence, multi-device state) is **eventually consistent** and self-heals on reconnect.
+- There is **no global order** across conversations — ordering is strong exactly where it matters (one chat) and fully parallel everywhere else.
+
+> One-liner: **"Strong durability + per-conversation order on the write path; eventual consistency for delivery, presence, and receipts — the client converges on reconnect."**
+
+---
+
+## 22. How to Drive the Interview (framework)
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on 5–6.
+
+1. **Clarify requirements** (functional + NFRs) and **name what's out of scope** — §2
+2. **Estimate scale** (connections vs message throughput — the two cost centers) — §3
+3. **Sketch the connection + routing model** (gateways, registry, inter-gateway bus) — §4, §5
+4. **Walk the 1:1 send path**, leading with **persist-before-ack** — §6
+5. **Deep dive: the hard parts** → reliable/ordered delivery, offline sync, groups/fan-out — §7–§10
+6. **Deep dive: E2E encryption + multi-device** (the WhatsApp-specific crux) — §12, §13
+7. **Address scale + failure + edge cases** — §19, §21, §23, cheat sheet
+8. **Summarize tradeoffs** — §21, §24
+
+> 🎤 **Lead with the core challenge:** state up front that "the crux is pushing messages reliably and in order to hundreds of millions of persistent connections, with offline sync and (for WhatsApp) end-to-end encryption," then spend most of your time there. Decide **E2E vs server-side (§12)** early — it reshapes storage, search, and multi-device.
+
+---
+
+## 23. Reliability & Observability
+
+- **No single point of failure** — gateways scale horizontally (any node can route via the Redis registry + bus); message store is partitioned + replicated; multi-AZ Redis for registry/presence.
+- **Graceful degradation** — on deploy, gateways **drain** (stop new connections, let clients reconnect elsewhere); if presence/Redis is degraded, messaging still works (presence just goes stale).
+- **Idempotent everywhere** — dedup by `message_id` on both server and client makes every retry safe.
+- **Backpressure** — never block the sender on N-member fan-out; deliver async + batched (§10).
+
+### Key signals to monitor
+
+| Signal | Why it matters |
+| --- | --- |
+| **Concurrent connection count / node** | Capacity + balance — a node near its ~1M-conn ceiling needs shedding; sudden drops = mass disconnects. |
+| **Message ingest lag** (accept → persisted) | Guards the persist-before-ack contract; rising lag risks send timeouts. |
+| **Delivery latency percentiles** (p50/p95/**p99**) | The real user-felt "did it arrive fast?"; tail latency exposes hot partitions / slow gateways. |
+| **Gateway-registry staleness** | Stale `conn:user` entries (missed heartbeats) cause failed pushes → over-reliance on resync; watch TTL expiry vs reconnect rates. |
+| **Fan-out backlog / hot partition** | A celebrity group or spike can back up delivery workers — alert before it cascades. |
+| **Push-notification (APNS/FCM) success rate** | The only nudge for offline users; silent failures mean missed messages until manual app open. |
+
+---
+
+## 24. Design Patterns (that can be used)
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Observer / Pub-Sub** | Route messages/presence to subscribers | Decouple sender from recipients |
+| **Publish-Subscribe (broker)** | Kafka/Redis bus between gateways | Route across gateway nodes |
+| **Mediator** | Chat Service coordinates sender↔recipient gateways | Central routing |
+| **Registry** | Connection registry (user/device → node) | Locate recipients |
+| **Strategy** | Group fan-out (write/read/hybrid) | Swap per group size |
+| **State** | Message status (SENT→DELIVERED→READ) | Guarded transitions |
+| **Command** | Client actions (send/receipt/typing) as typed frames | Uniform protocol |
+| **Proxy** | Gateway proxies client ⇄ backend | Connection handling |
+| **Ports & Adapters** | Push (APNS/FCM), blob store, message store | Swap providers |
+| **Producer-Consumer** | Offline queue + delivery workers | Buffer + async deliver |
+
+---
+
+## 25. Final Takeaways
 
 - **Persistent WebSocket gateways** + **Redis connection registry** (user/device → node) + **inter-gateway pub-sub bus** = routing across nodes.
 - **Persist before ack** + **client dedup by message_id** + **per-conversation seq** = reliable, ordered, no-dupe (at-least-once).

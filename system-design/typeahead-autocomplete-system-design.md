@@ -20,10 +20,11 @@
 - [10. Data Model / Stores](#10-data-model--stores)
 - [11. API Design](#11-api-design)
 - [12. Sequences](#12-sequences)
-- [13. Design Patterns (that can be used)](#13-design-patterns-that-can-be-used)
-- [14. Scaling & Failure](#14-scaling--failure)
-- [15. Interview Cheat Sheet](#15-interview-cheat-sheet)
-- [16. Final Takeaways](#16-final-takeaways)
+- [13. Scaling & Failure](#13-scaling--failure)
+- [14. Interview Cheat Sheet](#14-interview-cheat-sheet)
+- [15. How to Drive the Interview](#15-how-to-drive-the-interview)
+- [16. Design Patterns (that can be used)](#16-design-patterns-that-can-be-used)
+- [17. Final Takeaways](#17-final-takeaways)
 
 ---
 
@@ -77,6 +78,8 @@ Instead of "search all queries starting with `net`," store — once — a tiny n
 
 ## 2. Requirements
 
+> 💡 **Start here in the interview.** Clarify functional scope + NFRs out loud before touching the trie — it frames every later decision (why in-memory, why eventual consistency, why an offline rebuild).
+
 **Functional**
 - Given a prefix, return **top-k** (5–10) suggestions ranked by popularity/relevance.
 - Update suggestions as trends change (new popular queries appear).
@@ -85,6 +88,20 @@ Instead of "search all queries starting with `net`," store — once — a tiny n
 **Non-functional**
 - **Very low latency** (<10–50ms) per keystroke; **huge QPS** (multiple lookups per search).
 - **Eventual consistency** of rankings is fine (a new trend can lag minutes/hours).
+
+### Non-Functional (NFRs)
+
+| NFR | Target / Note |
+| --- | --- |
+| **Latency** | **p99 < 50ms** end-to-end per keystroke (server budget ~10ms) — suggestions must land before the next keystroke, or they're useless. |
+| **Consistency** | **Eventual** for rankings — a new trend appearing minutes/hours late is fine. There's no "correctness" to violate (unlike a seat or a payment). |
+| **Availability** | **High (AP).** Autocomplete is a convenience layer; on failure, degrade to *no suggestions* rather than block the search box. |
+| **Scale** | Extremely **read-heavy**; autocomplete QPS ≈ 5–10× search QPS. The write path (rebuild) is rare and offline. |
+| **Freshness** | Trending terms may lag one rebuild cycle (minutes–hours) — acceptable. |
+
+### Out of scope (state assumptions)
+
+- Full search *results* ranking (this is only the *suggestion* box), voice input, cross-device sync of personal history, and spell-correction as a standalone product feature — mention, then defer.
 
 ---
 
@@ -276,9 +293,7 @@ You *could* use a plain `Map<String, List<Suggestion>>` (`"net" → [...]`), and
 
 For pure serving, a flat map is simpler and often faster; the trie is the mental model and the thing the builder produces. Both store **the precomputed top-k** — that's the part that matters.
 
-#### Q: Why store only top-k and not the full list of descendants at each node?
-
-Because `net` might have thousands of completions, but the dropdown only shows ~10. Storing all of them at every node would blow up memory (§9). We keep just the **top-k** (say 10) — the only ones a user will ever see — and let the rare "give me more" case fall back to a subtree scan or be omitted (long tail).
+It's also worth being deliberate about storing only **top-k**, not the full list of descendants, at each node: `net` might have thousands of completions, but the dropdown only shows ~10. Storing all of them at every node would blow up memory (§9). We keep just the **top-k** (say 10) — the only ones a user will ever see — and let the rare "give me more" case fall back to a subtree scan or be omitted (long tail).
 
 ---
 
@@ -332,9 +347,15 @@ List<Suggestion> autocomplete(String prefix) {
 
 This is **cache-aside**: check the cache, fall back to the source (the trie) on a miss, then populate the cache. The short TTL is fine because rankings only change on rebuild.
 
-#### Q: If the trie is already in-memory and fast, why cache on top of it?
+If the trie is already in-memory and fast, why cache on top of it at all? Two reasons: (1) a Redis/CDN hit can be served **closer to the user** (edge) and offloads the suggestion nodes entirely for the few super-hot prefixes that dominate traffic; (2) it protects the suggestion nodes from being hammered by the same handful of prefixes. The trie handles the long tail; the cache absorbs the head.
 
-Two reasons: (1) a Redis/CDN hit can be served **closer to the user** (edge) and offloads the suggestion nodes entirely for the few super-hot prefixes that dominate traffic; (2) it protects the suggestion nodes from being hammered by the same handful of prefixes. The trie handles the long tail; the cache absorbs the head.
+#### Q: Should we suggest on the very first character?
+
+Usually **no — wait until ~2 characters.** A single letter (`a`) matches almost everything, so its top-k is generic ("amazon", "amazon prime") and rarely what the user actually wants — yet `a`/`s`/`t` are the *highest-QPS, hottest-shard* prefixes of all. Enforcing a **minimum prefix length** (commonly 2–3 chars) kills a huge slice of low-value, load-heavy requests *and* improves suggestion quality. The very short prefixes you *do* choose to serve are exactly the ones you cache hardest.
+
+#### Q: What if the user types faster than the debounce window?
+
+That's precisely what debounce is *for*. If keystrokes arrive closer together than the delay (say <80ms apart), the timer keeps resetting and **no request fires until the user pauses** — a fast typist banging out `netflix` sends **one** request for `netflix`, not seven. The in-between prefixes (`n`, `ne`, ...) never reach the server at all. The real risk is the opposite: too *long* a debounce feels laggy, so tune it (~50–100ms) — long enough to skip intermediate keystrokes, short enough to feel instant. Also **discard stale responses**: if `net`'s response comes back *after* `netf` was already sent, drop it (tag each response with its query and ignore mismatches), or the dropdown flickers with outdated suggestions.
 
 ---
 
@@ -422,6 +443,80 @@ void offerToNode(TrieNode node, Suggestion cand) {
 
 Because `netflix` sits under `n`, `ne`, `net`, `netf`, ... it gets offered to each of those nodes, so **every prefix ends up knowing its own best completions**. (Real builders use a bounded min-heap per node instead of sort-then-trim, but the idea is identical.)
 
+### The top-k build, done right — post-order merge (the hard part)
+
+The insert-time approach above works but is wasteful: it re-offers and re-sorts at *every* node on *every* query's path. The canonical builder computes each node's top-k in **one bottom-up (post-order) pass**, using a key insight:
+
+> A node's top-k is just the **k best among its own word (if any) + the top-k lists its children already computed.** You never scan the whole subtree — because each child already summarized the best of everything beneath it into its own k-sized list.
+
+So you recurse to the children **first**, then **k-way merge** their (already-small) top-k lists into the parent. That's the whole trick.
+
+```java
+// Compute topK for every node in ONE post-order pass.
+// Each node's topK = best k among (its own word, if terminal) + the topK of its children.
+// We merge only k-sized lists — never the full subtree.
+List<Suggestion> computeTopK(TrieNode node) {
+    PriorityQueue<Suggestion> best =                       // min-heap: lowest score at head
+        new PriorityQueue<>(Comparator.comparingLong(Suggestion::score));
+
+    if (node.isWord) offer(best, new Suggestion(node.word, node.score));
+
+    for (TrieNode child : node.children.values()) {
+        List<Suggestion> childTopK = computeTopK(child);   // recurse FIRST (post-order)
+        for (Suggestion s : childTopK) offer(best, s);     // merge the child's k candidates
+    }
+
+    node.topK = drainDescending(best);                     // staple the answer onto the node
+    return node.topK;
+}
+
+// Keep the heap bounded to K: add, then evict the current lowest if we exceed K.
+void offer(PriorityQueue<Suggestion> best, Suggestion s) {
+    best.offer(s);
+    if (best.size() > K) best.poll();   // drop the smallest score
+}
+```
+
+#### Worked example (k = 2)
+
+Queries and scores: `to`(90), `tea`(80), `ted`(70), `ten`(50). The trie:
+
+```
+(root)─t─┬─o          (word "to", 90)
+         └─e─┬─a       (word "tea", 80)
+             ├─d       (word "ted", 70)
+             └─n       (word "ten", 50)
+```
+
+Post-order fills top-2 **from the leaves up**:
+
+```
+leaf "to"  → [to:90]        leaf "tea" → [tea:80]
+leaf "ted" → [ted:70]       leaf "ten" → [ten:50]
+
+node "te"  = merge children [tea:80],[ted:70],[ten:50]      → top-2 = [tea:80, ted:70]
+node "t"   = merge children [to:90] and "te"'s [tea:80,ted:70] → top-2 = [to:90, tea:80]
+(root)     = merge "t"'s [to:90, tea:80]                     → top-2 = [to:90, tea:80]
+```
+
+Notice node `t` only had to look at **4 candidates** (`to` + `te`'s two + nothing else), *not* all four words re-scanned — because `te` had already distilled its subtree down to its best 2. That compounding is what makes the merge cheap.
+
+#### Complexity
+
+Let `N` = number of trie nodes and `C` = max children per node (≤ alphabet size). Each node merges at most `C·K + 1` candidates into a size-`K` heap → `O(C·K·log K)` per node, so the full build is roughly **`O(N·K·log K)`** — linear in the trie for a fixed `k`. Equivalently, each query contributes only to the nodes along its own path, so total work is bounded by `Σ(word length)·K`.
+
+> 💡 **Why this beats query-time DFS:** answering `net` by DFS-ing its subtree is `O(subtree size)` **per request**, millions of times a second. The post-order build pays a one-time `O(N·K·log K)` offline and turns every read into an `O(prefix)` pointer walk. Precompute once, read forever.
+
+> ⚠️ **Ties & determinism:** when scores tie, break ties deterministically (e.g. by alphabetical text) so the same build always yields the same lists — otherwise A/B comparisons and cache keys get noisy.
+
+### Safety filter & breaking-news boost
+
+> ⚠️ **Autocomplete is a megaphone — filter *before* you amplify.** A slur or a leaked phone number that reaches the top-k gets shown to millions. Use two layers:
+> - **Build-time filter** — drop profanity, spam, and PII (`isSpamOrOffensiveOrPII` above) so they never enter the trie at all.
+> - **Read-time safe-search** — an allow/deny list applied at serving time (toggled by the `safe` param, §11) catches context-sensitive cases or anything that slipped through.
+
+**Breaking-news / trending boost:** the normal 7-day-half-life decay above is far too slow for a story that explodes in an hour. Run a **shorter-decay lane** (half-life of minutes–hours) computed from a streaming counter, and blend its spikes into the ranking so a breaking term surfaces fast, then fades once the streaming counter cools. That's the mechanism behind "why did *that* suddenly appear at the top?"
+
 ### Atomic swap — replacing the trie without downtime
 
 You don't mutate the live trie in place while people are reading it (they'd see half-updated, inconsistent state). You build the **whole new trie** off to the side, then in one instant switch everyone to it.
@@ -448,15 +543,17 @@ class SuggestionService {
 
 Why this is safe: a reader is always pointing at *some* fully-built trie — either the old complete one or the new complete one, **never a half-built mix**. No locks on the read path, no downtime, no partial state.
 
+> 💡 **Double buffering (a.k.a. blue-green) for beginners:** picture two identical slots, "blue" and "green". Readers are served from *blue* while the builder fills *green* completely, off to the side. When *green* is fully ready, you flip one pointer so all new reads go to *green*; *blue* becomes the spare for next time. Nobody ever reads a half-filled buffer — you only ever switch between two *fully built* copies. The `volatile current = freshlyBuilt` line above **is** that flip.
+
+> 💡 **Versioned tries → free A/B tests + instant rollback.** Because each build is an immutable, numbered snapshot (`v41`, `v42`), you can point, say, 5% of traffic at `v42` to trial a new ranking, and if it's worse, flip everyone back to `v41` in a single pointer assignment — no rebuild required.
+
 #### Q: Why rebuild on a schedule instead of updating the trie live on every search?
 
 - **Reads must stay lock-free.** Mutating the shared trie while millions read it means locks or half-updated nodes → slow or wrong.
 - **A single search barely matters.** One more "netflix" search won't change the top-10; rankings are statistical. Batching thousands of searches into a periodic rebuild is far cheaper than touching the structure per search.
 - **Staleness is acceptable.** The requirements say eventual consistency is fine — a new trend showing up a few minutes/hours late is OK. Latency being slow is not. So we optimize reads and let writes be lazy/batched.
 
-#### Q: What is Kafka doing in this pipeline?
-
-Kafka is the **buffer/pipe** that absorbs the search-log firehose (producer-consumer). Search servers just *append* each query-logged event to Kafka and move on; the aggregator consumes at its own pace. Same role as in any log-ingestion system — decouple the fast producers from the slower batch consumer.
+Kafka's role in this pipeline is the **buffer/pipe** that absorbs the search-log firehose (producer-consumer). Search servers just *append* each query-logged event to Kafka and move on; the aggregator consumes at its own pace. Same role as in any log-ingestion system — decouple the fast producers from the slower batch consumer.
 
 ---
 
@@ -564,6 +661,8 @@ String shardFor(String prefix) {
 }
 ```
 
+> 💡 **Consistent hashing (beginner note):** the `if first <= 'c'` range table works but is rigid — adding or removing a shard means re-drawing the ranges and physically moving a lot of data. **Consistent hashing** instead maps both prefixes and shards onto a ring, so adding/removing one shard only reshuffles a small slice of prefixes rather than everything. Same idea as any partitioned store — see [Consistent Hashing](../concepts/consistent-hashing.md). (Keep prefix-grouping in mind: you still want a whole prefix's branch on one shard, so hash the *routing prefix*, not each full query.)
+
 #### Q: Why shard by *prefix* specifically, and not randomly?
 
 Because a single autocomplete request only cares about **one** prefix (`net`), and everything it needs (`net`, `netf`, `netfl`, ...) lives under the **same branch**. Shard by prefix and the whole answer is on **one** shard — no fan-out, no combining results from multiple machines. Random sharding would scatter one prefix's data everywhere and force every request to hit many shards.
@@ -593,13 +692,32 @@ radix trie:   (net)---"flix"--->(netflix)       ← the unbranching run is one e
 
 And the simplest lever of all, restated: **store only the top-k at each node, never the full descendant list.** The dropdown shows ~10; keeping thousands per node would multiply memory for suggestions nobody sees. The rare "show more" falls back to a subtree scan or is simply omitted (the long tail).
 
-#### Q: If we only keep top-k per node and drop the long tail, do we lose rare queries?
+Keeping only top-k per node and dropping the long tail does mean rare queries are lost from the fast path — but mostly that's fine, since autocomplete exists to speed up *common* queries; obscure ones the user can just type fully. If needed, rare completions can be recovered by a fallback subtree scan on a cache miss, or served from a secondary (slower) store. The serving trie deliberately optimizes for the popular head.
 
-Mostly that's fine — autocomplete exists to speed up *common* queries; obscure ones the user can just type fully. If needed, rare completions can be recovered by a fallback subtree scan on a cache miss, or served from a secondary (slower) store. The serving trie deliberately optimizes for the popular head.
+#### Q: Trie or Elasticsearch — which handles the long tail of rare queries?
+
+Use **both, for different jobs.** The in-memory trie owns the **head**: the common prefixes everyone types, where sub-10ms latency and pre-baked top-k matter most. But the trie deliberately drops the tail (top-k only, popular queries), so a rare or very specific prefix may return little or nothing. **Elasticsearch** (or any inverted-index search) is the natural **hybrid fallback** for that tail — it does full-text, multi-word, and *infix* ("contains", not just "starts-with") matching that a prefix trie can't, at a higher latency that's acceptable for rare queries. The pattern: **try the trie first; if it returns too few results, fall back to an ES query.** The trie makes the common case instant; ES makes the rare case *possible*.
+
+> 💡 **Prefix vs infix:** a trie only matches from the *start* (`net` → `netflix`). Matching a word in the *middle* ("watch **flix**" → "netflix") needs an inverted index (ES) or an n-gram index — another reason ES backs the tail.
 
 ---
 
 ## 10. Data Model / Stores
+
+### Database & storage choices (which DB, and why at scale)
+
+No single store fits every job here, so we use **polyglot persistence** — pick the store that matches each phase's access pattern. The deciding question is *"is this on the millisecond read path, or the offline build path?"* (§4) — those two paths never share a store.
+
+| Data | Store | Why this one | Why not the alternative |
+| --- | --- | --- | --- |
+| Serving trie (the actual lookup structure) | **In-memory (RAM)**, sharded by prefix | A lookup is a few pointer hops — **O(prefix length)** — and at hundreds of thousands of lookups/sec (§3), anything that touches disk or a network hop per request is too slow. | A DB `LIKE 'prefix%'` query re-scans and re-sorts on **every keystroke** (§1) — even a well-indexed RDBMS can't beat "the answer is already sitting in RAM." |
+| Trie snapshot (build artifact) | **Blob/object store**, versioned (`v41`, `v42`, ...) | The trie is rebuilt **whole** and swapped in atomically (§7) — a big immutable file you download once and load into RAM fits "build-once, read-many, swap-atomically" far better than row-by-row writes, and versioning gives instant rollback (point back at `v41`). | An RDBMS forces row-by-row updates for something that's really one giant write-once artifact per rebuild; there's no natural "roll back the whole trie" operation on a table. |
+| `query_frequency` aggregate (offline ranking input) | **Data warehouse** (or big KV table) | Billions of log lines aggregated in batch/stream with time decay (§7) — a scan-and-aggregate workload, not a transactional one. | An OLTP RDBMS optimizes for row-level reads/writes with locks, not scanning billions of rows to compute decayed scores; the serving path never even touches this table directly. |
+| Raw search logs | **Kafka → data lake/warehouse** | A durable, replayable firehose decouples "user searched X" from the (much slower) aggregation job, and replay lets you rebuild rankings from scratch if the ranking logic changes. | Writing straight into a warehouse table per search means every search blocks on an analytical store; Kafka absorbs the burst and lets the aggregator consume at its own pace. |
+| Hot-prefix responses (`"a"`, `"the"`, ...) | **Redis / CDN edge** | The busiest prefixes barely change between rebuilds yet get hit constantly — a cache-aside lookup skips the trie walk entirely and can be served even closer to the user. | Re-walking the in-memory trie for the same handful of prefixes millions of times/sec is wasted, avoidable work. |
+| Per-user search history (optional, personalization) | **KV store** (Redis/DynamoDB), keyed by `user_id` | Small, per-user, single-key lookup blended into the global list at read time (§8) — no scans needed. | A relational join per keystroke against a growing history table would blow the latency budget; personalization is a thin blend, not a query-time join. |
+
+**Why an in-memory trie beats any database at this scale, and why build/serve use different stores (CQRS):** a `LIKE 'prefix%'` query — even indexed — re-scans and re-sorts on every keystroke, and autocomplete QPS runs several times higher than search QPS (§3); no general-purpose database survives that as a per-request cost. The trie instead pays the sorting cost **once, offline**, and serves a pointer-walk at read time. That's also why the write path (rebuild from logs) and read path (serve from RAM) live in completely separate stores — the read side **shards by prefix** (first 1–2 characters, §9) so one request never fans out across shards, and each shard is **replicated**, with extra copies for hot prefixes (`"a"`, `"the"`) to absorb their disproportionate share of traffic and fewer for the long tail. (For the full engine trade-off matrix, see [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
 ```sql
 -- Offline aggregation (warehouse / KV)
@@ -627,22 +745,58 @@ The confusing part is that there are **several** stores, each for a different ph
 
 The flow of a query's data: **raw log → frequency table → trie snapshot → in-memory trie (+ Redis cache) → your dropdown.**
 
-#### Q: Why is the trie stored as a "versioned snapshot" blob and not in a database?
+The trie is stored as a "versioned snapshot" blob rather than in a database because the serving trie is **rebuilt whole and swapped atomically** (§7). Versioning (`v41`, `v42`) means: build the new one as a fresh blob, have suggestion nodes download and load it, then flip the pointer. If `v42` turns out bad, you can roll back to `v41` instantly. A big immutable file that you load into RAM fits this "build-once, read-many, swap-atomically" pattern far better than row-by-row DB updates.
 
-Because the serving trie is **rebuilt whole and swapped atomically** (§7). Versioning (`v41`, `v42`) means: build the new one as a fresh blob, have suggestion nodes download and load it, then flip the pointer. If `v42` turns out bad, you can roll back to `v41` instantly. A big immutable file that you load into RAM fits this "build-once, read-many, swap-atomically" pattern far better than row-by-row DB updates.
-
-#### Q: Where does the `query_frequency` table live — is it OLTP or a warehouse?
-
-It's an **analytics/aggregate** store, produced by the offline pipeline over billions of log lines — think a data warehouse or a big KV table, not your app's transactional DB. The serving path never touches it directly; it only reads the **trie snapshot** built from it. (Same read/write split as everything else here.)
+The `query_frequency` table itself lives on the analytics side, not OLTP — it's an **analytics/aggregate** store, produced by the offline pipeline over billions of log lines: think a data warehouse or a big KV table, not your app's transactional DB. The serving path never touches it directly; it only reads the **trie snapshot** built from it. (Same read/write split as everything else here.)
 
 ---
 
 ## 11. API Design
 
+> 💡 **One tiny, cacheable read endpoint.** Autocomplete has essentially *one* API — a `GET`. There's no per-keystroke write; queries are logged through the search pipeline (§7), not by this endpoint.
+
 ```
-GET /v1/autocomplete?q=net&limit=10&lang=en   → { suggestions: ["netflix","network",...] }
-# query logging happens via the search pipeline (not a per-keystroke write)
+GET /v1/autocomplete?q=net&limit=10&lang=en&safe=true
 ```
+
+| Param | Meaning | Default |
+| --- | --- | --- |
+| `q` | the prefix typed so far (**required**) | — |
+| `limit` | max suggestions to return (the top-k) | 10 (capped ~20) |
+| `lang` | language/locale → selects the matching trie (§8) | `en` |
+| `safe` | apply the safe-search filter (§7) | `true` |
+
+**Response (`200`):**
+
+```json
+{
+  "prefix": "net",
+  "suggestions": [
+    { "text": "netflix", "score": 900 },
+    { "text": "network", "score": 500 },
+    { "text": "netgear", "score": 120 }
+  ],
+  "version": "v42"
+}
+```
+
+`version` is the trie snapshot that served this response (§7) — useful for cache-busting on swap and for debugging A/B builds.
+
+**Edge cases & status rules:**
+
+| Case | Behavior |
+| --- | --- |
+| **Empty / whitespace `q`** | `200` with `{ "suggestions": [] }` (or a trending list) — **not** an error. |
+| **Prefix below min length** (§6) | `200` with an empty list; don't suggest on 1 char. |
+| **Prefix simply not in the trie** | `200` with `[]` (or a fuzzy fallback, §8). A normal miss is **not** a `404`. |
+| **Malformed request** (missing `q`, bad `limit`) | `400 Bad Request`. |
+| **Genuinely unknown route** | `404` — reserved for wrong endpoints, never for "no suggestions". |
+
+- **Rate limiting:** per-IP/user **token bucket** at the gateway — autocomplete QPS is huge and bot-prone. Enforce the **client debounce** (§6) and shed absurd request rates before they reach the suggestion nodes.
+- **Caching:** responses are cacheable (`Cache-Control` short TTL; the `version` field lets caches invalidate on a trie swap). Hot prefixes served from edge/CDN.
+- **Latency SLA:** **p99 < 50ms** end-to-end (server budget ~10ms). Slower than a keystroke = useless → **degrade to empty suggestions** rather than block or slow the search box.
+
+> ⚠️ **Return `200 []`, not `404`, for "no suggestions".** A missing completion is a normal, expected outcome on the hot path. A `404` would make every rare prefix look like an error to clients and complicate caching.
 
 ---
 
@@ -664,7 +818,61 @@ Suggestion nodes: load vN in background → when ready, ATOMIC SWAP pointer old�
 
 ---
 
-## 13. Design Patterns (that can be used)
+## 13. Scaling & Failure
+
+- **Shard trie by prefix**; replicate each shard for QPS + HA; extra replicas for hot prefixes (skew).
+- **In-memory serving** + Redis/CDN for hottest prefixes; **client debounce** cuts QPS.
+- **Offline pipeline** rebuilds rankings; **atomic swap** the new trie (no downtime).
+- **Node failure** → replicas serve; a new node loads the latest snapshot.
+- **Eventual consistency:** trending terms appear after the next rebuild — acceptable.
+
+---
+
+## 14. Interview Cheat Sheet
+
+> **"How do you return suggestions in milliseconds?"**
+> "A **trie with top-k precomputed and cached at each node** — a query walks to the prefix node (O(prefix length)) and returns the list, no subtree scan. It's served in-memory, with hot prefixes cached in Redis/edge and client-side debounce."
+
+> **"How are rankings kept fresh?"**
+> "Search logs → Kafka → a batch/stream job aggregates query frequencies with **time decay**, recomputes top-k per prefix, builds a **new immutable trie**, and **atomically swaps** it into the serving nodes."
+
+> **"How do you scale memory/QPS?"**
+> "**Shard the trie by prefix**, replicate shards (more for hot prefixes), hold in memory, compress with radix/DAWG, store only top-k per node, and cache hot prefixes. Debounce on the client."
+
+> **"Typo tolerance / personalization?"**
+> "Fuzzy matching via edit distance / a spell-correction stage; personalization by blending a per-user history layer with the global trie at read time."
+
+### Tricky scenarios (rapid-fire)
+
+| Scenario | What happens / what to do |
+| --- | --- |
+| **Hot-shard overload** (`a`, `the` hammer one shard) | Extra **replicas** for hot shards, **finer sub-sharding** of hot prefixes, and **cache** the hottest prefixes at the edge (§6, §9). Cap the firehose with a **min prefix length**. |
+| **Trie swap mid-request** | Safe — a reader holds a pointer to *some* fully-built trie (old *or* new), **never a half-built mix** (§7). The in-flight read finishes on the old trie; the next read sees the new one. |
+| **Typo → exact walk finds nothing** | Fall back to a **bounded fuzzy / spell-correction stage** (§8), *only on the miss*, so the exact hot path stays cheap. Adds latency, but only for the rare miss. |
+| **Empty / 1-char prefix** | Return `200 []` (or a trending list); **don't** suggest on the first character (§6, §11) — it's generic and lands on the hottest shard. |
+| **Long-tail / infix query** (`watch flix`) | The trie can't do infix; **fall back to Elasticsearch** (§9). Trie = head, ES = tail. |
+| **Responses arrive out of order** (`net` after `netf`) | Client tags each response with its query and **discards stale ones** (§6), else the dropdown flickers. |
+
+---
+
+## 15. How to Drive the Interview
+
+> Use this order so you never freeze. Spend ~5 min on 1–4, then go deep on the trie + build pipeline — that's the meat.
+
+1. **Clarify requirements + NFRs** — top-k per prefix, latency target, eventual consistency is fine — §2
+2. **Estimate scale** — reads ≫ writes; autocomplete QPS ≈ 5–10× search QPS → it *must* be in-memory — §3
+3. **Split read vs write path up front** — a fast **serving path** (lookups) and a slow **build path** (recompute rankings); they're separate systems (**CQRS**) — §4
+4. **Core data structure: a trie with precomputed top-k per node** — walk `O(prefix)`, read the cached list, no subtree scan — §5
+5. **Build pipeline** — logs → Kafka → aggregate with time decay → **post-order top-k build** → immutable snapshot → **atomic swap** — §7
+6. **Scale it** — shard by prefix, replicate (extra for hot), cache hot prefixes, debounce the client, compress (radix/DAWG) — §6, §9
+7. **Edge cases** — typos/fuzzy, personalization, long-tail via ES, safety filtering — §8, §9
+8. **Summarize tradeoffs** — eventual consistency, CQRS, head-vs-tail — §14
+
+> 🎤 **Lead with the core split:** open with "this is a **read-heavy, latency-critical lookup** — I'll precompute top-k per prefix in a trie and rebuild it offline." Then spend most of your time on the trie + the top-k build, which is the genuinely hard part.
+
+---
+
+## 16. Design Patterns (that can be used)
 
 | Pattern | Where | Why |
 | --- | --- | --- |
@@ -679,33 +887,7 @@ Suggestion nodes: load vN in background → when ready, ATOMIC SWAP pointer old�
 
 ---
 
-## 14. Scaling & Failure
-
-- **Shard trie by prefix**; replicate each shard for QPS + HA; extra replicas for hot prefixes (skew).
-- **In-memory serving** + Redis/CDN for hottest prefixes; **client debounce** cuts QPS.
-- **Offline pipeline** rebuilds rankings; **atomic swap** the new trie (no downtime).
-- **Node failure** → replicas serve; a new node loads the latest snapshot.
-- **Eventual consistency:** trending terms appear after the next rebuild — acceptable.
-
----
-
-## 15. Interview Cheat Sheet
-
-> **"How do you return suggestions in milliseconds?"**
-> "A **trie with top-k precomputed and cached at each node** — a query walks to the prefix node (O(prefix length)) and returns the list, no subtree scan. It's served in-memory, with hot prefixes cached in Redis/edge and client-side debounce."
-
-> **"How are rankings kept fresh?"**
-> "Search logs → Kafka → a batch/stream job aggregates query frequencies with **time decay**, recomputes top-k per prefix, builds a **new immutable trie**, and **atomically swaps** it into the serving nodes."
-
-> **"How do you scale memory/QPS?"**
-> "**Shard the trie by prefix**, replicate shards (more for hot prefixes), hold in memory, compress with radix/DAWG, store only top-k per node, and cache hot prefixes. Debounce on the client."
-
-> **"Typo tolerance / personalization?"**
-> "Fuzzy matching via edit distance / a spell-correction stage; personalization by blending a per-user history layer with the global trie at read time."
-
----
-
-## 16. Final Takeaways
+## 17. Final Takeaways
 
 - **Trie with precomputed top-k per node** = O(prefix) millisecond lookups (no subtree scan).
 - **Offline pipeline** (logs → Kafka → aggregate w/ decay → rebuild → **atomic swap**) keeps rankings fresh.
