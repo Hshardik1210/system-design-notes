@@ -502,6 +502,54 @@ It means only the Order Service is allowed to change an order's status (`PLACED 
 
 **Why orders must be relational, and GPS pings absolutely must not be:** the split comes straight from §4's capacity math — orders are a manageable ~58/sec average that needs to be **exactly right** (money, state transitions), while location pings are a **75,000/sec firehose** that only needs to be **roughly current**. Putting both in the same store would force you to either slow down the order path to survive the location firehose, or relax correctness on money to handle the volume — neither is acceptable, so they're deliberately isolated into stores that match their actual shape. **Scaling:** shard the order RDBMS by **region/city** (§17) — a food marketplace is inherently local, so a Bangalore order never needs a Delhi row, which keeps shards small and isolates a regional incident from the rest of the country. Redis GEO and the location stream scale horizontally by simply adding nodes, since they hold no durable state that requires careful partitioning. (See [Databases — Deep Dive](../concepts/databases-deep-dive.md).)
 
+### How much load can that single order RDBMS take — and MySQL or PostgreSQL?
+
+A common worry: "everything funnels into one relational store — won't it melt?" It won't, because the numbers are modest and reads/writes scale differently.
+
+**Rough single-primary throughput (decent hardware):**
+
+| Workload | Realistic RPS (one primary) | Bounded by |
+| --- | --- | --- |
+| Indexed point reads (`WHERE id = ?`) | 10k–50k+ | pooler / network, often not the DB itself |
+| Reads from buffer cache (working set in RAM) | ~100k | memory |
+| ACID writes (INSERT/UPDATE with `fsync`) | ~1k–5k | disk `fsync`, WAL, locking, index maintenance |
+| Contended writes (hot row, many indexes) | hundreds | lock contention |
+
+- **Reads scale out easily** — add **read replicas** to multiply read capacity almost linearly.
+- **Writes are the hard part** — they all go through the single primary; the real limiter is `fsync` + hot-row lock contention, not CPU. Sharding (by city/region, §17) is how you scale writes past one primary.
+- **Connections matter** — thousands of raw connections degrade an RDBMS (especially Postgres); a **pooler** (PgBouncer) lets a few hundred connections serve tens of thousands of RPS.
+
+**Why our order load is comfortable:** orders are ~58 writes/sec (§4) — three orders of magnitude below a single primary's write budget. That headroom is *exactly why* the durable, must-be-correct data (orders, payments, state machine) can afford ACID + idempotency here, while the 75k/sec location firehose is deliberately kept out (decision table above).
+
+**MySQL vs PostgreSQL for the order core** — either handles this load with room to spare; the choice is features and operations, not throughput:
+
+| | PostgreSQL | MySQL (InnoDB) |
+| --- | --- | --- |
+| SQL richness / standards | Richer (JSONB, arrays, window fns, partial/expression indexes) | Leaner, catching up |
+| Geospatial | **PostGIS — best-in-class** (relevant for serviceability polygons, §9) | Basic spatial |
+| Concurrency | MVCC; writers don't block readers | MVCC too |
+| Horizontal sharding | Citus / manual | **Vitess** — very proven at scale |
+| Watch-outs | Connection overhead → needs PgBouncer; `VACUUM` tuning | Historically laxer defaults (use strict mode) |
+
+> **Default pick:** for a greenfield transactional core, **PostgreSQL** (rich SQL + PostGIS + strict correctness); lean **MySQL + Vitess** if proven horizontal write-sharding is the dominant concern. At ~58 orders/sec the decision is team familiarity, not performance.
+
+### Menu & restaurant images — why "blob store + CDN," not the database
+
+The decision table's last row deserves unpacking, because it's a pattern reused everywhere (product photos, receipts, PDFs).
+
+**Blob store** = object storage (S3 / GCS / Azure Blob): holds huge, opaque files addressed by a key, cheap per GB, effectively infinite, very durable. **CDN** = a global network of edge caches (CloudFront / Cloudflare / Fastly) sitting *in front of* the blob store, serving copies from a data center near the user. Mental model: **blob store = the warehouse; CDN = local shops holding copies.**
+
+**Why not store image bytes in the RDBMS?**
+
+- **Row/backup bloat** — a 100 KB–2 MB image as a `BLOB` makes rows huge and every backup enormous and slow.
+- **No query value** — you never `WHERE image = …`; you fetch it by id. Relational storage buys nothing.
+- **Steals the scarce resource** — fat binary reads through the transactional DB steal capacity from the order path.
+- **Can't cache at the edge** — a CDN can front object storage, not your primary DB.
+
+So the catalog row stores only a **URL/key**; the bytes live in the blob store. **Why the CDN on top?** Menu images are **large, immutable, and read-shared** (everyone in a city loads the same dish photo) — ideal for aggressive edge caching: low latency, massive origin offload (95%+ of requests never touch the bucket), and spike absorption at dinner rush.
+
+**Flow:** owner uploads → bytes go to the blob store (often via a **presigned URL**, skipping your app servers) → catalog RDBMS stores the URL → that URL rides CDC into the discovery index (§9). Serve: client hits the CDN → cache hit serves instantly; miss → CDN fetches from the bucket once, caches, serves. Use **content-hashed filenames** (`dish-<hash>.jpg`) so URLs are immutable and cacheable "forever" — a new image is a new URL, so there's no stale-cache invalidation to fight.
+
 ### Order (the core — same shape as any e-commerce order)
 
 ```sql
@@ -566,7 +614,42 @@ CREATE TABLE menu_items (
 );
 ```
 
+### `is_open` is really two signals — scheduled hours vs a live toggle
+
+The single `is_open BOOLEAN` is a whiteboard simplification. In reality "are we open?" combines **two very different things**, and conflating them is a classic modeling mistake:
+
+| Concept | Example | Changes | Model as |
+| --- | --- | --- | --- |
+| **Scheduled hours** | "Open 9am–11pm daily" | Predictable, recurring | A **hours table**, computed against the clock |
+| **Live override** | "Slammed — pause 20 min"; "closing early" | Unpredictable, real-time | A **stored boolean** (`is_accepting_orders`) |
+
+Don't flip a boolean at 9am and 11pm every day: that makes a **human be a reliable clock** (forget to open → invisible all morning; forget to close → orders into a dark kitchen), and a boolean can't express timezones, per-day hours, or past-midnight. Instead:
+
+```sql
+CREATE TABLE restaurant_hours (
+    restaurant_id BIGINT,
+    day_of_week   SMALLINT,   -- 0..6
+    open_time     TIME,
+    close_time    TIME        -- timezone lives on the restaurant row
+);
+-- plus a real-time override on the restaurant row:  is_accepting_orders BOOLEAN
+```
+
+Effective open is **computed, never stored raw**:
+
+```
+open_now = withinScheduledHours(now, tz)   -- owner sets hours ONCE; system computes daily
+           AND is_accepting_orders          -- owner's live pause/resume (rare, event-driven)
+           AND hasAvailableItems            -- not fully sold out
+```
+
+The owner controls **both** levers — the schedule is *their* stored hours (set once, edited rarely), the toggle is *their* in-the-moment override. The schedule automates the predictable 95% so the owner only touches the toggle for exceptions (rush, emergency). The daily open/close rhythm is a *reaction-free clock event*, so it should be computed, not tapped. Note the **write volumes are trivial either way** (even generous pause/resume is ~100 writes/sec fleet-wide) — this split is about *correctness and not babysitting a clock*, never about saving DB writes.
+
+**Flow:** hours edits and the toggle write to the RDBMS → **CDC → Kafka → Elasticsearch** carries them into discovery, with the volatile toggle pushed on a **short TTL** (§9). Discovery computes `open_now` **at query time** (schedule vs the live clock), so nothing flips rows at 9am/11pm. Because discovery is eventually consistent, checkout **re-validates `open_now` against the RDBMS** before charging (§10) — speed for browsing, correctness for money.
+
 ### Delivery partner & location (hot, ephemeral → Redis, not RDBMS)
+
+> 💡 **"Ephemeral" = short-lived and safe to lose.** These values matter only for a few seconds and are constantly overwritten — the opposite of durable data like orders/payments. Losing a rider's position is harmless because the next GPS ping (seconds later) replaces it, which is exactly why it belongs in Redis with a TTL, not the transactional DB.
 
 ```
 Rider status/index (Redis GEO):
@@ -580,6 +663,20 @@ Historical track (time-series / archived for analytics only)
 ```
 
 > **Key modeling decision:** high-frequency location data does **not** go in the transactional DB. It lives in **Redis (GEO + latest value)** and optionally a time-series store — otherwise 75k writes/sec crushes the order DB.
+
+### The three Redis structures behind one rider (and why each)
+
+Those blocks use **three different Redis data types**, one per job — a good example of matching the structure to the access pattern:
+
+| Key | Redis type | Answers | Updated |
+| --- | --- | --- | --- |
+| `riders:online` | **GEO sorted set** | "*which* riders are near this point?" (search across many) | every GPS ping (overwrite in place) |
+| `rider:{id}` | **Hash** | "what *state* is this rider in?" (status, current order) | on events (assigned, delivered) |
+| `loc:rider:{id}` | **String + TTL** | "where is *this one* rider right now?" (direct lookup) | every GPS ping |
+
+**`HSET rider:{id} status ONLINE current_order NULL` is a Hash, not a flat string.** The key `rider:{id}` points to a small **field→value map** (`status=ONLINE`, `current_order=NULL`) — like a row with columns — so you can read/update one field (`HGET rider:{id} status`) without rewriting the whole value. Position (GEO) changes on every ping; status (Hash) changes only on events.
+
+**`SET loc:rider:{id} {lat,lng,ts} EX 30` is a point lookup with a built-in heartbeat.** It serves live tracking's "where is *my* rider" (a direct `GET`, distinct from the GEO set's proximity *search* used by dispatch). The `ts` lets consumers judge freshness; the **`EX 30`** makes the key **auto-expire** if pings stop — so a rider who loses signal simply *disappears* instead of showing a frozen stale dot. Presence of the key = "fresh, trustworthy location"; absence = stale/gone. Free liveness detection, no cleanup job.
 
 ### Indexes that matter
 
@@ -647,6 +744,23 @@ It changes **75,000 times per second** across all riders and it's disposable —
 ### What `GEOADD` / Redis GEO is doing
 
 It's a special Redis feature that stores points by latitude/longitude and lets you ask **"who's within 3 km of here?"** instantly. That's exactly the question dispatch asks ("which riders are near this restaurant?") and discovery asks ("which restaurants are near this user?"). It's a map with a built-in "find nearby" button. (Used heavily in §9 and §12.)
+
+### How Redis GEO actually works (`GEOADD` / `GEOSEARCH`)
+
+Under the hood, Redis GEO is **not a new data type — it's a sorted set (ZSET) where each member's score is a 52-bit geohash** of its coordinates. Points that are physically close get numerically close scores, so a radius search becomes a scan over ranges of the sorted set across neighboring geohash cells.
+
+```
+GEOADD riders:online <lng> <lat> rider:{id}       # add/UPDATE a point (overwrite in place)
+GEOSEARCH riders:online FROMLONLAT <lng> <lat> \  # search from a coordinate
+          BYRADIUS 3 km ASC COUNT 20 WITHDIST     # nearest-first, cap 20, include distance
+```
+
+- **`GEOADD` inserts *and* updates** — same member key = overwritten position. That's why a rider pinging every few seconds is just repeated `GEOADD`, not accumulating rows (the 75k/sec firehose overwrites in place).
+- **`GEOSEARCH`** (Redis 6.2+, replaces the deprecated `GEORADIUS`) does radius **or** box search; `ASC` for nearest-first, `COUNT` to cap, `WITHDIST`/`WITHCOORD` for extras — exactly the "20 closest idle riders" query dispatch needs (§12).
+- Helpers: `GEOPOS` (a member's coords), `GEODIST` (distance between two), `ZREM` (remove — a rider going offline, since it's just a ZSET member).
+- ⚠️ **Gotcha:** longitude comes **before** latitude.
+
+**Why riders use Redis GEO but restaurants don't:** riders are **dynamic** (moving, ephemeral, pure proximity queries) — perfect for Redis GEO. Restaurants are **static** and their query — discovery — needs geo **plus** text, facets (veg, open, rating), and ranking, which Redis GEO can't do. So restaurant location lives in the RDBMS (source of truth) and **Elasticsearch** (the query layer); Redis GEO is reserved for the rider index. **Limitation:** Redis GEO does circles/boxes only — for delivery *polygons*/geofences you use S2 cells or a real geo engine (see §9's technique table).
 
 ---
 
@@ -717,6 +831,12 @@ results.sort(byEtaThenRating());   // best/nearest/fastest on top
 ### "Nearby" vs "serviceable"
 
 "Nearby" = physically close to you. "Serviceable" = the restaurant is **willing and able** to deliver *to your exact address*. A place 500 m away across a river with no bridge is nearby but not serviceable. Serviceability checks the restaurant's delivery radius/polygon **and** whether riders are actually free in that area right now.
+
+#### Q: Why store `serviceable_radius_m` per restaurant, not one platform-wide range?
+
+Because serviceability **varies per restaurant** and only the restaurant/platform knows *its* value — a home kitchen may deliver 2 km, a cloud kitchen 7 km, and a place across a bridgeless river 0 useful km. A single global radius would be wrong everywhere. The column is precisely the **input** to the "don't show what can't reach me" filter (`distance <= r.serviceable_radius`, above): the broad `geoSearch` is a coarse candidate net, and the per-restaurant radius is the scalpel that removes the unreachable ones.
+
+It's also a **hard yes/no gate**, separate from the **delivery fee** (a continuous function of distance). You still need the gate even though fees scale with distance: past some range the food arrives cold, the ETA blows the SLA, and rider economics stop working — no fee makes that acceptable, so those restaurants are hidden entirely rather than shown with an absurd fee. (The schema comment's "or a polygon/geofence" is the production upgrade — a real coverage shape that follows roads and carves out no-go zones.)
 
 ### Why discovery reads from Elasticsearch instead of the main orders/restaurant database
 
@@ -1006,6 +1126,38 @@ If two orders come from the *same or nearby* restaurants heading in the *same di
 
 Real systems blend them: greedy when quiet, batch during peaks. In an interview, treat the scoring function as a pluggable (often ML) black box and emphasize the **loop: candidates → score → offer → accept/timeout → fallback**.
 
+### `offerAndAwaitAccept(order, 20s)` isn't really blocking — the async offer loop
+
+The dispatch code reads like a `for` loop that "waits 20 seconds" for each rider. It can't literally do that — the rider is a **human on a remote phone**, and parking a server thread per pending offer would exhaust threads under thousands of concurrent dispatches. So the loop is *conceptual*; the implementation is an **event-driven state machine**.
+
+**The loop is externalized to Redis.** Before the worker returns, it saves the loop's state so it doesn't need to stay alive:
+
+```
+dispatch:123 = { candidates:[r1,r2,r3], currentIndex:0, state:WAITING }   # the "loop", as data
+offer:987    = { order:123, rider:r1 } PENDING EX 20                      # the pending offer + timer
+```
+
+`currentIndex` replaces the loop counter; the candidate list is computed **once** and saved (so a rejected rider is never re-offered — you just advance the index, no re-search needed).
+
+**What "pending offer" means:** an offer is the system *proposing* an order to one rider — a question, not an assignment. It's `PENDING` from when it's sent until the rider accepts, declines, or the 20s lapses. The record is stored (Redis, TTL = the accept window) so the system can match the reply, enforce the timeout, and reject a late tap.
+
+**Nobody blocks — three events drive it forward:**
+
+```
+send offer → push to rider (WebSocket/FCM), schedule a "timeout" message for T+20s, RETURN the thread
+   ├─ rider taps Accept  → inbound request → assign rider, status RIDER_ASSIGNED (done)
+   ├─ rider taps Decline → inbound request → release lock → offer next candidate
+   └─ 20s elapse, no reply → timeout message fires → treat as reject → offer next candidate
+```
+
+- The **accept/decline is a separate inbound request** that may land on a **different server instance**; it finds the pending offer in **shared Redis** by `offer_id`, and whichever of {reply, timeout} fires first wins (the other sees the offer is no longer `PENDING` and no-ops).
+- The **timeout is a scheduled message, not a `sleep`** — a delayed queue (RabbitMQ TTL+DLX / Kafka delay topic / SQS delay / Redis sorted-set by fire-time) or a Redis key-expiry event. Durable delivery means a crashed worker doesn't strand the order.
+- **"Offer next candidate" is itself an event:** any free worker loads `dispatch:123`, advances `currentIndex` to get r2, sends the next offer, and returns. rider2's identity comes from the **saved candidate list**, not from a queue — the queue only carries the *trigger*.
+
+This is why the state lives in Redis, not worker memory: the offer send, the reply, and the timeout can each be handled by different stateless instances, glued together only by `dispatch:123` + `offer:987`. (If you instead re-search each round because riders moved, keep a per-order `tried` set — `SADD dispatch:123:tried r1` — to skip already-offered riders.)
+
+> **On the claim lock (`SET rider:{id}:lock orderId NX EX 30`, above):** the key is **per rider** because the collision it prevents is *two orders grabbing the same rider* (`NX` = first-writer-wins). The **value is the `orderId`** so release is safe — delete *only if you still own it* (`GET`==myOrderId then `DEL`, atomically via a Lua script) — otherwise, after your lock expired and another order claimed the rider, a blind `DEL` would wipe *their* claim. The same order legitimately sets the same `orderId` on different rider-lock keys as it walks the candidate list.
+
 ---
 
 ## 13. Live Order Tracking
@@ -1072,6 +1224,63 @@ You only care about a rider's live position when they're **carrying your food**.
 ### Why it's fine for tracking to be "eventually consistent"
 
 If one GPS ping drops or arrives late, the *next* ping (4 seconds later) corrects the map — no harm done. The client even animates smoothly between updates so you don't notice. Contrast with payments, where a single lost/duplicated message means real money is wrong. Tracking is the **opposite** of the order path: speed and cheapness over perfect accuracy.
+
+### The two connections: rider→server is HTTP, server→customer is WebSocket
+
+A common confusion: the rider and the customer are **not** connected to each other, and they don't use the same channel. Each connects to the *platform*, which relays between them:
+
+| Leg | Who | Channel | Why |
+| --- | --- | --- | --- |
+| Rider → server | rider **sends** GPS | plain **HTTP POST** every ~4s (fire-and-forget) | rider only pushes one-way; each ping is independent and survives flaky networks |
+| Server → customer | customer **receives** updates | **WebSocket** (server pushes) | server must push the instant the rider moves; polling would be millions of wasteful "any update?" calls |
+
+Rule of thumb: **you need a WebSocket only for whoever needs the server to push *to* them.** (The rider *does* use a WebSocket/push elsewhere — to *receive* dispatch offers, §12 — but for *sending* location, HTTP is enough.)
+
+### What each hop does — `onPing`, `kafka.publish`, `onRiderMoved`
+
+- **`POST /v1/riders/42/location` → `onPing`**: yes, that endpoint *is* handled by `onPing`. Each ping (1) overwrites the latest dot in Redis (`loc:rider:42 EX 30`) and (2) **publishes to Kafka**, then returns immediately.
+- **`kafka.publish("rider-locations", p)`**: Kafka is a **pipe, not a pusher** — it drops the ping on a topic that *many* consumers read: the WebSocket service (to update your map), plus ETA, analytics, geofencing. This decouples "receiving pings" from "delivering to watchers," fans one stream out to many readers, and buffers the 75k/sec firehose.
+- **WebSocket service consumes the topic → `onRiderMoved`**: it maps rider→order (`orderOf(42)=555`), looks up **who's watching** that order in the Redis connection map (`ws:order:555`), and pushes coords down each socket.
+
+### The WebSocket, end to end (with code)
+
+The customer's socket is opened **once** when they tap "Track" and kept open — each ping is just a cheap `send` into the existing pipe, not a new connection.
+
+```javascript
+// CUSTOMER (browser): open once, then just listen — no polling
+const socket = new WebSocket("wss://track.myfood.com/live");
+socket.onopen    = () => socket.send(JSON.stringify({ type: "SUBSCRIBE", orderId: 555 }));
+socket.onmessage = (e) => {                     // fires AUTOMATICALLY when the server pushes
+  const m = JSON.parse(e.data);
+  if (m.type === "LOCATION") moveMapMarker(m.lat, m.lng);   // marker glides to the new spot
+};
+
+// WEBSOCKET SERVICE: remember who watches what, push on each ping
+const localSockets = new Map();                 // orderId -> Set<socket> on THIS instance
+wss.on("connection", (socket) => {              // runs ONCE PER connecting client
+  socket.on("message", (raw) => {
+    const { orderId } = JSON.parse(raw);
+    (localSockets.get(orderId) ?? localSockets.set(orderId, new Set()).get(orderId)).add(socket);
+    redis.sadd(`ws:order:${orderId}`, SERVER_ID);   // which instance holds this watcher
+  });
+  socket.on("close", () => { /* remove from map; srem from Redis */ });
+});
+kafka.subscribe("rider-locations", async (ping) => {
+  const orderId = await redis.get(`rider:${ping.riderId}:order`);
+  const sockets = localSockets.get(Number(orderId));      // LOOKUP existing sockets (not connect)
+  for (const s of sockets ?? [])
+    if (s.readyState === WebSocket.OPEN) s.send(JSON.stringify({ type: "LOCATION", ...ping }));
+});
+```
+
+- **`localSockets.get(orderId)` is a lookup, not a connect** — the socket was saved at `SUBSCRIBE` time and stays open.
+- **The `for` loop** exists because several devices can watch one order (your phone + a tablet); push to each.
+- **`readyState === OPEN`** guards against sending on a dropped/closing socket (which would throw) — mobile connections die constantly.
+- **`socket.send()` on the server ↔ `socket.onmessage` on the client** are the two ends of one pipe: the server writes bytes, the browser *automatically* fires `onmessage`, your handler parses the JSON and moves the map marker — that repaint is how it "reflects on the UI."
+
+### One socket per viewer, across many servers
+
+The server is one program but holds a **separate socket object per connected client** (1,000 viewers = 1,000 sockets), stored in a map keyed by order so each ping pushes only to the right watchers. At scale there are **many** WebSocket instances behind a load balancer, and a customer's socket lives in the memory of **one** of them — but a rider's ping could be consumed by any instance. That's why the **Redis connection map (`ws:order:{id}`)** exists: to route a ping to the instance(s) holding that order's sockets (often via a Redis Pub/Sub per-order channel). Note too that **"publishing" and "holding sockets" are two different services** — the **Location Service** publishes pings to Kafka; the **WebSocket Service** holds your socket and consumes Kafka. Kafka bridges them.
 
 ---
 
@@ -1203,6 +1412,15 @@ void recompute(ReviewAdded e) {              // background worker, off the hot p
 ### Why a slightly-stale average rating is OK
 
 A restaurant's rating drifting from 4.31 to 4.32 a few seconds late affects nobody. It's **eventually consistent**, like discovery. The synchronous, must-be-exact treatment is reserved for money and order state — not for a star average.
+
+#### Q: Does every review recompute the *whole* average? (Kafka's role, incremental, batching)
+
+Two clarifications. First, **Kafka doesn't compute anything** — it's the pipe that delivers each `ReviewAdded` event to a background consumer; the *consumer* is what recomputes. Second, you don't want a literal full recompute per review for a place getting 10k reviews/day:
+
+- **Incremental update** — keep a running `count` + `sum` and do `new_avg = (sum + rating) / (count + 1)` — O(1) per review, no scanning all rows. ("Rolling average" implies this.)
+- **Batching / debounce** — the consumer can accumulate and flush once every N seconds or N reviews, so 500 reviews in 10s become **one** average update. Consuming from Kafka lets the consumer pace itself while the producer just fires events.
+
+The whole point (again): keep the **review write cheap and off the hot row**, and update the slightly-stale-is-fine average asynchronously.
 
 ### Why rate the restaurant and rider separately
 
