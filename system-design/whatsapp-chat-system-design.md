@@ -85,7 +85,7 @@ A normal website is **pull**: your browser asks the server for a page, the serve
 
 ### Out of scope (state assumptions)
 
-- **Voice/video calls** (a separate real-time media/WebRTC problem), **server-side full-text search** (impossible under true E2E — nothing readable to index, §12), and **message edit/delete-for-everyone** (mention, then defer). Call these out, then focus on messaging.
+- **Voice/video calls** (a separate real-time media/WebRTC problem) and **server-side full-text search** (impossible under true E2E — nothing readable to index, §12). Call these out, then focus on messaging. (**Delete-for-everyone / edit** are a light add-on — covered as revoke/edit control messages in §7.)
 
 ---
 
@@ -108,6 +108,18 @@ Message store:
 ```
 
 > Two cost centers: **millions of persistent connections** (memory/CPU on gateways) and **message throughput** (a partitioned write-optimized store). E2E designs shrink storage by deleting delivered messages.
+
+### Reading the "~1 TB RAM" number — it's fleet-wide, not one machine
+
+That 1 TB is the **aggregate across all gateways**, not a single box. Divide it by per-node capacity:
+
+```
+Total RAM for conns = 100M conns × ~10 KB = ~1 TB    (whole fleet)
+Per node            = ~1M conns × ~10 KB  = ~10 GB   (ordinary hardware)
+Number of nodes     = 100M ÷ 1M           = ~100+ gateway nodes
+```
+
+You never build one impossible 1 TB machine — you **scale horizontally**: each gateway is a normal ~32–64 GB instance holding ~1M connections, and you run hundreds of them. This is exactly why you need the **connection registry** (§5) to find *which* node holds a given user, and why load balancing is **by connection count** (§4).
 
 ---
 
@@ -203,6 +215,63 @@ public class WebSocketGateway {
 
 The open socket is a physical thing pinned to one machine's memory and network card — you can't move a live connection to another machine. That's why we **balance by connection count** (send new connections to emptier nodes) and, on deploy, **drain gracefully** (stop accepting new connections, let existing ones migrate as clients reconnect) instead of yanking them.
 
+### How a connection is actually established (handshake + auth)
+
+`onConnect(conn, …)` above is a simplification: the gateway doesn't *create* the connection, it **reacts** to one the WebSocket framework already established. The real sequence: the app opens `wss://…/v1/ws?token=…`; the framework completes the TCP + TLS + HTTP-`Upgrade` handshake and constructs the live socket object; **then** it calls your handler. In Spring that handler method is `afterConnectionEstablished(session)` — `session` *is* the `conn` you were handed (that's why `conn` is a **parameter**, not something you `new` yourself).
+
+Identity (`userId`/`deviceId`) is attached **during** the handshake by an auth interceptor that runs *before* the connection is accepted (§16: "auth + device key on handshake"):
+
+```java
+// 1. Validate the token BEFORE accepting the socket; stash identity for later.
+public class AuthHandshakeInterceptor implements HandshakeInterceptor {
+    public boolean beforeHandshake(ServerHttpRequest req, ServerHttpResponse res,
+                                   WebSocketHandler h, Map<String,Object> attrs) {
+        Claims c = tokens.verify(tokenFrom(req));   // reject → handshake refused, no connection
+        if (c == null) { res.setStatusCode(HttpStatus.UNAUTHORIZED); return false; }
+        attrs.put("userId", c.userId());
+        attrs.put("deviceId", c.deviceId());
+        return true;
+    }
+    public void afterHandshake(ServerHttpRequest req, ServerHttpResponse res,
+                               WebSocketHandler h, Exception ex) {}
+}
+
+// 2. The framework calls THIS once the socket is live — the real "onConnect".
+public class ChatWebSocketHandler extends TextWebSocketHandler {
+    protected void afterConnectionEstablished(WebSocketSession session) {
+        String userId   = (String) session.getAttributes().get("userId");
+        String deviceId = (String) session.getAttributes().get("deviceId");
+        gateway.onConnect(new SpringWsConnection(session), userId, deviceId); // → liveConns + registry
+        presence.markOnline(userId);
+    }
+    protected void handleTextMessage(WebSocketSession s, TextMessage m) { /* parse frame, dispatch */ }
+    public void afterConnectionClosed(WebSocketSession s, CloseStatus st)  { /* onDisconnect + offline */ }
+}
+```
+
+Client side is just: open the socket, render pushes, auto-reconnect on close, and send a periodic `PING` so the registry TTL never lapses.
+
+```javascript
+const ws = new WebSocket("wss://chat.example.com/v1/ws?token=" + jwt);
+ws.onopen    = () => {};                                    // triggers the server's onConnect
+ws.onmessage = (e) => renderMessage(JSON.parse(e.data));    // server pushed something
+ws.onclose   = () => scheduleReconnect();                   // reconnect + resync (§9)
+setInterval(() => ws.send(JSON.stringify({ type:"PING" })), 15000);  // keep TTL alive
+```
+
+### Where the gateway's `nodeId` comes from
+
+A **gateway node is just a server process** (on an EC2 instance, a K8s pod, a container — the substrate doesn't matter; its whole job is to hold ~1M WebSockets and push down them). The `nodeId = "gateway-B"` in the code is **hardcoded only for illustration**: you deploy the *same* image to all N instances, so the id must be **injected at runtime**, not baked into the code. Common ways:
+
+| Method | How the id is set |
+| --- | --- |
+| **Env var** (most common) | `System.getenv("NODE_ID")` — orchestrator injects a unique value |
+| **Hostname** | `InetAddress.getLocalHost().getHostName()` |
+| **K8s StatefulSet** | Stable ordinal hostnames `gateway-0..N` — *preferred for stateful gateways* (stable across restarts, plays nice with graceful drain) |
+| **IP:port** | Inherently unique + directly routable |
+
+Only two requirements: the id must be **unique** across the fleet (so registry entries don't collide) and **addressable** (others must be able to route to it — via a bus topic named after it, or its IP:port).
+
 ---
 
 ## 5. Inter-Gateway Routing (across nodes)
@@ -269,6 +338,34 @@ Both are shown in the table above. The **bus** (Kafka/Redis pub-sub) decouples n
 ### What if the recipient reconnects to a different server mid-message
 
 That's exactly why the registry has a **short TTL and heartbeats** (§4). If Bob's phone hops from B to D, the old entry expires and a new one ("Bob is on D") appears within seconds. If a message is published to B just as Bob leaves, B's push fails — the message is still safely stored (§6 persists first), so Bob gets it on resync (§9). Nothing is lost.
+
+### Subscribing to your own node's topic with a runtime `nodeId`
+
+The listener shows `@KafkaListener(topics = "gateway-B")`, but since `nodeId` is decided at runtime (§4) you can't hardcode the topic. An annotation value must resolve at startup, so feed the id in as a property (resolved once, before the listener is built):
+
+```java
+@KafkaListener(topics = "${node.id}")          // resolves to e.g. "gateway-7" for THIS instance
+public void onEnvelope(Envelope e) {
+    gateway.pushToDevice(e.deviceId(), e.message());
+}
+```
+
+If the id is only known programmatically, skip the annotation and build the container yourself:
+
+```java
+@PostConstruct
+void subscribe() {
+    var container = factory.createContainer(nodeId);   // runtime topic name
+    container.getContainerProperties().setMessageListener(
+        (MessageListener<String, Envelope>) rec ->
+            gateway.pushToDevice(rec.value().deviceId(), rec.value().message()));
+    container.start();
+}
+```
+
+The **same `nodeId`** is used on both sides: the router **publishes** to it (`bus.publish(r.gatewayNode(), …)`) and the owning node **subscribes** to it — and it must match the id written into the registry during `onConnect` (§4).
+
+⚠️ **Scaling caveat:** a Kafka *topic-per-node* doesn't scale to thousands of autoscaling nodes (partition limits, churn from create/delete). At large scale prefer **Redis Pub/Sub channels per node** (cheap, ephemeral — the alternative listed above) or a smaller set of sharded topics. Topic-per-node is the clean *conceptual* model; Redis pub-sub is often the more practical one for "route to one ephemeral node."
 
 ---
 
@@ -341,6 +438,28 @@ Walk the numbered steps: **(1)** persist the message, **(2)** ack the sender, **
 
 The ✓ only means "**the server has safely stored it**" — not "delivered." Delivery to the other person is a separate, slower step (they might be offline). That's the whole point of the different ticks in §7: ✓ = stored, ✓✓ = on their device, blue = they read it.
 
+### Where the `conversationId` comes from (conversation creation)
+
+`handleSend` assumes `in.conversationId()` already exists — so who creates it, and when? A **conversation** is the chat thread a message belongs to (its `type` is `DIRECT` or `GROUP`, §15); it's the anchor for storage (**partition key**), ordering (scope of `seq`), and membership (who receives it).
+
+- **GROUP** → created **explicitly** when the group is made (tap "New Group"): one `INSERT` into `conversations (type='GROUP')`, plus `conversation_members` rows and `group_metadata`. The id exists before any message.
+- **DIRECT (1:1)** → usually created **lazily on the first message** via a find-or-create:
+
+```java
+long conversationId = conversations.findOrCreateDirect(senderId, recipientId);
+
+long findOrCreateDirect(long a, long b) {
+    long lo = Math.min(a, b), hi = Math.max(a, b);    // canonicalize the pair!
+    Long existing = lookupDirect(lo, hi);
+    if (existing != null) return existing;             // already chatting → reuse the same thread
+    long id = insertConversation("DIRECT");
+    addMembers(id, lo, hi);
+    return id;
+}
+```
+
+Two details that matter: **canonicalize the participant pair** (sort the two user ids) so "A→B" and "B→A" map to the *same* conversation, and make find-or-create **atomic/idempotent** (unique constraint on the sorted pair) so two simultaneous first messages don't create duplicate threads. Either way the id exists **before** `handleSend` stamps it onto the stored message. (Some designs instead create it when you *open* the chat via `POST /v1/conversations`.)
+
 ---
 
 ## 7. Delivery Semantics & Receipts
@@ -409,6 +528,23 @@ The wire is **at-least-once** — true **exactly-once delivery is impossible** o
 - **In order** → **per-conversation `seq` + per-partition ordering** (§8, §9). All of one conversation's messages live on one partition (`partition by conversation_id`), so they're written and read back in a single monotonic `seq` order; the client renders by `seq` and buffers gaps.
 
 > 💡 Put together: **at-least-once transport + idempotent apply + per-conversation ordering = "exactly-once, in-order" from the user's point of view.** You never *achieve* exactly-once on the wire; you make duplicates harmless and order deterministic.
+
+### Delete-for-everyone (message revoke)
+
+"Delete for everyone" isn't a remote wipe — you can't reach into someone's phone and erase data. It's **another message**: a small **REVOKE control message** referencing the original's `message_id`, sent through the *same* pipeline (§5, §6), which each client **cooperatively** obeys.
+
+```
+Bob taps "Delete for everyone" on message_id = M123
+  → app sends { type:"REVOKE", conversationId, targetMessageId:"M123" }  (encrypted like any msg)
+  → server routes it like a normal message (online push / offline store + notif)
+  → if M123 is still UNDELIVERED in the store, server drops that pending copy
+  → each recipient device finds local M123, deletes it, renders "This message was deleted"
+  → also self-fanned-out to Bob's OTHER devices (§13) so it's consistent everywhere
+```
+
+Two cases for the original: if **already delivered**, it now lives in the recipient's **local DB** (§9) — only the *client* can remove it, hence "cooperative"; if **still undelivered**, the server simply drops the pending ciphertext before delivery.
+
+⚠️ It's **best-effort and client-enforced**: a modified client could ignore the REVOKE, and someone may have already seen a notification preview or screenshot. Time limits also apply. Contrast **"delete for me"**, which is purely local — it removes the message from your own device and sends nothing. Under E2E the server routes REVOKE by its (unencrypted) `message_id`/`conversationId` metadata without ever reading content. **Message edit** works the same way: an edit control message referencing `message_id`, applied cooperatively by clients.
 
 ---
 
@@ -547,6 +683,16 @@ On your **devices**, not the server. Because WhatsApp is end-to-end encrypted (�
 
 The stored message just sits there silently — the phone won't know to reconnect and grab it. The push notification (APNS on iOS, FCM on Android) is the external nudge: it wakes the phone/app enough to alert the user and trigger a reconnect + resync. Without it, an offline user wouldn't see the message until they happened to open the app.
 
+#### Q: If history lives on devices, why keep a server `messages` table at all?
+
+Because the table is a **durable in-transit buffer, not the archive.** It holds a message safely between "sender sent it" and "every device received it" — which can be days if the recipient is offline. Three jobs, none of which are long-term history:
+
+1. **Persist-before-ack (§6)** — the durable write that lets us ack "✓ sent" without risking loss *is* this table.
+2. **Offline delivery (§9)** — a message to an offline user has to wait *somewhere*; it waits here, and the device range-scans it on reconnect.
+3. It stores **ciphertext** the server can't read, and in the E2E model it's **deleted once delivered to all devices** (retention above).
+
+So think **durable outbox/queue**, not log. Permanent, readable history then lives on **devices**. The identical schema in Slack/Messenger simply **retains** the rows → the table *becomes* the searchable server-side history (bigger store + index). Same table, different retention policy.
+
 ---
 
 ## 10. Group Chat & Fan-out
@@ -671,7 +817,22 @@ Presence is **high-churn and disposable**. Millions of people flip online/offlin
 
 ### What the N² storm is, and why we "fan out only to interested parties"
 
-Imagine 100 million people come online at 8am. If we notified **every contact of every user**, that's each person's presence change pushed to hundreds of contacts × millions of people = a catastrophic flood (roughly N² messages). Instead, we only tell the people who are **actually looking right now** — someone with your chat open, or viewing your contact. Everyone else finds out your status lazily, the next time they open your chat. Same idea for **typing indicators**: a pure ephemeral "Bob is typing…" event pushed only to whoever's in that chat, and **never stored** at all.
+Imagine 100 million people come online at 8am. If we notified **every contact of every user**, that's each person's presence change pushed to hundreds of contacts × millions of people = a catastrophic flood (roughly N² messages). Instead, we only tell the people who are **actually looking right now** — someone with your chat open, or viewing your contact. Everyone else finds out your status lazily, the next time they open your chat. Same idea for **typing indicators**: a pure ephemeral "Bob is typing…" event routed only to that conversation's other participants, and **never stored** at all.
+
+### Why you see "typing…" before opening the chat
+
+A subtlety: WhatsApp shows "typing…" (and voice-recording) in the **chat-list row**, before you open the chat. So the trigger to *display* it isn't "the chat screen is open" — it's simply that your app **received a typing event for a conversation you're in**, and it renders that in whatever view you're on. **Delivery** is to the conversation's participants; **display** is a client choice.
+
+This clears up an easy conflation — typing is **not** the same fan-out problem as presence:
+
+| | **Typing** | **Presence broadcast** |
+| --- | --- | --- |
+| Sent to | Participants of **one conversation** | Potentially **all your contacts** |
+| 1:1 fan-out | Exactly **1** person → **no N² risk** | Hundreds → **real N² risk** |
+
+So for **1:1**, typing goes to exactly one person and is freely shown in the list — no reason to gate on "chat open." The "fan out only to interested parties" rule genuinely bites for **presence** (the true N² case) and for **large-group typing**, where apps *do* throttle hard / limit to active viewers. It is not a real constraint for 1:1 typing.
+
+Delivery of a typing event still rides the same **registry lookup + inter-gateway bus + `pushToDevice`** path as a real message (§5) — the only difference is the "persist to store" step is skipped entirely. The sender **throttles** it (once every few seconds, not per keystroke) and the receiver **auto-hides** it on a ~5s timeout, so a lost STOP event self-heals.
 
 ---
 
@@ -726,6 +887,15 @@ When the group roster changes, sender keys must be re-managed so the right peopl
 
 - **Add a member** → each existing member sends **their current sender key** to the new member (pairwise-encrypted). The newcomer can now decrypt subsequent messages — but **not** past ones (it never had the earlier keys), which is the desired behavior.
 - **Remove a member** ⚠️ → every remaining member must **rotate (regenerate) their sender key** and redistribute it to the *remaining* members. Otherwise the removed member, who still holds the old sender key, could keep decrypting new messages. This "rotate on removal" step is the group-chat equivalent of changing the locks when someone leaves.
+
+#### Q: If the Sender Key is shared with members, can't the server read it from the DB and decrypt?
+
+No — and this is the crux of E2E. The keys uploaded to the server are **public keys only**; **private keys never leave the device**, so the server can hold every public key and still decrypt nothing (public key encrypts, only the matching private key decrypts). Two more points close the gap:
+
+- **1:1 has no transmitted key at all** — X3DH *derives* a shared secret on both devices from public material (the "mixing paints" analogy above). A middleman sees only the public colors and can't reproduce the secret.
+- **The Sender Key *is* distributed, but "pairwise-encrypted"** — wrapped inside each existing 1:1 encrypted channel before sending. The server relays only **ciphertext** of the sender key; to steal it you'd first have to break the pairwise session, which needs a private key that never left a device.
+
+⚠️ In true E2E the sender key is **not** stored server-side in readable form (it lives on member devices). The `group_metadata.sender_keys` column in §15 is therefore misleading — in a real design it would be absent or hold only **opaque/encrypted** blobs. Net: a compromised server still can't read messages, because decryption needs private keys it never possessed.
 
 ### Design fork — server-side (Slack) vs E2E (WhatsApp)
 
@@ -822,6 +992,7 @@ CREATE TABLE message_receipts (
     PRIMARY KEY (conversation_id, seq, user_id)      -- DELIVERED / READ
 );
 CREATE TABLE group_metadata ( conversation_id BIGINT PRIMARY KEY, name TEXT, admin_ids BIGINT[], sender_keys JSONB );
+-- ⚠️ Under true E2E, sender_keys are CLIENT-HELD; the server would store only opaque/encrypted blobs (or omit the column) — never readable keys (§12).
 CREATE TABLE blocked_users ( user_id BIGINT, blocked_id BIGINT, PRIMARY KEY (user_id, blocked_id) );
 
 -- Ephemeral (Redis):
